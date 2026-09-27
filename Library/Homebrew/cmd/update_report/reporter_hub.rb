@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/output"
+
 class ReporterHub
   include Utils::Output::Mixin
 
@@ -9,15 +11,20 @@ class ReporterHub
 
   sig { void }
   def initialize
-    @hash = T.let({}, T::Hash[Symbol, T::Array[T.any(String, [String, String])]])
+    @hash = T.let({}, T::Hash[Symbol, T.any(T::Array[String], T::Array[[String, String]])])
     @reporters = T.let([], T::Array[Reporter])
   end
 
-  sig { params(key: Symbol).returns(T::Array[String]) }
+  sig { params(key: Symbol).returns(T.any(T::Array[String], T::Array[[String, String]])) }
   def select_formula_or_cask(key)
     raise "Unsupported key #{key}" unless [:A, :AC, :D, :DC, :M, :MC, :R, :RC, :T].include?(key)
 
-    T.cast(@hash.fetch(key, []), T::Array[String])
+    @hash.fetch(key, [])
+  end
+
+  sig { returns(T::Array[[String, String]]) }
+  def renamed_formulae
+    T.cast(@hash.fetch(:R, []), T::Array[[String, String]])
   end
 
   sig { params(reporter: Reporter, auto_update: T::Boolean).void }
@@ -34,6 +41,8 @@ class ReporterHub
 
   sig { params(auto_update: T::Boolean).void }
   def dump(auto_update: false)
+    return if auto_update && Homebrew::EnvConfig.auto_update_quiet?
+
     unless Homebrew::EnvConfig.no_update_report_new?
       dump_new_formula_report
       dump_new_cask_report
@@ -90,11 +99,18 @@ class ReporterHub
     EOS
   end
 
+  sig { void }
+  def migrate_cask_renames
+    Cask::Caskroom.casks.each do |cask|
+      Cask::Migrator.migrate_if_needed(cask)
+    end
+  end
+
   private
 
   sig { void }
   def dump_new_formula_report
-    formulae = select_formula_or_cask(:A).sort.reject { |name| installed?(name) }
+    formulae = T.cast(select_formula_or_cask(:A), T::Array[String]).sort.reject { |name| installed?(name) }
     return if formulae.blank?
 
     ohai "New Formulae"
@@ -116,7 +132,7 @@ class ReporterHub
   def dump_new_cask_report
     return unless Cask::Caskroom.any_casks_installed?
 
-    casks = select_formula_or_cask(:AC).sort.reject { |name| cask_installed?(name) }
+    casks = T.cast(select_formula_or_cask(:AC), T::Array[String]).sort.reject { |name| cask_installed?(name) }
     return if casks.blank?
 
     ohai "New Casks"
@@ -137,7 +153,7 @@ class ReporterHub
 
   sig { void }
   def dump_deleted_formula_report
-    formulae = select_formula_or_cask(:D).sort.filter_map do |name|
+    formulae = T.cast(select_formula_or_cask(:D), T::Array[String]).sort.filter_map do |name|
       pretty_uninstalled(name) if installed?(name)
     end
 
@@ -148,7 +164,7 @@ class ReporterHub
   def dump_deleted_cask_report
     return if Homebrew::SimulateSystem.simulating_or_running_on_linux?
 
-    casks = select_formula_or_cask(:DC).sort.filter_map do |name|
+    casks = T.cast(select_formula_or_cask(:DC), T::Array[String]).sort.filter_map do |name|
       name = Utils.name_from_full_name(name)
       pretty_uninstalled(name) if cask_installed?(name)
     end
@@ -173,26 +189,6 @@ class ReporterHub
     (Cask::Caskroom.path/cask).directory?
   end
 
-  sig { returns(T::Array[T.untyped]) }
-  def all_formula_json
-    return @all_formula_json if @all_formula_json
-
-    @all_formula_json = T.let(nil, T.nilable(T::Array[T.untyped]))
-    all_formula_json, = Homebrew::API.fetch_json_api_file "formula.jws.json"
-    all_formula_json = T.cast(all_formula_json, T::Array[T.untyped])
-    @all_formula_json = all_formula_json
-  end
-
-  sig { returns(T::Array[T.untyped]) }
-  def all_cask_json
-    return @all_cask_json if @all_cask_json
-
-    @all_cask_json = T.let(nil, T.nilable(T::Array[T.untyped]))
-    all_cask_json, = Homebrew::API.fetch_json_api_file "cask.jws.json"
-    all_cask_json = T.cast(all_cask_json, T::Array[T.untyped])
-    @all_cask_json = all_cask_json
-  end
-
   sig { params(formula: String).returns(T.nilable(String)) }
   def description(formula)
     if Homebrew::EnvConfig.no_install_from_api?
@@ -205,9 +201,7 @@ class ReporterHub
         nil
       end
     else
-      all_formula_json.find { |f| f["name"] == formula }
-                      &.fetch("desc", nil)
-                      &.presence
+      Homebrew::API::Internal.formula_hash(formula)&.fetch("desc", nil)&.presence
     end
   end
 
@@ -223,9 +217,7 @@ class ReporterHub
         nil
       end
     else
-      all_cask_json.find { |f| f["token"] == cask }
-                   &.fetch("desc", nil)
-                   &.presence
+      Homebrew::API::Internal.cask_hash(cask)&.fetch("desc", nil)&.presence
     end
   end
 end

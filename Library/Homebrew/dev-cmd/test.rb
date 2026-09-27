@@ -31,7 +31,7 @@ module Homebrew
 
       sig { override.void }
       def run
-        Homebrew.install_bundler_gems!(groups: ["formula_test"], setup_path: false)
+        Utils::GemSetup.install_bundler_gems!(groups: ["formula_test"], setup_path: false)
 
         require "formula_assertions"
         require "formula_free_port"
@@ -74,33 +74,40 @@ module Homebrew
           env = ENV.to_hash
 
           begin
-            exec_args = HOMEBREW_RUBY_EXEC_ARGS + %W[
-              --
-              #{HOMEBREW_LIBRARY_PATH}/test.rb
-              #{f.path}
-            ].concat(args.options_only)
+            exec_args = Sandbox.ruby_command("test.rb", f.path, *args.options_only)
 
             exec_args << "--HEAD" if f.head?
 
-            Sandbox.ensure_sandbox_installed!
-            if Sandbox.available?
-              sandbox = Sandbox.new
-              f.logs.mkpath
-              sandbox.record_log(f.logs/"test.sandbox.log")
-              sandbox.allow_write_temp_and_cache
-              sandbox.allow_write_log(f)
-              sandbox.allow_write_xcode
-              sandbox.allow_write_path(HOMEBREW_PREFIX/"var/homebrew/locks")
-              sandbox.deny_read_home
-              optional_prefix_var_dirs.each do |dir|
-                sandbox.allow_write_path_if_exists HOMEBREW_PREFIX/dir
+            Mktemp.new("#{f.name}-test", retain: args.keep_tmp?).run(chdir: false) do |staging|
+              testpath = staging.tmpdir
+              raise "Test path is unexpectedly unset." if testpath.nil?
+
+              ENV["HOMEBREW_TEST_PATH"] = testpath.to_s
+
+              Sandbox.run_or_fork(
+                *exec_args,
+                step:                 "testing #{f.full_name}",
+                warn_without_sandbox: false,
+                retain_tmp:           args.keep_tmp?,
+                debug:                args.debug?,
+              ) do |sandbox|
+                f.logs.mkpath
+                sandbox.record_log(f.logs/"test.sandbox.log")
+                sandbox.allow_write_temp_and_cache
+                sandbox.allow_write_log(f)
+                sandbox.allow_write_xcode
+                sandbox.allow_write_path(HOMEBREW_PREFIX/"var/homebrew/locks")
+                sandbox.deny_read_home
+                optional_prefix_var_dirs.each do |dir|
+                  sandbox.allow_write_path_if_exists HOMEBREW_PREFIX/dir
+                end
+                sandbox.deny_all_network unless f.class.network_access_allowed?(:test)
+                sandbox.allow_network path: testpath, type: :subpath
               end
-              sandbox.deny_all_network unless f.class.network_access_allowed?(:test)
-              sandbox.run(*exec_args)
-            else
-              Utils.safe_fork do
-                exec(*exec_args)
-              end
+            # Preserve the parent's test directory for interactive debugging.
+            rescue Exception # rubocop:disable Lint/RescueException
+              staging.retain! if args.debug?
+              raise
             end
           # Rescue any possible exception types.
           rescue Exception => e # rubocop:disable Lint/RescueException

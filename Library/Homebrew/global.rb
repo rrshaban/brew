@@ -14,8 +14,6 @@ HOMEBREW_DEFAULT_CACHE = T.let(ENV.fetch("HOMEBREW_DEFAULT_CACHE").freeze, Strin
 HOMEBREW_DEFAULT_LOGS = T.let(ENV.fetch("HOMEBREW_DEFAULT_LOGS").freeze, String)
 HOMEBREW_DEFAULT_TEMP = T.let(ENV.fetch("HOMEBREW_DEFAULT_TEMP").freeze, String)
 HOMEBREW_REQUIRED_RUBY_VERSION = T.let(ENV.fetch("HOMEBREW_REQUIRED_RUBY_VERSION").freeze, String)
-
-HOMEBREW_PRODUCT = T.let(ENV.fetch("HOMEBREW_PRODUCT").freeze, String)
 HOMEBREW_VERSION = T.let(ENV.fetch("HOMEBREW_VERSION").freeze, String)
 
 HOMEBREW_WWW = "https://brew.sh"
@@ -32,16 +30,12 @@ HOMEBREW_USER_AGENT_FAKE_SAFARI =
   # Don't update this beyond 10.15.7 until Safari actually updates their
   # user agent to be beyond 10.15.7 (not the case as-of macOS 26)
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 " \
-  "(KHTML, like Gecko) Version/26.0 Safari/605.1.15"
+  "(KHTML, like Gecko) Version/27.0 Safari/605.1.15"
 HOMEBREW_GITHUB_PACKAGES_AUTH = T.let(ENV.fetch("HOMEBREW_GITHUB_PACKAGES_AUTH", "").freeze, String)
 HOMEBREW_DEFAULT_PREFIX = T.let(ENV.fetch("HOMEBREW_GENERIC_DEFAULT_PREFIX").freeze, String)
-HOMEBREW_DEFAULT_REPOSITORY = T.let(ENV.fetch("HOMEBREW_GENERIC_DEFAULT_REPOSITORY").freeze, String)
 
 HOMEBREW_MACOS_ARM_DEFAULT_PREFIX = T.let(ENV.delete("HOMEBREW_MACOS_ARM_DEFAULT_PREFIX").freeze, T.nilable(String))
-HOMEBREW_MACOS_ARM_DEFAULT_REPOSITORY = T.let(ENV.delete("HOMEBREW_MACOS_ARM_DEFAULT_REPOSITORY").freeze,
-                                              T.nilable(String))
 HOMEBREW_LINUX_DEFAULT_PREFIX = T.let(ENV.delete("HOMEBREW_LINUX_DEFAULT_PREFIX").freeze, T.nilable(String))
-HOMEBREW_LINUX_DEFAULT_REPOSITORY = T.let(ENV.delete("HOMEBREW_LINUX_DEFAULT_REPOSITORY").freeze, T.nilable(String))
 
 HOMEBREW_PREFIX_PLACEHOLDER = "$HOMEBREW_PREFIX"
 HOMEBREW_CELLAR_PLACEHOLDER = "$HOMEBREW_CELLAR"
@@ -65,6 +59,11 @@ module Homebrew
   DEFAULT_MACOS_CELLAR = T.let("#{HOMEBREW_DEFAULT_PREFIX}/Cellar".freeze, String)
   DEFAULT_MACOS_ARM_CELLAR = T.let("#{HOMEBREW_MACOS_ARM_DEFAULT_PREFIX}/Cellar".freeze, String)
   DEFAULT_LINUX_CELLAR = T.let("#{HOMEBREW_LINUX_DEFAULT_PREFIX}/Cellar".freeze, String)
+
+  # A pinned bottle built at one of these 64-byte prefixes can be patched for any shorter prefix.
+  MACOS_ARM64_BOTTLE_PREFIX = T.let("/opt/homebrew/.brew-padded-arm64".ljust(64, "_").freeze, String)
+  LINUX_ARM64_BOTTLE_PREFIX = T.let("/home/linuxbrew/.linuxbrew/.brew-padded-arm64".ljust(64, "_").freeze, String)
+  LINUX_X86_64_BOTTLE_PREFIX = T.let("/home/linuxbrew/.linuxbrew/.brew-padded-x86_64".ljust(64, "_").freeze, String)
 
   class << self
     sig { params(failed: T::Boolean).returns(T::Boolean) }
@@ -115,7 +114,7 @@ module Homebrew
 
     sig { returns(Integer) }
     def owner_uid
-      @owner_uid ||= T.let(HOMEBREW_ORIGINAL_BREW_FILE.stat.uid, T.nilable(Integer))
+      @owner_uid ||= T.let(HOMEBREW_BREW_FILE.stat.uid, T.nilable(Integer))
     end
 
     sig { returns(T::Boolean) }
@@ -153,7 +152,7 @@ require "extend/kernel"
 require "os"
 
 require "extend/array"
-require "cachable"
+require "cacheable"
 require "extend/enumerable"
 require "extend/string"
 require "extend/pathname"

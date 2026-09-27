@@ -43,9 +43,11 @@ module Cask
       Artifact::Artifact,
       Artifact::AudioUnitPlugin,
       Artifact::Binary,
+      Artifact::CommandWrapper,
       Artifact::Colorpicker,
       Artifact::Dictionary,
       Artifact::Font,
+      Artifact::GeneratedScript,
       Artifact::InputMethod,
       Artifact::InternetPlugin,
       Artifact::KeyboardLayout,
@@ -60,9 +62,10 @@ module Cask
       Artifact::Suite,
       Artifact::VstPlugin,
       Artifact::Vst3Plugin,
+      Artifact::BashCompletion,
       Artifact::ZshCompletion,
       Artifact::FishCompletion,
-      Artifact::BashCompletion,
+      Artifact::PwshCompletion,
       Artifact::GeneratedCompletion,
       Artifact::Uninstall,
       Artifact::Zap,
@@ -85,19 +88,11 @@ module Cask
       Artifact::UninstallPostflightSteps,
     ].freeze
 
-    InstallStepFlightBlockClasses = T.type_alias do
-      T::Hash[
-        T.class_of(Artifact::AbstractInstallSteps),
-        [T.class_of(Artifact::AbstractFlightBlock), Symbol],
-      ]
-    end
-
-    INSTALL_STEP_FLIGHT_BLOCK_CLASSES = T.let({
-      Artifact::PreflightSteps           => [Artifact::PreflightBlock, :preflight],
-      Artifact::PostflightSteps          => [Artifact::PostflightBlock, :postflight],
-      Artifact::UninstallPreflightSteps  => [Artifact::PreflightBlock, :uninstall_preflight],
-      Artifact::UninstallPostflightSteps => [Artifact::PostflightBlock, :uninstall_postflight],
-    }.freeze, InstallStepFlightBlockClasses)
+    ARTIFACT_DSL_METHODS = T.let(Set.new([
+      *ORDINARY_ARTIFACT_CLASSES.map(&:dsl_key),
+      *ARTIFACT_BLOCK_CLASSES.flat_map { |klass| [klass.dsl_key, klass.uninstall_dsl_key] },
+      *INSTALL_STEP_ARTIFACT_CLASSES.map(&:dsl_key),
+    ]).freeze, T::Set[Symbol])
 
     DSL_METHODS = T.let(Set.new([
       :arch,
@@ -109,6 +104,7 @@ module Cask
       :desc,
       :depends_on,
       :homepage,
+      :homepage_browsed,
       :language,
       :name,
       :os,
@@ -141,10 +137,7 @@ module Cask
       :on_os_blocks_exist?,
       :on_system_block_min_os,
       :depends_on_set_in_block?,
-      *ORDINARY_ARTIFACT_CLASSES.map(&:dsl_key),
-      *ACTIVATABLE_ARTIFACT_CLASSES.map(&:dsl_key),
-      *ARTIFACT_BLOCK_CLASSES.flat_map { |klass| [klass.dsl_key, klass.uninstall_dsl_key] },
-      *INSTALL_STEP_ARTIFACT_CLASSES.map(&:dsl_key),
+      *ARTIFACT_DSL_METHODS,
     ]).freeze, T::Set[Symbol])
 
     include OnSystem::MacOSAndLinux
@@ -188,6 +181,9 @@ module Cask
     sig { returns(T.nilable(String)) }
     attr_reader :disable_replacement_formula
 
+    sig { returns(T.nilable(Date)) }
+    attr_reader :homepage_browsed
+
     sig { returns(T.nilable(T::Hash[Symbol, T.nilable(T.any(String, Symbol))])) }
     attr_reader :disable_args
 
@@ -205,10 +201,10 @@ module Cask
       @auto_updates_set_in_block = T.let(false, T::Boolean)
       @autobump = T.let(true, T::Boolean)
       @called_in_on_system_block = T.let(false, T::Boolean)
+      @called_in_on_os_block = T.let(false, T::Boolean)
       @cask = cask
       @caveats = T.let(DSL::Caveats.new(cask), DSL::Caveats)
       @conflicts_with = T.let(nil, T.nilable(DSL::ConflictsWith))
-      @conflicts_with_set_in_block = T.let(false, T::Boolean)
       @container = T.let(nil, T.nilable(DSL::Container))
       @container_set_in_block = T.let(false, T::Boolean)
       @depends_on = T.let(DSL::DependsOn.new, DSL::DependsOn)
@@ -228,6 +224,7 @@ module Cask
       @disable_args = T.let(nil, T.nilable(T::Hash[Symbol, T.nilable(T.any(String, Symbol))]))
       @disabled = T.let(false, T::Boolean)
       @homepage = T.let(nil, T.nilable(String))
+      @homepage_browsed = T.let(nil, T.nilable(Date))
       @homepage_set_in_block = T.let(false, T::Boolean)
       @language_blocks = T.let({}, T::Hash[T::Array[String], Proc])
       @language_eval = T.let(nil, T.nilable(String))
@@ -243,7 +240,6 @@ module Cask
       @os_set_in_block = T.let(false, T::Boolean)
       @rename = T.let([], T::Array[DSL::Rename])
       @sha256 = T.let(nil, T.nilable(T.any(Checksum, Symbol)))
-      @sha256_set_for_linux = T.let(false, T::Boolean)
       @sha256_set_in_block = T.let(false, T::Boolean)
       @staged_path = T.let(nil, T.nilable(Pathname))
       @token = T.let(cask.token, String)
@@ -270,9 +266,6 @@ module Cask
 
     sig { returns(T::Boolean) }
     def on_os_blocks_exist? = @on_os_blocks_exist
-
-    sig { returns(T::Boolean) }
-    def sha256_set_for_linux? = @sha256_set_for_linux
 
     # Specifies the cask's name.
     #
@@ -341,13 +334,21 @@ module Cask
     # ### Example
     #
     # ```ruby
-    # homepage "https://code.visualstudio.com/"
+    # homepage "https://code.visualstudio.com/", browsed: "2026-07-26"
     # ```
     #
+    # `browsed` is the date when a human last checked the homepage in a browser.
+    # Automated homepage availability audits are skipped for one year.
+    #
     # @api public
-    sig { params(homepage: T.nilable(String)).returns(T.nilable(String)) }
-    def homepage(homepage = nil)
-      set_unique_stanza(:homepage, homepage.nil?) { homepage }
+    sig { params(homepage: T.nilable(String), browsed: T.nilable(String)).returns(T.nilable(String)) }
+    def homepage(homepage = nil, browsed: nil)
+      raise CaskInvalidError.new(cask, "`browsed` requires a homepage URL") if homepage.nil? && browsed
+
+      set_unique_stanza(:homepage, homepage.nil?) do
+        @homepage_browsed = Date.parse(browsed) if browsed
+        homepage
+      end
     end
 
     # Specifies language-specific values for the cask.
@@ -411,6 +412,19 @@ module Cask
       @language_blocks.keys.flatten
     end
 
+    sig { returns(T::Array[T::Array[String]]) }
+    def language_groups
+      @language_blocks.keys
+    end
+
+    sig { returns(T.nilable(T::Array[String])) }
+    def default_language_group
+      default_language_block = @language_blocks.default
+      return if default_language_block.nil?
+
+      @language_blocks.key(default_language_block)
+    end
+
     # Sets the cask's download URL.
     #
     # ### Example
@@ -425,8 +439,16 @@ module Cask
       caller_location = caller_locations.fetch(0)
       return @url unless uri
 
+      unless @cask.loaded_from_api?
+        URL::DEPRECATED_URL_SPECS.each do |spec|
+          next unless options[spec]
+
+          odeprecated "the `#{spec}` parameter in the `url` stanza", "the default URL verification behaviour"
+        end
+      end
+
       set_unique_stanza(:url, false) do
-        URL.new(uri, **options, caller_location:)
+        URL.new(uri, **options.except(*URL::DEPRECATED_URL_SPECS), caller_location:)
       end
     end
 
@@ -466,12 +488,10 @@ module Cask
     # ```
     #
     # @api public
-    sig {
-      params(from: String,
-             to:   String).returns(T::Array[DSL::Rename])
-    }
-    def rename(from = T.unsafe(nil), to = T.unsafe(nil))
+    sig { params(from: T.nilable(String), to: T.nilable(String)).returns(T::Array[DSL::Rename]) }
+    def rename(from = nil, to = nil)
       return @rename if from.nil?
+      raise CaskInvalidError.new(cask, "`rename` requires both a `from` and a `to` filename") if to.nil?
 
       @rename << DSL::Rename.new(from, to)
     end
@@ -509,13 +529,13 @@ module Cask
     # sha256 "7bdb497080ffafdfd8cc94d8c62b004af1be9599e865e5555e456e2681e150ca"
     # ```
     #
-    # For architecture-dependent downloads:
+    # For architecture- or OS-dependent downloads:
     #
     # ```ruby
     # sha256 arm:          "7bdb497080ffafdfd8cc94d8c62b004af1be9599e865e5555e456e2681e150ca",
-    #        x86_64:       "b3c1c2442480a0219b9e05cf91d03385858c20f04b764ec08a3fa83d1b27e7b2"
+    #        intel:        "b3c1c2442480a0219b9e05cf91d03385858c20f04b764ec08a3fa83d1b27e7b2",
+    #        arm64_linux:  "bd766af7e692afceb727a6f88e24e6e68d9882aeb3e8348412f6c03d96537c75",
     #        x86_64_linux: "1a2aee7f1ddc999993d4d7d42a150c5e602bc17281678050b8ed79a0500cc90f"
-    #        arm64_linux:  "bd766af7e692afceb727a6f88e24e6e68d9882aeb3e8348412f6c03d96537c75"
     # ```
     #
     # @api public
@@ -537,7 +557,6 @@ module Cask
         if arm.present? || x86_64.present? || x86_64_linux.present? || arm64_linux.present?
           @on_system_blocks_exist = true
         end
-        @sha256_set_for_linux = true if x86_64_linux.present? || arm64_linux.present?
 
         val = arg || on_system_conditional(
           macos: on_arch_conditional(arm:, intel: x86_64),
@@ -548,6 +567,8 @@ module Cask
           :no_check
         when String
           Checksum.new(val)
+        when nil
+          nil
         else
           raise CaskInvalidError.new(cask, "invalid 'sha256' value: #{val.inspect}")
         end
@@ -622,7 +643,10 @@ module Cask
       return @depends_on if kwargs.empty?
 
       begin
-        @depends_on.load(kwargs, set_in_block: @called_in_on_system_block)
+        # Only OS blocks scope a dependency to one OS: `on_arm`/`on_intel`
+        # blocks are evaluated on every OS, so a macOS dependency inside one
+        # applies everywhere and marks the cask macOS-only.
+        @depends_on.load(kwargs, set_in_block: @called_in_on_system_block, os_scoped: @called_in_on_os_block)
       rescue RuntimeError => e
         raise CaskInvalidError.new(cask, e)
       end
@@ -631,11 +655,19 @@ module Cask
 
     # Declare conflicts that keep a cask from installing or working correctly.
     #
+    # NOTE: Multiple `conflicts_with` stanzas can be specified; they are merged.
+    #
     # @api public
     sig { params(kwargs: T.anything).returns(T.nilable(DSL::ConflictsWith)) }
     def conflicts_with(**kwargs)
-      # TODO: Remove this constraint and instead merge multiple `conflicts_with` stanzas
-      set_unique_stanza(:conflicts_with, kwargs.empty?) { DSL::ConflictsWith.new(**kwargs) }
+      return @conflicts_with if kwargs.empty?
+
+      new_conflicts = DSL::ConflictsWith.new(**kwargs)
+      @conflicts_with = @conflicts_with&.merge!(new_conflicts) || new_conflicts
+    rescue CaskInvalidError
+      raise
+    rescue => e
+      raise CaskInvalidError.new(cask, "'conflicts_with' stanza failed with: #{e}")
     end
 
     sig { returns(Pathname) }
@@ -690,7 +722,7 @@ module Cask
     # Automatically fetch the latest version of a cask from changelogs.
     #
     # @api public
-    sig { params(block: T.nilable(T.proc.void)).returns(Livecheck) }
+    sig { params(block: T.nilable(T.proc.bind(Livecheck).void)).returns(Livecheck) }
     def livecheck(&block)
       return @livecheck unless block
 
@@ -827,11 +859,8 @@ module Cask
       [klass.dsl_key, klass.uninstall_dsl_key].each do |dsl_key|
         define_method(dsl_key) do |&block|
           T.bind(self, DSL)
-          if install_step_artifact_defined?(dsl_key)
-            warn_on_install_step_conflict(dsl_key, T.must(install_step_artifact_class(dsl_key)).dsl_key)
-          else
-            artifacts.add(klass.new(cask, dsl_key => block))
-          end
+          odeprecated "`#{dsl_key}`", "`#{dsl_key}_steps`"
+          artifacts.add(klass.new(cask, dsl_key => block))
         end
       end
     end
@@ -845,43 +874,8 @@ module Cask
         else
           Homebrew::InstallSteps::DSL.normalise_steps([kwargs[:steps] || steps].flatten.compact)
         end
-        remove_conflicting_flight_blocks(klass)
         artifacts.add(klass.new(cask, steps))
       end
-    end
-
-    sig { params(dsl_key: Symbol).returns(T::Boolean) }
-    def install_step_artifact_defined?(dsl_key)
-      return false unless (klass = install_step_artifact_class(dsl_key))
-
-      artifacts.any?(klass)
-    end
-
-    sig { params(dsl_key: Symbol).returns(T.nilable(T.class_of(Artifact::AbstractInstallSteps))) }
-    def install_step_artifact_class(dsl_key)
-      INSTALL_STEP_FLIGHT_BLOCK_CLASSES.find do |_step_class, (_block_class, block_dsl_key)|
-        block_dsl_key == dsl_key
-      end&.first
-    end
-
-    sig { params(klass: T.class_of(Artifact::AbstractInstallSteps)).void }
-    def remove_conflicting_flight_blocks(klass)
-      flight_block_class, dsl_key = INSTALL_STEP_FLIGHT_BLOCK_CLASSES.fetch(klass)
-      conflicting_flight_blocks = artifacts.select do |artifact|
-        next false unless artifact.is_a?(flight_block_class)
-
-        artifact.directives.key?(dsl_key)
-      end
-
-      conflicting_flight_blocks.each do |artifact|
-        warn_on_install_step_conflict(dsl_key, klass.dsl_key)
-        artifacts.delete(artifact)
-      end
-    end
-
-    sig { params(dsl_key: Symbol, steps_key: Symbol).void }
-    def warn_on_install_step_conflict(dsl_key, steps_key)
-      opoo "#{token}: `#{dsl_key}` is ignored because `#{steps_key}` is defined!"
     end
 
     sig { override.params(method: Symbol, _args: T.anything).returns(T.noreturn) }
@@ -918,15 +912,13 @@ module Cask
 
     sig { params(because: T.any(String, Symbol)).void }
     def set_no_autobump(because:)
-      if because.is_a?(Symbol) && !NO_AUTOBUMP_REASONS_LIST.key?(because)
+      if because.is_a?(Symbol) && !NO_AUTOBUMP_REASONS_LIST.key?(because) && !@cask.loaded_from_metadata?
         raise ArgumentError, "'because' argument should use valid symbol or a string!"
       end
 
       if !@cask.allow_reassignment && no_autobump_defined?
         raise CaskInvalidError.new(cask, "'no_autobump!' stanza may only appear once.")
       end
-
-      odisabled "no_autobump! because: :requires_manual_review" if because == :requires_manual_review
 
       @no_autobump_defined = true
       @no_autobump_message = because

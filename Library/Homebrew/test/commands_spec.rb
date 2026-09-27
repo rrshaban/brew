@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 require "commands"
@@ -23,23 +23,39 @@ RSpec.shared_context "custom internal commands" do # rubocop:disable RSpec/Conte
   before do
     stub_const("Commands::HOMEBREW_CMD_PATH", cmd_path)
     stub_const("Commands::HOMEBREW_DEV_CMD_PATH", dev_cmd_path)
-  end
 
-  around do |example|
     cmd_path.mkpath
     dev_cmd_path.mkpath
     cmds.each do |f|
       FileUtils.touch f
     end
+  end
 
-    example.run
-  ensure
+  after do
     FileUtils.rm_f cmds
   end
 end
 
 RSpec.describe Commands do
   include_context "custom internal commands"
+
+  test_each(["../other", ".", ".."]) do |cmd|
+    it "rejects #{cmd.inspect} before attempting to load an internal command" do
+      allow(Utils::Ruby).to receive(:require?).and_raise("Loading is not permitted")
+
+      expect(described_class.valid_internal_cmd?(cmd)).to be(false)
+    end
+
+    it "rejects #{cmd.inspect} before attempting to load an internal developer command" do
+      allow(Utils::Ruby).to receive(:require?).and_raise("Loading is not permitted")
+
+      expect(described_class.valid_internal_dev_cmd?(cmd)).to be(false)
+    end
+  end
+
+  it "does not resolve a path component as an internal command path" do
+    expect(described_class.path("../brew")).to be_nil
+  end
 
   specify "::internal_commands" do
     cmds = described_class.internal_commands
@@ -83,6 +99,32 @@ RSpec.describe Commands do
       expect(cmds).to include("t2"), "Executable Ruby files should be included"
       expect(cmds).to include("t3"), "Executable files with a Ruby extension should be included"
       expect(cmds).not_to include("t4"), "Non-executable files shouldn't be included"
+    end
+  end
+
+  describe "::suggestion_message" do
+    let(:internal_commands) { %w[doctor up upgrade] }
+    let(:all_commands) { %w[doctor external-command up upgrade] }
+
+    before do
+      allow(described_class).to receive(:commands).with(external: false, aliases: true).and_return(internal_commands)
+      allow(described_class).to receive(:commands).with(aliases: true).and_return(all_commands)
+    end
+
+    it "suggests a command for a typo" do
+      expect(described_class.suggestion_message("upgrde")).to eq("\nDid you mean upgrade?")
+    end
+
+    it "suggests a command alias for a typo" do
+      expect(described_class.suggestion_message("upp")).to eq("\nDid you mean up?")
+    end
+
+    it "falls back to external command suggestions" do
+      expect(described_class.suggestion_message("external-comand")).to eq("\nDid you mean external-command?")
+    end
+
+    it "does not suggest a command without a close match" do
+      expect(described_class.suggestion_message("zzzzzz")).to be_empty
     end
   end
 

@@ -11,7 +11,14 @@ module Homebrew
       Checkable = T.type_alias { { name: String, options: WithOptions } }
       ToolEntry = T.type_alias { T.any(Tool, Checkable) }
 
-      SOURCE_REQUIREMENT_REGEX = %r{\A(?:git\+|https?://|file://|\.{0,2}/)|\.git\z}
+      SOURCE_REQUIREMENT_REGEX = %r{\A(?:git\+|https?://)|\.git\z}
+      # `uv tool list` reports a tool installed from a directory as an absolute
+      # `file://` URL, and a hand-written Brewfile can name a path directly.
+      # `uv tool install` also takes either spelling behind a `git+` prefix.
+      # None of them resolves on another machine, so none is accepted, and a
+      # tool installed from one is dumped without a `source:` rather than with
+      # one that would then fail to parse.
+      LOCAL_SOURCE_REGEX = %r{\A(?:git\+)?(?:file://|\.{0,2}/)}
 
       class << self
         sig { override.returns(Symbol) }
@@ -42,6 +49,10 @@ module Homebrew
           normalized_with = normalize_with(with || [])
           normalized_options[:with] = normalized_with if normalized_with.present?
           normalized_source = normalize_source(source)
+          if normalized_source&.match?(LOCAL_SOURCE_REGEX)
+            raise "options[:source](#{source.inspect}) is local to this machine so cannot be used in a Brewfile"
+          end
+
           normalized_options[:source] = normalized_source if normalized_source.present?
 
           Dsl::Entry.new(:uv, name, normalized_options)
@@ -64,7 +75,8 @@ module Homebrew
           return packages if packages
 
           @packages = if (uv = package_manager_executable)
-            output = `#{uv} tool list --show-with --show-extras --show-version-specifiers 2>/dev/null`
+            output = Utils.popen_read_text(uv, "tool", "list", "--show-with", "--show-extras",
+                                           "--show-version-specifiers", err: File::NULL)
             parse_tool_list(output)
           end
           return [] if @packages.nil?
@@ -96,15 +108,23 @@ module Homebrew
           ).returns(T::Boolean)
         }
         def install_package!(name, with: nil, source: nil, verbose: false)
-          uv = package_manager_executable!
+          require "formula"
+          require "utils/path"
 
           args = ["tool", "install", source.presence || name]
+          # Find the newest installed Homebrew Python from opt/bin filenames without loading formulae.
+          python = Formula.installed_formula_names.grep(/\Apython(?:@.+)?\z/)
+                          .flat_map { |formula_name| Utils::Path.formula_opt_bin(formula_name).glob("python[0-9]*") }
+                          .select { |path| path.file? && path.basename.to_s.match?(/\Apython\d+\.\d+\z/) }
+                          .max_by { |path| Version.new(path.basename.to_s.delete_prefix("python")) }
+          ENV["UV_PYTHON"] = python.to_s if python
+
           normalize_with(with || []).each do |requirement|
             args << "--with"
             args << requirement
           end
 
-          Bundle.system(uv.to_s, *args, verbose:)
+          Bundle.system(package_manager_executable!.to_s, *args, verbose:)
         end
 
         sig { override.returns(T::Array[Tool]) }
@@ -120,7 +140,7 @@ module Homebrew
           entries = T.let([], T::Array[Tool])
 
           output.each_line do |line|
-            match = line.match(/\A(\S+)\s+v\S+/)
+            match = line.match(/\A([A-Za-z0-9]\S*)\s+v\S+/)
             next unless match
 
             name = match[1]
@@ -146,6 +166,7 @@ module Homebrew
         def parse_source(required_raw)
           source = normalize_source(required_raw)
           return if source.nil?
+          return if source.match?(LOCAL_SOURCE_REGEX)
           return source if source.match?(SOURCE_REQUIREMENT_REGEX)
 
           nil

@@ -1,9 +1,47 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "cacheable"
+
 module Utils
   # Helper methods for outputting messages in Homebrew's formats.
   module Output
+    extend T::Generic
+    extend Cacheable
+
+    Cache = type_template { { fixed: T::Hash[String, T::Boolean] } }
+
+    @warnings_mutex = T.let(Thread::Mutex.new, Thread::Mutex)
+
+    # Reserve a warning for one caller in this process, including across threads.
+    sig { params(message: String).returns(T::Boolean) }
+    def self.claim_warning(message)
+      @warnings_mutex.synchronize do
+        return false if cache[message]
+
+        cache[message] = true
+      end
+    end
+
+    sig { override.void }
+    def self.clear_cache
+      @warnings_mutex.synchronize { super }
+    end
+
+    sig {
+      type_parameters(:U)
+        .params(file: T.any(IO, Pathname, String), _block: T.proc.returns(T.type_parameter(:U)))
+        .returns(T.type_parameter(:U))
+    }
+    def self.redirect_stdout(file, &_block)
+      out = $stdout.dup
+      $stdout.reopen(file)
+      yield
+    ensure
+      $stdout.reopen(out)
+      out.close
+    end
+
     # Mixin used to add these helpers to stdout and stderr.
     module Mixin
       extend T::Helpers
@@ -13,13 +51,7 @@ module Utils
       # Keep in sync with `ohai` in Library/Homebrew/utils.sh.
       sig { params(title: String).returns(String) }
       def ohai_title(title)
-        verbose = if respond_to?(:verbose?)
-          T.unsafe(self).verbose?
-        else
-          Context.current.verbose?
-        end
-
-        title = Tty.truncate(title.to_s) if $stdout.tty? && !verbose
+        title = Tty.truncate(title.to_s) if $stdout.tty? && !output_context?(:verbose?)
         Formatter.headline(title, color: :blue)
       end
 
@@ -31,13 +63,7 @@ module Utils
 
       sig { params(title: T.any(String, Exception), sput: T.anything, always_display: T::Boolean).void }
       def odebug(title, *sput, always_display: false)
-        debug = if respond_to?(:debug)
-          T.unsafe(self).debug?
-        else
-          Context.current.debug?
-        end
-
-        return if !debug && !always_display
+        return if !always_display && !output_context?(:debug?)
 
         $stderr.puts Formatter.headline(title.to_s, color: :magenta)
         $stderr.puts sput unless sput.empty?
@@ -45,13 +71,7 @@ module Utils
 
       sig { params(title: String, truncate: T.any(Symbol, T::Boolean)).returns(String) }
       def oh1_title(title, truncate: :auto)
-        verbose = if respond_to?(:verbose?)
-          T.unsafe(self).verbose?
-        else
-          Context.current.verbose?
-        end
-
-        title = Tty.truncate(title.to_s) if $stdout.tty? && !verbose && truncate == :auto
+        title = Tty.truncate(title.to_s) if $stdout.tty? && truncate == :auto && !output_context?(:verbose?)
         Formatter.headline(title, color: :green)
       end
 
@@ -74,6 +94,14 @@ module Utils
         Tty.with($stderr) do |stderr|
           stderr.puts Formatter.warning(message, label: "Warning")
         end
+      end
+
+      # Print a warning message once per process.
+      #
+      # @api public
+      sig { params(message: T.any(String, Exception)).void }
+      def opoo_once(message)
+        opoo message if Utils::Output.claim_warning(message.to_s)
       end
 
       sig { params(message: T.any(String, Exception)).void }
@@ -227,13 +255,18 @@ module Utils
 
         disable = true if disable_for_developers && Homebrew::EnvConfig.developer?
         if disable || Homebrew.raise_deprecation_exceptions?
-          require "utils/github/actions"
-          GitHub::Actions.puts_annotation_if_env_set!(:error, message, file:, line:)
           exception = MethodDeprecatedError.new(message)
           exception.set_backtrace(backtrace)
-          raise exception
+          begin
+            raise exception
+          rescue MethodDeprecatedError
+            require "utils/github/actions"
+            GitHub::Actions.puts_annotation_if_env_set!(:error, message, file:, line:)
+            # Do not offer an already-rejected exception to Ignorable again.
+            Kernel.raise
+          end
         elsif !Homebrew.auditing?
-          opoo message
+          opoo_once message
         end
       end
 
@@ -292,6 +325,18 @@ module Utils
         end
       end
 
+      sig { params(string: String, bold: T::Boolean).returns(String) }
+      def pretty_cannot_install(string, bold: true)
+        weight = bold ? Tty.bold.to_s : ""
+        if !$stdout.tty?
+          string
+        elsif Homebrew::EnvConfig.no_emoji?
+          Formatter.error("#{weight}#{string} (can't be installed)#{Tty.reset}")
+        else
+          "#{weight}#{string} #{Formatter.error("⊘")}#{Tty.reset}"
+        end
+      end
+
       # Keep status labels, colours and emoji in sync with
       # `pretty_uninstalled` in Library/Homebrew/utils.sh.
       sig { params(string: String, bold: T::Boolean).returns(String) }
@@ -329,11 +374,12 @@ module Utils
 
       sig {
         params(string: String, installed: T::Boolean, warning: T::Boolean, outdated: T::Boolean,
-               deprecated: T::Boolean, disabled: T::Boolean, mark_uninstalled: T::Boolean,
-               bold: T.nilable(T::Boolean)).returns(String)
+               deprecated: T::Boolean, disabled: T::Boolean, can_install: T::Boolean,
+               mark_uninstalled: T::Boolean, bold: T.nilable(T::Boolean)).returns(String)
       }
       def pretty_install_status(string, installed:, warning: false, outdated: false, deprecated: false,
-                                disabled: false, mark_uninstalled: true, bold: nil)
+                                disabled: false, can_install: true, mark_uninstalled: false,
+                                bold: nil)
         bold = installed if bold.nil?
         status = if warning
           pretty_warning(string, bold:)
@@ -341,6 +387,8 @@ module Utils
           pretty_upgradable(string, bold:)
         elsif installed
           pretty_installed(string)
+        elsif !can_install
+          pretty_cannot_install(string, bold:)
         elsif mark_uninstalled
           pretty_uninstalled(string, bold:)
         else
@@ -382,6 +430,14 @@ module Utils
 
         res << Utils.pluralize("second", seconds, include_count: true)
         res.freeze
+      end
+
+      private
+
+      # `verbose?` and `debug?` are duck-typed on includers such as `FormulaInstaller`.
+      sig { params(flag: Symbol).returns(T::Boolean) }
+      def output_context?(flag)
+        respond_to?(flag) ? public_send(flag) : Context.current.public_send(flag)
       end
     end
 

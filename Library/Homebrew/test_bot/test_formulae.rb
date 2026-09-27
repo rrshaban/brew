@@ -1,6 +1,7 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "package_manager_cache"
 require "trust"
 
 module Homebrew
@@ -11,6 +12,9 @@ module Homebrew
 
       sig { returns(Pathname) }
       attr_reader :artifact_cache
+
+      sig { returns(T::Hash[String, T::Array[String]]) }
+      attr_reader :downloaded_artifacts
 
       sig {
         params(
@@ -33,12 +37,93 @@ module Homebrew
         @tested_formulae = T.let([], T::Array[String])
       end
 
-      protected
+      sig { params(artifact_pattern: String, dry_run: T::Boolean).void }
+      def download_artifacts_from_previous_run!(artifact_pattern, dry_run:)
+        return if dry_run
+        return if GitHub::API.credentials_type == :none
+        return if (sha = previous_github_sha).blank?
 
-      sig { returns(T::Hash[String, String]) }
-      def require_current_tap_trust_env
-        { "HOMEBREW_REQUIRE_TAP_TRUST" => "1" }
+        pull_number = github_event_payload&.dig("pull_request", "number")
+        return if pull_number.blank?
+
+        github_repository = ENV.fetch("GITHUB_REPOSITORY")
+        owner, repo = *github_repository.split("/")
+        raise "github_repository #{github_repository} is invalid" if owner.nil? || repo.nil?
+
+        pr_labels = GitHub.pull_request_labels(owner, repo, pull_number)
+        # Also disable bottle cache for PRs modifying workflows to avoid cache poisoning.
+        return if pr_labels.include?("CI-no-bottle-cache") || pr_labels.include?("workflows")
+
+        variables = {
+          owner:,
+          repo:,
+          commit: sha,
+        }
+
+        response = GitHub::API.open_graphql(GRAPHQL_QUERY, variables:)
+        check_suite_nodes = response.dig("repository", "object", "checkSuites", "nodes")
+        return if check_suite_nodes.blank?
+
+        wanted_artifacts = artifact_metadata(check_suite_nodes, github_repository, "pull_request",
+                                             "CI", "conclusion", artifact_pattern)
+        wanted_artifacts_pattern = artifact_pattern
+        if wanted_artifacts.empty?
+          # If we didn't find the artifacts that we wanted, fall back to the `event_payload` artifact.
+          wanted_artifacts = artifact_metadata(check_suite_nodes, github_repository, "pull_request_target",
+                                               "Triage tasks", "upload-metadata", "event_payload")
+          wanted_artifacts_pattern = "event_payload"
+        end
+        return if wanted_artifacts.empty?
+
+        if (attempted_artifact = wanted_artifacts.find do |artifact|
+              @downloaded_artifacts.fetch(sha, []).include?(artifact.fetch("name"))
+            end)
+          opoo "Already tried #{attempted_artifact.fetch("name")} from #{sha}, giving up"
+          return
+        end
+
+        cached_event_json&.unlink if File.fnmatch?(wanted_artifacts_pattern, "event_payload", File::FNM_EXTGLOB)
+
+        require "utils/github/artifacts"
+
+        ohai "Downloading artifacts matching pattern #{wanted_artifacts_pattern} from #{sha}"
+        artifact_cache.mkpath
+        artifact_cache.cd do
+          wanted_artifacts.each do |artifact|
+            name = artifact.fetch("name")
+            ohai "Downloading artifact #{name} from #{sha}"
+            (@downloaded_artifacts[sha] ||= []) << name
+
+            download_url = artifact.fetch("archive_download_url")
+            artifact_id = artifact.fetch("id")
+            GitHub.download_artifact(download_url, artifact_id.to_s)
+          end
+        end
+
+        return if wanted_artifacts_pattern == artifact_pattern
+
+        # If we made it here, then we downloaded an `event_payload` artifact.
+        # We can now use this `event_payload` artifact to attempt to download the artifact we wanted.
+        download_artifacts_from_previous_run!(artifact_pattern, dry_run:)
+      rescue GitHub::API::AuthenticationFailedError => e
+        opoo e
       end
+
+      # A build could poison the package manager caches for the builds after
+      # it, so start each one with only the caches that verify their contents.
+      sig { void }
+      def cleanup_package_manager_caches
+        return if ENV["HOMEBREW_GITHUB_ACTIONS"].blank?
+
+        paths = Homebrew::PackageManagerCache.paths.select(&:exist?).reject do |path|
+          Homebrew::PackageManagerCache::CONTENT_ADDRESSED_DIRECTORIES.include?(path.basename.to_s)
+        end
+        # Go makes its module cache read-only.
+        paths.each { |path| FileUtils.chmod_R("u+w", path, force: true) }
+        FileUtils.rm_rf paths
+      end
+
+      protected
 
       sig { returns(T.nilable(Pathname)) }
       def cached_event_json
@@ -146,80 +231,6 @@ module Homebrew
         }
       GRAPHQL
 
-      sig { params(artifact_pattern: String, dry_run: T::Boolean).void }
-      def download_artifacts_from_previous_run!(artifact_pattern, dry_run:)
-        return if dry_run
-        return if GitHub::API.credentials_type == :none
-        return if (sha = previous_github_sha).blank?
-
-        pull_number = github_event_payload&.dig("pull_request", "number")
-        return if pull_number.blank?
-
-        github_repository = ENV.fetch("GITHUB_REPOSITORY")
-        owner, repo = *github_repository.split("/")
-        raise "github_repository #{github_repository} is invalid" if owner.nil? || repo.nil?
-
-        pr_labels = GitHub.pull_request_labels(owner, repo, pull_number)
-        # Also disable bottle cache for PRs modifying workflows to avoid cache poisoning.
-        return if pr_labels.include?("CI-no-bottle-cache") || pr_labels.include?("workflows")
-
-        variables = {
-          owner:,
-          repo:,
-          commit: sha,
-        }
-
-        response = GitHub::API.open_graphql(GRAPHQL_QUERY, variables:)
-        check_suite_nodes = response.dig("repository", "object", "checkSuites", "nodes")
-        return if check_suite_nodes.blank?
-
-        wanted_artifacts = artifact_metadata(check_suite_nodes, github_repository, "pull_request",
-                                             "CI", "conclusion", artifact_pattern)
-        wanted_artifacts_pattern = artifact_pattern
-        if wanted_artifacts.empty?
-          # If we didn't find the artifacts that we wanted, fall back to the `event_payload` artifact.
-          wanted_artifacts = artifact_metadata(check_suite_nodes, github_repository, "pull_request_target",
-                                               "Triage tasks", "upload-metadata", "event_payload")
-          wanted_artifacts_pattern = "event_payload"
-        end
-        return if wanted_artifacts.empty?
-
-        if (attempted_artifact = wanted_artifacts.find do |artifact|
-              # Hash value must exist due to the hash having a default value of an empty array.
-              T.must(@downloaded_artifacts[sha]).include?(artifact.fetch("name"))
-            end)
-          opoo "Already tried #{attempted_artifact.fetch("name")} from #{sha}, giving up"
-          return
-        end
-
-        cached_event_json&.unlink if File.fnmatch?(wanted_artifacts_pattern, "event_payload", File::FNM_EXTGLOB)
-
-        require "utils/github/artifacts"
-
-        ohai "Downloading artifacts matching pattern #{wanted_artifacts_pattern} from #{sha}"
-        artifact_cache.mkpath
-        artifact_cache.cd do
-          wanted_artifacts.each do |artifact|
-            name = artifact.fetch("name")
-            ohai "Downloading artifact #{name} from #{sha}"
-            # Hash value must exist due to the hash having a default value of an empty array.
-            T.must(@downloaded_artifacts[sha]) << name
-
-            download_url = artifact.fetch("archive_download_url")
-            artifact_id = artifact.fetch("id")
-            GitHub.download_artifact(download_url, artifact_id.to_s)
-          end
-        end
-
-        return if wanted_artifacts_pattern == artifact_pattern
-
-        # If we made it here, then we downloaded an `event_payload` artifact.
-        # We can now use this `event_payload` artifact to attempt to download the artifact we wanted.
-        download_artifacts_from_previous_run!(artifact_pattern, dry_run:)
-      rescue GitHub::API::AuthenticationFailedError => e
-        opoo e
-      end
-
       sig { params(formula: Formula, git_ref: String).returns(T::Boolean) }
       def no_diff?(formula, git_ref)
         return false unless repository.directory?
@@ -230,9 +241,10 @@ module Homebrew
           @fetched_refs << git_ref if steps.fetch(-1).passed?
         end
 
-        relative_formula_path = formula.path.relative_path_from(repository)
+        relative_paths = [formula.path.relative_path_from(repository).to_s]
+        relative_paths.concat(formula.patchlist.grep(LocalPatch).map { |patch| patch.file.to_s })
         !!system(git.to_s, "-C", repository.to_s, "diff", "--no-ext-diff", "--quiet", git_ref, "--",
-                 relative_formula_path.to_s)
+                 *relative_paths)
       end
 
       sig { params(formula: String, bottle_dir: Pathname).returns(T.nilable(T::Hash[String, T.untyped])) }
@@ -338,9 +350,7 @@ module Homebrew
       sig { params(formula: Formula, no_older_versions: T::Boolean).returns(T::Boolean) }
       def bottled?(formula, no_older_versions: false)
         # If a formula has an `:all` bottle, then all its dependencies have
-        # to be bottled too for us to use it. We only need to recurse
-        # up the dep tree when we encounter an `:all` bottle because
-        # a formula is not bottled unless its dependencies are.
+        # to be bottled too for us to use it.
         if formula.bottle_specification.tag?(Utils::Bottles.tag(:all))
           formula.deps.all? do |dep|
             bottle_no_older_versions = no_older_versions && (!dep.test? || dep.build?)
@@ -359,13 +369,15 @@ module Homebrew
         ).returns(T::Boolean)
       }
       def bottled_or_built?(formula, built_formulae, no_older_versions: false)
-        bottled?(formula, no_older_versions:) || built_formulae.include?(formula.full_name)
+        [formula, *formula.runtime_formula_dependencies(read_from_tab: false, undeclared: false)].all? do |dependency|
+          bottled?(dependency, no_older_versions:) || built_formulae.include?(dependency.full_name)
+        end
       end
 
       sig { params(formula: Formula).returns(T::Boolean) }
       def downloads_using_homebrew_curl?(formula)
         [:stable, :head].any? do |spec_name|
-          next false unless (spec = formula.send(spec_name))
+          next false unless (spec = formula.public_send(spec_name))
 
           spec.using == :homebrew_curl || spec.resources.values.any? { |r| r.using == :homebrew_curl }
         end
@@ -384,7 +396,7 @@ module Homebrew
         return if (deps | reqs).none? { |d| d.name == "mercurial" && d.build? }
 
         test "brew", "install", "mercurial",
-             env:  { "HOMEBREW_DEVELOPER" => nil }
+             env: { "HOMEBREW_DEVELOPER" => nil }
       end
 
       sig { params(deps: T::Array[Dependency], reqs: T::Array[Requirement]).void }
@@ -392,7 +404,7 @@ module Homebrew
         return if (deps | reqs).none? { |d| d.name == "subversion" && d.build? }
 
         test "brew", "install", "subversion",
-             env:  { "HOMEBREW_DEVELOPER" => nil }
+             env: { "HOMEBREW_DEVELOPER" => nil }
       end
 
       sig { params(formula_name: String, reason: String).void }

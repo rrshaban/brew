@@ -153,11 +153,111 @@ RSpec.describe Cask::DSL, :cask, :no_api do
         end
       end
     end
+
+    context "with checksums for only one OS" do
+      it "has no checksum on macOS when only Linux checksums are set" do
+        Homebrew::SimulateSystem.with(os: :macos, arch: :arm) do
+          cask = Cask::Cask.new("checksum-cask") do
+            sha256 x86_64_linux: "imasha2intellinux", arm64_linux: "imasha2armlinux"
+          end
+
+          expect(cask.sha256).to be_nil
+        end
+      end
+
+      it "stores the matching checksum on Linux" do
+        Homebrew::SimulateSystem.with(os: :linux, arch: :intel) do
+          cask = Cask::Cask.new("checksum-cask") do
+            sha256 x86_64_linux: "imasha2intellinux", arm64_linux: "imasha2armlinux"
+          end
+
+          expect(cask.sha256).to eq("imasha2intellinux")
+        end
+      end
+
+      it "has no checksum on Linux when only macOS checksums are set" do
+        Homebrew::SimulateSystem.with(os: :linux, arch: :arm) do
+          cask = Cask::Cask.new("checksum-cask") do
+            sha256 arm: "imasha2arm", intel: "imasha2intel"
+          end
+
+          expect(cask.sha256).to be_nil
+        end
+      end
+
+      it "has no checksum when simulating an architecture whose checksum is missing" do
+        Homebrew::SimulateSystem.with(os: :macos, arch: :intel) do
+          cask = Cask::Cask.new("checksum-cask") do
+            sha256 arm: "imasha2arm", arm64_linux: "imasha2armlinux"
+          end
+
+          expect(cask.sha256).to be_nil
+        end
+      end
+
+      it "loads the architecture requirement when the running-architecture checksum is missing" do
+        allow(Homebrew::SimulateSystem).to receive(:simulating?).and_return(false)
+
+        Homebrew::SimulateSystem.with(os: :linux, arch: :intel) do
+          cask = Cask::Cask.new("checksum-cask") do
+            sha256 arm64_linux: "imasha2armlinux", intel: "imasha2intel"
+            depends_on arch: :arm64
+          end
+
+          expect([cask.sha256, cask.depends_on.arch]).to eq([nil, [{ type: :arm, bits: 64 }]])
+        end
+      end
+    end
   end
 
-  describe "no_autobump! stanze" do
+  describe "no_autobump! stanza" do
     it "returns true if no_autobump! is not set" do
       expect(cask.autobump?).to be(true)
+    end
+
+    it "rejects the disabled reason in a current cask" do
+      expect do
+        Cask::Cask.new("test-cask") do
+          no_autobump! because: :requires_manual_review
+        end
+      end.to raise_error(ArgumentError, /'because' argument/)
+    end
+
+    it "loads the disabled reason from installed cask metadata" do
+      caskfile = mktmpdir/"test-cask.rb"
+      caskfile.dirname.mkpath
+      caskfile.write <<~RUBY
+        cask "test-cask" do
+          no_autobump! because: :requires_manual_review
+        end
+      RUBY
+
+      expect(Cask::CaskLoader::FromInstalledPathLoader.new(caskfile).load(config: nil).no_autobump_message)
+        .to eq(:requires_manual_review)
+    end
+
+    it "rejects an unknown reason in a current cached cask" do
+      caskfile = Cask::Cache.path/"test-cask.rb"
+      caskfile.dirname.mkpath
+      caskfile.write <<~RUBY
+        cask "test-cask" do
+          no_autobump! because: :unknown_reason
+        end
+      RUBY
+
+      expect { Cask::CaskLoader.load(caskfile) }.to raise_error(Cask::CaskUnreadableError, /'because' argument/)
+    end
+
+    it "rejects the removed reason in a current cask loaded from a URI", :needs_utils_curl do
+      caskfile = mktmpdir/"test-cask.rb"
+      caskfile.write <<~RUBY
+        cask "test-cask" do
+          no_autobump! because: :requires_manual_review
+        end
+      RUBY
+
+      expect { Cask::CaskLoader.load("file://#{caskfile}") }
+        .to raise_error(Cask::CaskUnreadableError, /'because' argument/)
     end
 
     context "when no_autobump! is set" do
@@ -358,6 +458,14 @@ RSpec.describe Cask::DSL, :cask, :no_api do
     it "prevents defining multiple urls" do
       expect { cask }.to raise_error(Cask::CaskInvalidError, /'url' stanza may only appear once/)
     end
+
+    it "deprecates the verified parameter for tap casks" do
+      expect do
+        Cask::Cask.new("legacy-verified") do
+          url "https://cdn.example.com/app.dmg", verified: "cdn.example.com/"
+        end
+      end.to raise_error(MethodDeprecatedError, /verified/)
+    end
   end
 
   describe "homepage stanza" do
@@ -365,6 +473,22 @@ RSpec.describe Cask::DSL, :cask, :no_api do
 
     it "prevents defining multiple homepages" do
       expect { cask }.to raise_error(Cask::CaskInvalidError, /'homepage' stanza may only appear once/)
+    end
+
+    it "records when a human browsed the homepage" do
+      cask = Cask::Cask.new("cask-with-browsed-homepage") do
+        homepage "https://brew.sh/", browsed: "2026-07-26"
+      end
+
+      expect(cask.homepage_browsed).to eq(Date.new(2026, 7, 26))
+    end
+
+    it "requires a homepage URL when a human browser check is specified" do
+      expect do
+        Cask::Cask.new("cask-without-homepage") do
+          homepage browsed: "2026-07-26"
+        end
+      end.to raise_error(Cask::CaskInvalidError, /`browsed` requires a homepage URL/)
     end
   end
 
@@ -504,6 +628,23 @@ RSpec.describe Cask::DSL, :cask, :no_api do
         end
       end
     end
+
+    context "when only an arch block declares the macOS version" do
+      it "requires macOS because arch blocks are evaluated on every OS" do
+        Homebrew::SimulateSystem.with(os: :linux, arch: :arm) do
+          cask = Cask::Cask.new("with-arch-scoped-macos-version") do
+            on_arm do
+              depends_on macos: :ventura
+            end
+            on_intel do
+              depends_on macos: :monterey
+            end
+          end
+
+          expect(cask.depends_on.requires_macos?).to be true
+        end
+      end
+    end
   end
 
   describe "depends_on linux" do
@@ -605,9 +746,7 @@ RSpec.describe Cask::DSL, :cask, :no_api do
       end
       Homebrew::Trust.trust!(:cask, "#{tap}/requested-cask")
 
-      with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-        expect { Cask::Installer.new(cask).check_conflicts }.not_to raise_error
-      end
+      expect { Cask::Installer.new(cask).check_conflicts }.not_to raise_error
     ensure
       FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
     end
@@ -632,10 +771,8 @@ RSpec.describe Cask::DSL, :cask, :no_api do
       end
       Homebrew::Trust.trust!(:cask, "#{tap}/requested-cask")
 
-      with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-        expect { Cask::Installer.new(cask).check_conflicts }
-          .to raise_error(Cask::CaskConflictError, "Cask 'requested-cask' conflicts with 'conflicting-cask'.")
-      end
+      expect { Cask::Installer.new(cask).check_conflicts }
+        .to raise_error(Cask::CaskConflictError, "Cask 'requested-cask' conflicts with 'conflicting-cask'.")
     ensure
       FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
     end
@@ -647,6 +784,16 @@ RSpec.describe Cask::DSL, :cask, :no_api do
 
       it "allows conflicts_with stanza to be specified" do
         expect(cask.conflicts_with[:formula]).to be_empty
+      end
+    end
+
+    context "when specified multiple times" do
+      let(:token) { "with-conflicts-with-multiple" }
+
+      it "merges and deduplicates all conflicts_with stanzas" do
+        os_conflict = OS.mac? ? "macos-caffeine" : "linux-caffeine"
+        expect(cask.conflicts_with[:cask])
+          .to eq(Set.new(["local-caffeine", "with-caffeine", os_conflict]))
       end
     end
 
@@ -676,7 +823,7 @@ RSpec.describe Cask::DSL, :cask, :no_api do
 
       it "allows installer manual to be specified" do
         installer = cask.artifacts.first
-        expect(installer.instance_variable_get(:@manual_install)).to be true
+        expect(installer.manual_install).to be true
         expect(installer.path).to eq(Pathname("Caffeine.app"))
       end
     end
@@ -733,11 +880,11 @@ RSpec.describe Cask::DSL, :cask, :no_api do
   describe "#artifacts" do
     it "sorts artifacts according to the preferable installation order" do
       cask = Cask::Cask.new("appdir-trailing-slash") do
-        postflight do
+        postflight_steps do
           next
         end
 
-        preflight do
+        preflight_steps do
           next
         end
 
@@ -747,10 +894,10 @@ RSpec.describe Cask::DSL, :cask, :no_api do
       end
 
       expect(cask.artifacts.map { |artifact| artifact.class.dsl_key }).to eq [
-        :preflight,
+        :preflight_steps,
         :app,
         :binary,
-        :postflight,
+        :postflight_steps,
       ]
     end
   end

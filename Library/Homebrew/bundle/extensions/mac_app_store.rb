@@ -54,14 +54,34 @@ module Homebrew
           @outdated_app_ids = T.let(nil, T.nilable(T::Array[String]))
         end
 
+        sig { override.params(_name: String, _options: Homebrew::Bundle::EntryOptions).returns(T::Boolean) }
+        def batch_installable?(_name, _options = {})
+          true
+        end
+
+        sig { override.params(entries: T::Array[Dsl::Entry], verbose: T::Boolean).returns(T::Boolean) }
+        def install_batch!(entries, verbose: false)
+          outdated_entries, fresh_entries = entries.partition do |entry|
+            app_id_installed?(T.cast(entry.options.fetch(:id), Integer))
+          end
+          mas = package_manager_executable!
+          upgraded = outdated_entries.empty? || Bundle.system(
+            mas, "upgrade", *outdated_entries.map { |entry| entry.options.fetch(:id).to_s }, verbose:
+          )
+          fresh_installed = fresh_entries.empty? || Bundle.system(
+            mas, "install", *fresh_entries.map { |entry| entry.options.fetch(:id).to_s }, verbose:
+          ) || Bundle.system(mas, "get", *fresh_entries.map { |entry| entry.options.fetch(:id).to_s }, verbose:)
+          upgraded && fresh_installed
+        end
+
         sig { returns(T::Array[[String, String]]) }
         def apps
           apps = @apps
           return apps if apps
 
           @apps = if (mas = package_manager_executable)
-            `#{mas} list 2>/dev/null`.split("\n").filter_map do |app|
-              app_details = app.match(/\A\s*(?<id>\d+)\s+(?<name>.*?)\s+\((?<version>[\d.]*)\)\Z/)
+            Utils.popen_read_text(mas, "list", err: File::NULL).split("\n").filter_map do |app|
+              app_details = app.match(/\A\s*(?<id>\d+)\s+(?<name>.*?)\s+\(?(?<version>[\d.]*)\)?\Z/)
               next if app_details.nil?
 
               id = app_details[:id]
@@ -169,7 +189,7 @@ module Homebrew
           return outdated_app_ids if outdated_app_ids
 
           @outdated_app_ids = if (mas = package_manager_executable)
-            `#{mas} outdated 2>/dev/null`.split("\n").map do |app|
+            Utils.popen_read_text(mas, "outdated", err: File::NULL).split("\n").map do |app|
               app.split(" ", 2).first.to_s
             end
           end

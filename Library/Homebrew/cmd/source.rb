@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/browser"
+
 require "abstract_command"
 require "formula"
 require "utils/curl"
@@ -24,7 +26,7 @@ module Homebrew
       sig { override.void }
       def run
         if args.no_named?
-          exec_browser "https://github.com/Homebrew/brew"
+          Utils::Browser.open "https://github.com/Homebrew/brew"
           return
         end
 
@@ -42,27 +44,7 @@ module Homebrew
 
         return if repo_urls.empty?
 
-        exec_browser(*repo_urls)
-      end
-
-      private
-
-      sig { params(formula: Formula).returns(T.nilable(String)) }
-      def extract_repo_url(formula)
-        urls_to_check = [
-          formula.head&.url,
-          formula.stable&.url,
-          formula.homepage,
-        ]
-
-        urls_to_check.each do |url|
-          next if url.nil?
-
-          repo_url = url_to_repo(url)
-          return repo_url if repo_url
-        end
-
-        nil
+        Utils::Browser.open(*repo_urls)
       end
 
       sig { params(url: String).returns(T.nilable(String)) }
@@ -205,6 +187,26 @@ module Homebrew
         url = JSON.parse(stdout).dig("repository", "url")
         url&.delete_prefix("git+")
       rescue JSON::ParserError
+        nil
+      end
+
+      private
+
+      sig { params(formula: Formula).returns(T.nilable(String)) }
+      def extract_repo_url(formula)
+        urls_to_check = [
+          formula.head&.url,
+          formula.stable&.url,
+          formula.homepage,
+        ]
+
+        urls_to_check.each do |url|
+          next if url.nil?
+
+          repo_url = url_to_repo(url)
+          return repo_url if repo_url
+        end
+
         nil
       end
     end

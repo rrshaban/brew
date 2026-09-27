@@ -13,6 +13,12 @@ class Tab < AbstractTab
   sig { returns(T.nilable(T::Boolean)) }
   attr_accessor :built_as_bottle
 
+  sig { returns(T.nilable(String)) }
+  attr_accessor :built_prefix
+
+  sig { returns(T.nilable(T::Boolean)) }
+  attr_accessor :padded_prefix
+
   sig { returns(T.nilable(T.any(String, Symbol))) }
   attr_accessor :stdlib
 
@@ -37,20 +43,64 @@ class Tab < AbstractTab
   sig { returns(T.nilable(T::Array[Pathname])) }
   attr_accessor :changed_files
 
-  sig { params(attributes: T.any(T::Hash[String, T.untyped], T::Hash[Symbol, T.untyped])).void }
-  def initialize(attributes = {})
-    @poured_from_bottle = T.let(nil, T.nilable(T::Boolean))
-    @built_as_bottle = T.let(nil, T.nilable(T::Boolean))
-    @changed_files = T.let(nil, T.nilable(T::Array[Pathname]))
-    @stdlib = T.let(nil, T.nilable(T.any(String, Symbol)))
-    @aliases = T.let(nil, T.nilable(T::Array[String]))
-    @used_options = T.let(nil, T.nilable(T::Array[String]))
-    @unused_options = T.let(nil, T.nilable(T::Array[String]))
-    @compiler = T.let(nil, T.nilable(T.any(String, Symbol)))
-    @source_modified_time = T.let(nil, T.nilable(Integer))
-    @tapped_from = T.let(nil, T.nilable(String))
+  sig { returns(T.nilable(T::Array[Pathname])) }
+  attr_accessor :linkage_files
 
-    super
+  sig { returns(T.nilable(T::Array[Pathname])) }
+  attr_accessor :binary_relocation_files
+
+  # The prefix a poured bottle was built for, when it was patched in place.
+  sig { returns(T.nilable(String)) }
+  attr_accessor :relocated_build_prefix
+
+  sig { returns(T.nilable(T::Array[Pathname])) }
+  attr_accessor :relocated_files
+
+  sig {
+    params(poured_from_bottle:      T.nilable(T::Boolean),
+           built_as_bottle:         T.nilable(T::Boolean),
+           built_prefix:            T.nilable(String),
+           padded_prefix:           T.nilable(T::Boolean),
+           changed_files:           T.nilable(T::Array[T.any(Pathname, String)]),
+           linkage_files:           T.nilable(T::Array[T.any(Pathname, String)]),
+           binary_relocation_files: T.nilable(T::Array[T.any(Pathname, String)]),
+           relocated_build_prefix:  T.nilable(String),
+           relocated_files:         T.nilable(T::Array[T.any(Pathname, String)]),
+           stdlib:                  T.nilable(T.any(String, Symbol)),
+           aliases:                 T.nilable(T::Array[String]),
+           used_options:            T.nilable(T::Array[String]),
+           unused_options:          T.nilable(T::Array[String]),
+           compiler:                T.nilable(T.any(String, Symbol)),
+           source_modified_time:    T.nilable(Integer),
+           tapped_from:             T.nilable(String),
+           rest:                    T.untyped).void
+  }
+  def initialize(poured_from_bottle: nil, built_as_bottle: nil, built_prefix: nil, padded_prefix: nil,
+                 changed_files: nil,
+                 linkage_files: nil, binary_relocation_files: nil, relocated_build_prefix: nil,
+                 relocated_files: nil, stdlib: nil, aliases: nil, used_options: nil, unused_options: nil,
+                 compiler: nil, source_modified_time: nil, tapped_from: nil, **rest)
+    @poured_from_bottle = poured_from_bottle
+    @built_as_bottle = built_as_bottle
+    @built_prefix = built_prefix
+    @padded_prefix = padded_prefix
+    @changed_files = T.let(changed_files&.map { |f| Pathname(f) }, T.nilable(T::Array[Pathname]))
+    @linkage_files = T.let(linkage_files&.map { |f| Pathname(f) }, T.nilable(T::Array[Pathname]))
+    @binary_relocation_files = T.let(
+      binary_relocation_files&.map { |f| Pathname(f) },
+      T.nilable(T::Array[Pathname]),
+    )
+    @relocated_build_prefix = relocated_build_prefix
+    @relocated_files = T.let(relocated_files&.map { |f| Pathname(f) }, T.nilable(T::Array[Pathname]))
+    @stdlib = stdlib
+    @aliases = aliases
+    @used_options = used_options
+    @unused_options = unused_options
+    @compiler = compiler
+    @source_modified_time = source_modified_time
+    @tapped_from = tapped_from
+
+    super(**rest)
   end
 
   # Instantiates a {Tab} for a new installation of a formula.
@@ -69,17 +119,14 @@ class Tab < AbstractTab
     tab.unused_options = build.unused_options.as_flags
     tab.tabfile = formula.prefix/FILENAME
     tab.built_as_bottle = build.bottle?
+    tab.built_prefix = HOMEBREW_PREFIX.to_s if build.bottle? && !Homebrew.default_prefix?
     tab.poured_from_bottle = false
     tab.source_modified_time = formula.source_modified_time.to_i
     tab.compiler = compiler
     tab.stdlib = stdlib
     tab.aliases = formula.aliases
     tab.runtime_dependencies = Tab.runtime_deps_hash(formula, runtime_deps)
-    active_spec = if formula.active_spec_sym == :head
-      T.must(formula.head)
-    else
-      T.must(formula.stable)
-    end
+    active_spec = formula.active_spec
 
     tab.source["spec"] = formula.active_spec_sym.to_s
     tab.source["path"] = formula.specified_path.to_s
@@ -172,9 +219,13 @@ class Tab < AbstractTab
   def self.for_formula(formula)
     paths = []
 
-    paths << formula.opt_prefix.resolved_path if formula.opt_prefix.symlink? && formula.opt_prefix.directory?
+    if formula.opt_prefix.symlink? && formula.opt_prefix.directory?
+      paths << Utils::Path.resolved_path(formula.opt_prefix)
+    end
 
-    paths << formula.linked_keg.resolved_path if formula.linked_keg.symlink? && formula.linked_keg.directory?
+    if formula.linked_keg.symlink? && formula.linked_keg.directory?
+      paths << Utils::Path.resolved_path(formula.linked_keg)
+    end
 
     if (dirs = formula.installed_prefixes).length == 1
       paths << dirs.first
@@ -357,11 +408,17 @@ class Tab < AbstractTab
       "used_options"             => used_options.as_flags,
       "unused_options"           => unused_options.as_flags,
       "built_as_bottle"          => built_as_bottle,
+      "built_prefix"             => built_prefix,
+      "padded_prefix"            => padded_prefix,
       "poured_from_bottle"       => poured_from_bottle,
       "loaded_from_api"          => loaded_from_api,
       "loaded_from_internal_api" => loaded_from_internal_api,
       "installed_on_request"     => installed_on_request,
       "changed_files"            => changed_files&.map(&:to_s),
+      "linkage_files"            => linkage_files&.map(&:to_s),
+      "binary_relocation_files"  => binary_relocation_files&.map(&:to_s),
+      "relocated_build_prefix"   => relocated_build_prefix,
+      "relocated_files"          => relocated_files&.map(&:to_s),
       "time"                     => time,
       "source_modified_time"     => source_modified_time.to_i,
       "stdlib"                   => stdlib&.to_s,
@@ -373,6 +430,12 @@ class Tab < AbstractTab
       "built_on"                 => built_on,
     }
     attributes.delete("stdlib") if attributes["stdlib"].blank?
+    attributes.delete("built_prefix") if attributes["built_prefix"].nil?
+    attributes.delete("padded_prefix") if attributes["padded_prefix"].nil?
+    attributes.delete("linkage_files") if attributes["linkage_files"].nil?
+    attributes.delete("binary_relocation_files") if attributes["binary_relocation_files"].nil?
+    attributes.delete("relocated_build_prefix") if attributes["relocated_build_prefix"].nil?
+    attributes.delete("relocated_files") if attributes["relocated_files"].nil?
 
     JSON.pretty_generate(attributes, options)
   end
@@ -381,17 +444,25 @@ class Tab < AbstractTab
   sig { returns(T::Hash[String, T.untyped]) }
   def to_bottle_hash
     attributes = {
-      "homebrew_version"     => homebrew_version,
-      "changed_files"        => changed_files&.map(&:to_s),
-      "source_modified_time" => source_modified_time.to_i,
-      "stdlib"               => stdlib&.to_s,
-      "compiler"             => compiler.to_s,
-      "runtime_dependencies" => runtime_dependencies,
-      "source"               => source.slice("scm_revision").compact.presence,
-      "arch"                 => arch,
-      "built_on"             => built_on,
+      "homebrew_version"        => homebrew_version,
+      "built_prefix"            => built_prefix,
+      "padded_prefix"           => padded_prefix,
+      "changed_files"           => changed_files&.map(&:to_s),
+      "linkage_files"           => linkage_files&.map(&:to_s),
+      "binary_relocation_files" => binary_relocation_files&.map(&:to_s),
+      "source_modified_time"    => source_modified_time.to_i,
+      "stdlib"                  => stdlib&.to_s,
+      "compiler"                => compiler.to_s,
+      "runtime_dependencies"    => runtime_dependencies,
+      "source"                  => source.slice("scm_revision").compact.presence,
+      "arch"                    => arch,
+      "built_on"                => built_on,
     }
     attributes.delete("stdlib") if attributes["stdlib"].blank?
+    attributes.delete("built_prefix") if attributes["built_prefix"].nil?
+    attributes.delete("padded_prefix") if attributes["padded_prefix"].nil?
+    attributes.delete("linkage_files") if attributes["linkage_files"].nil?
+    attributes.delete("binary_relocation_files") if attributes["binary_relocation_files"].nil?
     attributes.delete("source") if attributes["source"].blank?
     attributes
   end

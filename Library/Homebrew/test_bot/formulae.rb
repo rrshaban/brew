@@ -71,6 +71,7 @@ module Homebrew
           if testing_portable_ruby?
             portable_formula!(f, args:)
           else
+            cleanup_package_manager_caches
             formula!(f, args:)
           end
           puts
@@ -105,109 +106,22 @@ module Homebrew
         FileUtils.rm_rf artifact_cache
       end
 
-      private
-
-      sig { void }
-      def install_ca_certificates_if_needed
-        return if DevelopmentTools.ca_file_handles_most_https_certificates?
-
-        test "brew", "install", "--formulae", "ca-certificates",
-             env: { "HOMEBREW_DEVELOPER" => nil }
-      end
-
-      sig { params(formula: Formula, formula_name: String, args: Homebrew::Cmd::TestBotCmd::Args).void }
-      def setup_formulae_deps_instances(formula, formula_name, args:)
-        conflicts = T.let(formula.conflicts, T::Array[T.any(Formula, Formula::FormulaConflict)])
-        formula_recursive_dependencies = formula.recursive_dependencies.map(&:to_formula)
-        formula_recursive_dependencies.each do |dependency|
-          conflicts += dependency.conflicts
-        end
-
-        # If we depend on a versioned formula, make sure to unlink any other
-        # installed versions to make sure that we use the right one.
-        versioned_dependencies = formula_recursive_dependencies.select(&:versioned_formula?)
-        versioned_dependencies.each do |dependency|
-          alternative_versions = dependency.versioned_formulae
-
-          begin
-            unversioned_name = dependency.name.sub(/@\d+(\.\d+)*$/, "")
-            alternative_versions << Formula[unversioned_name]
-          rescue FormulaUnavailableError
-            nil
-          end
-
-          unneeded_alternative_versions = alternative_versions - formula_recursive_dependencies
-          conflicts += unneeded_alternative_versions
-        end
-
-        unlink_formulae = conflicts.map(&:name)
-        unlink_formulae.uniq.each do |name|
-          unlink_formula = Formulary.factory(name)
-          next unless unlink_formula.latest_version_installed?
-          next unless unlink_formula.linked_keg.exist?
-
-          test "brew", "unlink", name
-        end
-
-        info_header "Determining dependencies..."
-        installed = Utils.safe_popen_read("brew", "list", "--formula", "--full-name").split("\n")
-        dependencies =
-          Utils.safe_popen_read("brew", "deps", "--formula",
-                                "--include-build",
-                                "--include-test",
-                                "--full-name",
-                                formula_name)
-               .split("\n")
-        installed_dependencies = installed & dependencies
-        installed_dependencies.each do |name|
-          link_formula = Formulary.factory(name)
-          next if link_formula.keg_only?
-          next if link_formula.linked_keg.exist?
-          next if unlink_formulae.include?(name)
-
-          test "brew", "link", name
-        end
-
-        dependencies -= installed
-        @unchanged_dependencies = dependencies - @testing_formulae
-        unless @unchanged_dependencies.empty?
-          test "brew", "fetch", "--formulae", "--retry",
-               *@unchanged_dependencies
-        end
-
-        changed_dependencies = dependencies - @unchanged_dependencies
-        unless changed_dependencies.empty?
-          test "brew", "fetch", "--formulae", "--retry", "--build-from-source",
-               *changed_dependencies
-
-          ignore_failures = !args.test_default_formula? && changed_dependencies.any? do |dep|
-            !bottled?(Formulary.factory(dep), no_older_versions: true)
-          end
-
-          # Install changed dependencies as new bottles so we don't have
-          # checksum problems. We have to install all `changed_dependencies`
-          # in one `brew install` command to make sure they are installed in
-          # the right order.
-          test("brew", "install", "--formulae", "--build-from-source",
-               named_args:      changed_dependencies,
-               ignore_failures:)
-          # Run postinstall on them because the tested formula might depend on
-          # this step
-          test "brew", "postinstall", named_args: changed_dependencies, ignore_failures:
-        end
-
-        runtime_or_test_dependencies =
-          Utils.safe_popen_read("brew", "deps", "--formula", "--include-test", formula_name)
-               .split("\n")
-        build_dependencies = dependencies - runtime_or_test_dependencies
-        @unchanged_build_dependencies = build_dependencies - @testing_formulae
-      end
-
       sig { params(formula: Formula).void }
       def cleanup_bottle_etc_var(formula)
         # Restore bottled `etc`/`var` through `Formula#install_etc_var`, keeping
         # test-bot cleanup aligned with `InstallRenamed` config handling.
         formula.install_etc_var
+      end
+
+      sig { params(dependencies: T::Array[String]).void }
+      def install_padded_prefix_source_dependencies(dependencies)
+        return if HOMEBREW_PREFIX.to_s != Utils::Bottles.tag.padded_prefix
+
+        source_dependencies = dependencies.select { |dependency| Formulary.factory(dependency).bottle.nil? }
+        return if source_dependencies.empty?
+
+        test "brew", "install", "--formulae", "--build-from-source",
+             named_args: source_dependencies
       end
 
       sig { returns(T::Boolean) }
@@ -260,95 +174,6 @@ module Homebrew
         end
       end
 
-      sig { params(formula: Formula, new_formula: T.nilable(T::Boolean), args: Homebrew::Cmd::TestBotCmd::Args).void }
-      def bottle_reinstall_formula(formula, new_formula, args:)
-        unless build_bottle?(formula, args:)
-          @bottle_filename = T.let(nil, T.nilable(Pathname))
-          return
-        end
-
-        root_url = args.root_url
-
-        # GitHub Releases url
-        root_url ||= if tap.present? && !T.must(tap).core_tap? && !args.test_default_formula?
-          "#{T.must(tap).default_remote}/releases/download/#{formula.name}-#{formula.pkg_version}"
-        end
-
-        setup_bottle_sudo_purge!(args:)
-
-        bottle_args = ["--verbose", "--json", formula.full_name]
-        bottle_args << "--keep-old" if args.keep_old? && !new_formula
-        bottle_args << "--skip-relocation" if args.skip_relocation?
-        bottle_args << "--force-core-tap" if args.test_default_formula?
-        bottle_args << "--root-url=#{root_url}" if root_url
-        bottle_args << "--only-json-tab" if args.only_json_tab?
-
-        verify_local_bottles
-        test "brew", "bottle", *bottle_args
-        bottle_step = steps.fetch(-1)
-
-        if !bottle_step.passed? || !bottle_step.output?
-          failed formula.full_name, "bottling failed" unless args.dry_run?
-          return
-        end
-
-        @bottle_filename = Pathname.new(
-          T.must(bottle_step.output)
-           .gsub(%r{.*(\./\S+#{HOMEBREW_BOTTLES_EXTNAME_REGEX}).*}om, '\1'),
-        )
-        @bottle_json_filename = Pathname.new(
-          @bottle_filename.to_s.gsub(/\.(\d+\.)?tar\.gz$/, ".json"),
-        )
-
-        @bottle_checksums[@bottle_filename.realpath] = @bottle_filename.sha256
-        @bottle_checksums[@bottle_json_filename.realpath] = @bottle_json_filename.sha256
-
-        @bottle_output_path.write(bottle_step.output, mode: "a")
-
-        bottle_merge_args =
-          ["--merge", "--write", "--no-commit", "--no-all-checks", @bottle_json_filename.to_s]
-        bottle_merge_args << "--keep-old" if args.keep_old? && !new_formula
-
-        test "brew", "bottle", *bottle_merge_args
-        annotate_missing_all_bottle(formula) if steps.fetch(-1).passed?
-        test "brew", "uninstall", "--formula", "--force", "--ignore-dependencies", formula.full_name
-
-        @testing_formulae.delete(formula.name)
-
-        unless @unchanged_build_dependencies.empty?
-          test "brew", "uninstall", "--formulae", "--force", "--ignore-dependencies", *@unchanged_build_dependencies
-          @unchanged_dependencies -= @unchanged_build_dependencies
-        end
-
-        verify_attestations = if formula.name == "gh"
-          nil
-        else
-          ENV.fetch("HOMEBREW_VERIFY_ATTESTATIONS", nil)
-        end
-        test "brew", "install", "--only-dependencies", @bottle_filename.to_s,
-             env: { "HOMEBREW_VERIFY_ATTESTATIONS" => verify_attestations }
-        test "brew", "install", @bottle_filename.to_s,
-             env: { "HOMEBREW_VERIFY_ATTESTATIONS" => verify_attestations }
-      end
-
-      sig { params(formula: Formula, args: Homebrew::Cmd::TestBotCmd::Args).returns(T::Boolean) }
-      def build_bottle?(formula, args:)
-        # Build and runtime dependencies must be bottled on the current OS,
-        # but accept an older compatible bottle for test dependencies.
-        return false if formula.deps.any? do |dep|
-          !bottled_or_built?(
-            dep.to_formula,
-            @built_formulae - @skipped_or_failed_formulae,
-            no_older_versions: !dep.test?,
-          )
-        end
-
-        !args.build_from_source?
-      end
-
-      sig { params(args: Homebrew::Cmd::TestBotCmd::Args).void }
-      def setup_bottle_sudo_purge!(args:); end
-
       sig { params(dependency: Dependency, dependency_name: String).returns(T::Boolean) }
       def dependency_name_match?(dependency, dependency_name)
         return true if dependency.name == dependency_name
@@ -356,15 +181,6 @@ module Homebrew
         return false if Utils.tap_from_full_name(dependency_name).present?
 
         Utils.name_from_full_name(dependency.name) == Utils.name_from_full_name(dependency_name)
-      end
-
-      sig { params(_formula: Formula, dependencies: T::Array[Dependency]).returns(T::Array[String]) }
-      def recursive_runtime_dependency_names(_formula, dependencies)
-        dependencies.each_with_object(Set.new) do |dep, set|
-          dep_f = dep.to_formula
-          set.add(dep_f.full_name)
-          set.merge(dep_f.runtime_dependencies(read_from_tab: false, undeclared: false).map(&:name))
-        end.to_a
       end
 
       sig { params(formula: Formula).void }
@@ -517,6 +333,208 @@ module Homebrew
         opoo "Failed to determine missing `:all` bottle impact for #{formula.full_name}: #{e}"
       end
 
+      sig { returns(T::Boolean) }
+      def testing_portable_ruby?
+        !!tap&.core_tap? && @testing_formulae.include?("portable-ruby")
+      end
+
+      private
+
+      sig { void }
+      def install_ca_certificates_if_needed
+        return unless DevelopmentTools.ca_file_substitution_required?
+
+        test "brew", "install", "--formulae", "ca-certificates",
+             env: { "HOMEBREW_DEVELOPER" => nil }
+      end
+
+      sig { params(formula: Formula, formula_name: String, args: Homebrew::Cmd::TestBotCmd::Args).void }
+      def setup_formulae_deps_instances(formula, formula_name, args:)
+        conflicts = T.let(formula.conflicts, T::Array[T.any(Formula, Formula::FormulaConflict)])
+        formula_recursive_dependencies = formula.recursive_dependencies.map(&:to_formula)
+        formula_recursive_dependencies.each do |dependency|
+          conflicts += dependency.conflicts
+        end
+
+        # If we depend on a versioned formula, make sure to unlink any other
+        # installed versions to make sure that we use the right one.
+        versioned_dependencies = formula_recursive_dependencies.select(&:versioned_formula?)
+        versioned_dependencies.each do |dependency|
+          alternative_versions = dependency.versioned_formulae
+
+          begin
+            unversioned_name = dependency.name.sub(/@\d+(?:\.\d+)*$/, "")
+            alternative_versions << Formula[unversioned_name]
+          rescue FormulaUnavailableError
+            nil
+          end
+
+          unneeded_alternative_versions = alternative_versions - formula_recursive_dependencies
+          conflicts += unneeded_alternative_versions
+        end
+
+        unlink_formulae = conflicts.map(&:name)
+        unlink_formulae.uniq.each do |name|
+          unlink_formula = Formulary.factory(name)
+          next unless unlink_formula.latest_version_installed?
+          next unless unlink_formula.linked_keg.exist?
+
+          test "brew", "unlink", name
+        end
+
+        info_header "Determining dependencies..."
+        installed = Utils.safe_popen_read("brew", "list", "--formula", "--full-name").split("\n")
+        dependencies =
+          Utils.safe_popen_read("brew", "deps", "--formula",
+                                "--include-build",
+                                "--include-test",
+                                "--full-name",
+                                formula_name)
+               .split("\n")
+        installed_dependencies = installed & dependencies
+        installed_dependencies.each do |name|
+          link_formula = Formulary.factory(name)
+          next if link_formula.keg_only?
+          next if link_formula.linked_keg.exist?
+          next if unlink_formulae.include?(name)
+
+          test "brew", "link", name
+        end
+
+        dependencies -= installed
+        @unchanged_dependencies = dependencies - @testing_formulae
+        unless @unchanged_dependencies.empty?
+          test "brew", "fetch", "--formulae", "--retry",
+               *@unchanged_dependencies
+          install_padded_prefix_source_dependencies(@unchanged_dependencies)
+        end
+
+        changed_dependencies = dependencies - @unchanged_dependencies
+        unless changed_dependencies.empty?
+          test "brew", "fetch", "--formulae", "--retry", "--build-from-source",
+               *changed_dependencies
+
+          ignore_failures = !args.test_default_formula? && changed_dependencies.any? do |dep|
+            !bottled?(Formulary.factory(dep), no_older_versions: true)
+          end
+
+          # Install changed dependencies as new bottles so we don't have
+          # checksum problems. We have to install all `changed_dependencies`
+          # in one `brew install` command to make sure they are installed in
+          # the right order.
+          test("brew", "install", "--formulae", "--build-from-source",
+               named_args:      changed_dependencies,
+               ignore_failures:)
+          # Run postinstall on them because the tested formula might depend on
+          # this step
+          test "brew", "postinstall", named_args: changed_dependencies, ignore_failures:
+        end
+
+        runtime_or_test_dependencies =
+          Utils.safe_popen_read("brew", "deps", "--formula", "--include-test", formula_name)
+               .split("\n")
+        build_dependencies = dependencies - runtime_or_test_dependencies
+        @unchanged_build_dependencies = build_dependencies - @testing_formulae
+      end
+
+      sig { params(formula: Formula, new_formula: T.nilable(T::Boolean), args: Homebrew::Cmd::TestBotCmd::Args).void }
+      def bottle_reinstall_formula(formula, new_formula, args:)
+        unless build_bottle?(formula, args:)
+          @bottle_filename = T.let(nil, T.nilable(Pathname))
+          return
+        end
+
+        root_url = args.root_url
+
+        # GitHub Releases url
+        root_url ||= if (tap = self.tap) && !tap.core_tap? && !args.test_default_formula?
+          "#{tap.default_remote}/releases/download/#{formula.name}-#{formula.pkg_version}"
+        end
+
+        setup_bottle_sudo_purge!(args:)
+
+        bottle_args = ["--verbose", "--json", formula.full_name]
+        bottle_args << "--keep-old" if args.keep_old? && !new_formula
+        bottle_args << "--skip-relocation" if args.skip_relocation?
+        bottle_args << "--force-core-tap" if args.test_default_formula?
+        bottle_args << "--root-url=#{root_url}" if root_url
+        bottle_args << "--only-json-tab" if args.only_json_tab?
+
+        verify_local_bottles
+        test "brew", "bottle", *bottle_args
+        bottle_step = steps.fetch(-1)
+        bottle_output = bottle_step.output
+
+        if !bottle_step.passed? || bottle_output.blank?
+          failed formula.full_name, "bottling failed" unless args.dry_run?
+          return
+        end
+
+        @bottle_filename = Pathname.new(
+          bottle_output.gsub(%r{.*(\./\S+#{HOMEBREW_BOTTLES_EXTNAME_REGEX}).*}om, '\1'),
+        )
+        @bottle_json_filename = Pathname.new(
+          @bottle_filename.to_s.gsub(/\.(?:\d+\.)?tar\.gz$/, ".json"),
+        )
+
+        @bottle_checksums[@bottle_filename.realpath] = @bottle_filename.sha256
+        @bottle_checksums[@bottle_json_filename.realpath] = @bottle_json_filename.sha256
+
+        @bottle_output_path.write(bottle_step.output, mode: "a")
+
+        bottle_merge_args =
+          ["--merge", "--write", "--no-commit", "--no-all-checks", @bottle_json_filename.to_s]
+        bottle_merge_args << "--keep-old" if args.keep_old? && !new_formula
+
+        test "brew", "bottle", *bottle_merge_args
+        annotate_missing_all_bottle(formula) if steps.fetch(-1).passed?
+        test "brew", "uninstall", "--formula", "--force", "--ignore-dependencies", formula.full_name
+
+        @testing_formulae.delete(formula.name)
+
+        unless @unchanged_build_dependencies.empty?
+          test "brew", "uninstall", "--formulae", "--force", "--ignore-dependencies", *@unchanged_build_dependencies
+          @unchanged_dependencies -= @unchanged_build_dependencies
+        end
+
+        verify_attestations = if formula.name == "gh"
+          nil
+        else
+          ENV.fetch("HOMEBREW_VERIFY_ATTESTATIONS", nil)
+        end
+        test "brew", "install", "--only-dependencies", @bottle_filename.to_s,
+             env: { "HOMEBREW_VERIFY_ATTESTATIONS" => verify_attestations }
+        test "brew", "install", @bottle_filename.to_s,
+             env: { "HOMEBREW_VERIFY_ATTESTATIONS" => verify_attestations }
+      end
+
+      sig { params(formula: Formula, args: Homebrew::Cmd::TestBotCmd::Args).returns(T::Boolean) }
+      def build_bottle?(formula, args:)
+        # Build and runtime dependencies must be bottled on the current OS,
+        # but accept an older compatible bottle for test dependencies.
+        return false if formula.deps.any? do |dep|
+          !bottled_or_built?(
+            dep.to_formula,
+            @built_formulae - @skipped_or_failed_formulae,
+            no_older_versions: !dep.test?,
+          )
+        end
+
+        !args.build_from_source?
+      end
+
+      sig { params(args: Homebrew::Cmd::TestBotCmd::Args).void }
+      def setup_bottle_sudo_purge!(args:); end
+
+      sig { params(_formula: Formula, dependencies: T::Array[Dependency]).returns(T::Array[String]) }
+      def recursive_runtime_dependency_names(_formula, dependencies)
+        dependencies.each_with_object(Set.new) do |dep, set|
+          dep_f = dep.to_formula
+          set.add(dep_f.full_name)
+          set.merge(dep_f.runtime_dependencies(read_from_tab: false, undeclared: false).map(&:name))
+        end.to_a
+      end
+
       sig {
         params(formula_name: String, bottle_dir: Pathname)
           .returns(T::Hash[String, T::Hash[String, T.anything]])
@@ -549,9 +567,11 @@ module Homebrew
                               "--json", "--full-name", formula.full_name
 
         return if livecheck_step.failed?
-        return unless livecheck_step.output?
 
-        livecheck_info = JSON.parse(T.must(livecheck_step.output)).first
+        livecheck_output = livecheck_step.output
+        return if livecheck_output.blank?
+
+        livecheck_info = JSON.parse(livecheck_output).first
 
         if livecheck_info["status"] == "error"
           error_msg = if livecheck_info["messages"].present? && livecheck_info["messages"].length.positive?
@@ -804,9 +824,9 @@ module Homebrew
 
           # Move bottle and don't test dependents if the formula linkage or test failed.
           if failed_linkage_or_test_messages.present?
-            if @bottle_filename
+            if @bottle_filename && @bottle_json_filename
               failed_dir = @bottle_filename.dirname/"failed"
-              moved_artifacts = [@bottle_filename, T.must(@bottle_json_filename)].map(&:realpath)
+              moved_artifacts = [@bottle_filename, @bottle_json_filename].map(&:realpath)
               failed_dir.install moved_artifacts
 
               moved_artifacts.each do |old_location|
@@ -870,6 +890,7 @@ module Homebrew
         # We only do full testing on `portable-ruby` itself.
         return if formula_name != "portable-ruby"
         return if args.dry_run?
+        return unless integration_test_portable_ruby?
 
         bottle_file = bottle_glob(formula_name).first
         if bottle_file.nil?
@@ -910,22 +931,32 @@ module Homebrew
 
         test "brew", "vendor-install", "ruby"
 
+        no_github_actions_env = { "GITHUB_ACTIONS" => nil }
         bundler_version = Utils::PortableRuby.sync_bundler_version!(pkg_version)
-        test "brew", "vendor-gems", "--no-commit", "--update=--ruby,--bundler=#{bundler_version}"
+        test "brew", "vendor-gems", "--no-commit", "--update=--ruby,--bundler=#{bundler_version}",
+             env: no_github_actions_env
         test "brew", "typecheck", "--update"
 
         # Run the checks that gate a Homebrew/brew pull request.
-        test "brew", "style"
+        test "brew", "style" unless OS.not_tier_one_configuration?
         test "brew", "typecheck"
         test "brew", "install-bundler-gems", "--groups=all"
-        test "brew", "vendor-gems", "--non-bundler-gems", "--no-commit"
-        test "brew", "tests", "--online", "--coverage"
-        test "brew", "tests", "--generic", "--coverage"
+        test "brew", "vendor-gems", "--non-bundler-gems", "--no-commit",
+             env: no_github_actions_env
+        if OS.not_tier_one_configuration?
+          test "brew", "tests", "--online", "--coverage", "--only=cask,formula"
+        else
+          test "brew", "tests", "--online", "--coverage"
+        end
         test "brew", "update-test"
         test "brew", "update-test", "--to-tag"
         test "brew", "update-test", "--commit=HEAD"
-        test "brew", "test-bot", "--only-formulae", "--only-json-tab", "--test-default-formula",
-             env: { "GITHUB_ACTIONS" => nil }
+
+        require "mktemp"
+        Mktemp.new("homebrew-test-bot").run do |_|
+          test "brew", "test-bot", "--only-formulae", "--only-json-tab", "--test-default-formula",
+               env: no_github_actions_env
+        end
       end
 
       sig { params(formula_name: String).void }
@@ -937,14 +968,11 @@ module Homebrew
              "--include-build",
              "--include-optional",
              "--include-test",
-             formula_name,
-             env: require_current_tap_trust_env
+             formula_name
       end
 
       sig { returns(T::Boolean) }
-      def testing_portable_ruby?
-        !!tap&.core_tap? && @testing_formulae.include?("portable-ruby")
-      end
+      def integration_test_portable_ruby? = true
     end
   end
 end

@@ -90,6 +90,31 @@ module Homebrew
         Homebrew.failed = args.named.present? && outdated.present?
       end
 
+      sig {
+        params(formulae_or_casks: T::Array[T.any(Formula, Cask::Cask)]).returns(T::Array[T.any(Formula, Cask::Cask)])
+      }
+      def select_outdated(formulae_or_casks)
+        formulae_or_casks.select do |formula_or_cask|
+          if formula_or_cask.is_a?(Formula)
+            if minimum_version.present?
+              formula_outdated_kegs(formula_or_cask).present?
+            else
+              formula_or_cask.outdated?(fetch_head: args.fetch_HEAD?)
+            end
+          else
+            if (minimum_version = self.minimum_version.presence)
+              next MinimumVersion.cask_installed_below?(formula_or_cask, minimum_version)
+            end
+
+            cask_greedy = upgrade_greedy_cask?(args.greedy?, formula_or_cask)
+
+            formula_or_cask.outdated?(greedy:              cask_greedy,
+                                      greedy_latest:       args.greedy_latest?,
+                                      greedy_auto_updates: args.greedy_auto_updates?)
+          end
+        end
+      end
+
       private
 
       sig { params(formulae_or_casks: T::Array[T.any(Formula, Cask::Cask)]).void }
@@ -176,10 +201,13 @@ module Homebrew
           else
             c = formula_or_cask
 
-            if minimum_version.present?
+            if (minimum_version = self.minimum_version.presence)
+              installed_version = c.installed_version
+              raise Cask::CaskNotInstalledError, c if installed_version.nil?
+
               { name:               c.token,
-                installed_versions: [T.must(c.installed_version)],
-                current_version:    T.must(minimum_version),
+                installed_versions: [installed_version],
+                current_version:    minimum_version,
                 pinned:             c.pinned?,
                 pinned_version:     c.pinned_version }
             else
@@ -241,31 +269,6 @@ module Homebrew
         end
 
         [select_outdated(formulae).sort, select_outdated(casks)]
-      end
-
-      sig {
-        params(formulae_or_casks: T::Array[T.any(Formula, Cask::Cask)]).returns(T::Array[T.any(Formula, Cask::Cask)])
-      }
-      def select_outdated(formulae_or_casks)
-        formulae_or_casks.select do |formula_or_cask|
-          if formula_or_cask.is_a?(Formula)
-            if minimum_version.present?
-              formula_outdated_kegs(formula_or_cask).present?
-            else
-              formula_or_cask.outdated?(fetch_head: args.fetch_HEAD?)
-            end
-          else
-            if minimum_version.present?
-              next MinimumVersion.cask_installed_below?(formula_or_cask, T.must(minimum_version))
-            end
-
-            cask_greedy = upgrade_greedy_cask?(args.greedy?, formula_or_cask)
-
-            formula_or_cask.outdated?(greedy:              cask_greedy,
-                                      greedy_latest:       args.greedy_latest?,
-                                      greedy_auto_updates: args.greedy_auto_updates?)
-          end
-        end
       end
 
       sig { params(formula: Formula).returns(T::Array[Keg]) }

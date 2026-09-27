@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 RSpec.describe Cask::Artifact::Binary, :cask do
@@ -11,11 +11,11 @@ RSpec.describe Cask::Artifact::Binary, :cask do
   let(:binarydir) { cask.config.binarydir }
   let(:expected_path) { binarydir.join("binary") }
 
-  around do |example|
+  before do
     binarydir.mkpath
+  end
 
-    example.run
-  ensure
+  after do
     FileUtils.rm_f expected_path
     FileUtils.rmdir binarydir
   end
@@ -84,6 +84,27 @@ RSpec.describe Cask::Artifact::Binary, :cask do
     end.to raise_error(Cask::CaskError)
 
     expect(File.readlink(expected_path)).to eq("/tmp")
+  end
+
+  it "skips linking when the target is already a symlink to the source" do
+    artifact = artifacts.first
+    expected_path.make_symlink(artifact.source)
+
+    expect do
+      artifact.install_phase(command: NeverSudoSystemCommand, force: false)
+    end.to output(/is already linked/).to_stdout
+
+    expect(expected_path.readlink).to eq(artifact.source)
+  end
+
+  it "raises a clean error when the target symlink cannot be resolved" do
+    artifact = artifacts.first
+    expected_path.make_symlink(binarydir)
+    allow(artifact.target).to receive(:realpath).and_raise(Errno::EACCES)
+
+    expect do
+      artifact.install_phase(command: NeverSudoSystemCommand, force: false)
+    end.to raise_error(Cask::CaskError, /already a Binary/)
   end
 
   it "creates parent directory if it doesn't exist" do

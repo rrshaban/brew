@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 require "rubocops/urls"
@@ -8,9 +8,9 @@ RSpec.describe RuboCop::Cop::FormulaAudit::Urls do
 
   let(:offense_list) do
     [{
-      "url" => "https://ftp.gnu.org/lightning/lightning-2.1.0.tar.gz",
-      "msg" => "https://ftp.gnu.org/lightning/lightning-2.1.0.tar.gz should be: " \
-               "https://ftpmirror.gnu.org/gnu/lightning/lightning-2.1.0.tar.gz",
+      "url" => "https://ftp.gnu.org/gnu/lightning/lightning-2.1.0.tar.gz",
+      "msg" => "https://ftp.gnu.org/gnu/lightning/lightning-2.1.0.tar.gz should be: " \
+               "https://ftpmirror.gnu.org/lightning/lightning-2.1.0.tar.gz",
       "col" => 2,
     }, {
       "url" => "https://fossies.org/linux/privat/monit-5.23.0.tar.gz",
@@ -160,12 +160,18 @@ RSpec.describe RuboCop::Cop::FormulaAudit::Urls do
       "col"         => 2,
       "formula_tap" => "homebrew-core",
     }, {
+      "url"         => "https://github.com/foo/bar/archive/refs/tags/darwin.tar.gz",
+      "msg"         => "https://github.com/foo/bar/archive/refs/tags/darwin.tar.gz looks like a binary package, " \
+                       "not a source archive; homebrew/core is source-only.",
+      "col"         => 2,
+      "formula_tap" => "homebrew-core",
+    }, {
       "url" => "cvs://brew.sh/foo/bar",
       "msg" => "Use of the \"cvs://\" scheme is deprecated, pass `using: :cvs` instead",
       "col" => 2,
     }, {
       "url" => "bzr://brew.sh/foo/bar",
-      "msg" => "Use of the \"bzr://\" scheme is deprecated, pass `using: :bzr` instead",
+      "msg" => "Use of the \"bzr://\" scheme is deprecated, use Git or a stable archive URL instead",
       "col" => 2,
     }, {
       "url" => "hg://brew.sh/foo/bar",
@@ -302,13 +308,23 @@ RSpec.describe RuboCop::Cop::FormulaAudit::Urls do
 
       expect(inspect_source(source)).to eq([])
     end
+
+    it "does not report an offense based on the username or repo name of a GitHub URL" do
+      source = <<~RUBY
+        class Foo < Formula
+          desc "foo"
+          url "https://github.com/scriptingosx/cool-darwin-app/archive/refs/tags/v0.1.1.tar.gz"
+        end
+      RUBY
+
+      expect(inspect_source(source)).to eq([])
+    end
   end
 
   context "when auditing Apache URLs" do
-    let(:expected_url) { "https://www.apache.org/dyn/closer.lua?path=apr/apr-1.7.6.tar.bz2" }
-
     shared_examples "offense" do |url|
       it "registers an offense and corrects" do
+        expected_url = "https://www.apache.org/dyn/closer.lua?path=apr/apr-1.7.6.tar.bz2"
         message = "FormulaAudit/Urls: #{url} should be: #{expected_url}"
 
         expect_offense(<<~RUBY, url:, message:)

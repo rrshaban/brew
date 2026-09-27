@@ -12,6 +12,66 @@ RSpec.describe Homebrew::Cmd::Doctor do
       .to output(/This is an integration test/).to_stderr
   end
 
+  specify "prints json when requested" do
+    cmd = described_class.new(["--json"])
+
+    expect { cmd.run }
+      .to output(/"tier": 1/).to_stdout
+  end
+
+  context "with a relocatable custom prefix" do
+    before do
+      allow(Utils::Bottles).to receive(:tag).and_return(Utils::Bottles::Tag.from_symbol(:arm64_tahoe))
+      allow(Utils::Bottles.tag).to receive(:default_cellar).and_return(Homebrew::DEFAULT_CELLAR)
+      stub_const("HOMEBREW_PREFIX", Pathname("/brew"))
+      stub_const("HOMEBREW_CELLAR", HOMEBREW_PREFIX/"Cellar")
+    end
+
+    it "does not print a prefix warning or support tier" do
+      expect { described_class.new(["check_homebrew_prefix"]).run }
+        .to output("Your system is ready to brew.\n").to_stdout
+        .and output("").to_stderr
+    end
+
+    it "does not fail" do
+      described_class.new(["check_homebrew_prefix", "--quiet"]).run
+
+      expect(Homebrew).not_to be_failed
+    end
+
+    it "reports Tier 1 without findings in JSON" do
+      expect { described_class.new(["check_homebrew_prefix", "--json"]).run }
+        .to output("#{JSON.pretty_generate({ tier: 1, findings: [] })}\n").to_stdout
+    end
+  end
+
+  [
+    [[], 1],
+    [[1, 2, 3, 2], 3],
+    [[3, :unsupported, 2], :unsupported],
+  ].each do |tiers, expected_tier|
+    specify "reports one support tier for #{tiers.inspect}" do
+      T.bind(self, RSpec::Core::ExampleGroup)
+
+      checks = Homebrew::Diagnostic::Checks.new
+      allow(Homebrew::Diagnostic::Checks).to receive(:new).and_return(checks)
+      allow(checks).to receive(:check_access_directories).and_return(
+        tiers.map { |tier| Homebrew::Diagnostic::Finding.new("Configuration warning", tier:) },
+      )
+
+      expect { described_class.new(["check_access_directories", "--json"]).run }
+        .to output(/"tier": #{expected_tier.to_json}/).to_stdout
+    end
+  end
+
+  specify "check_cask_deprecated_disabled loads installed casks once", :cask do
+    cask = instance_double(Cask::Cask, deprecated?: false, disabled?: false)
+
+    expect(Cask::Caskroom).to receive(:casks).once.and_return([cask])
+
+    Homebrew::Diagnostic::Checks.new.check_cask_deprecated_disabled
+  end
+
   specify "check_missing_deps reports formula and cask dependencies", :cask do
     formula = instance_double(Formula, full_name:            "needs-foo",
                                        missing_dependencies: [instance_double(Dependency, to_s: "foo")])
@@ -25,7 +85,7 @@ RSpec.describe Homebrew::Cmd::Doctor do
     allow(Cask::Caskroom).to receive(:casks).and_return([cask])
     allow(Cask::Tab).to receive(:for_cask).with(cask).and_return(tab)
 
-    expect(Homebrew::Diagnostic::Checks.new.check_missing_deps)
+    expect(Homebrew::Diagnostic::Checks.new.check_missing_deps&.to_s)
       .to include(
         "Some installed formulae or casks are missing dependencies.",
         "brew install foo local-caffeine unar",

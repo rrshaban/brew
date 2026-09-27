@@ -7,19 +7,21 @@ require "formula"
 RSpec.describe Tab do
   subject(:tab) do
     described_class.new(
-      "homebrew_version"     => HOMEBREW_VERSION,
-      "used_options"         => used_options.as_flags,
-      "unused_options"       => unused_options.as_flags,
-      "built_as_bottle"      => false,
-      "poured_from_bottle"   => true,
-      "installed_on_request" => true,
-      "changed_files"        => [],
-      "time"                 => time,
-      "source_modified_time" => 0,
-      "compiler"             => "clang",
-      "stdlib"               => "libcxx",
-      "runtime_dependencies" => [],
-      "source"               => {
+      homebrew_version:        HOMEBREW_VERSION,
+      used_options:            used_options.as_flags,
+      unused_options:          unused_options.as_flags,
+      built_as_bottle:         false,
+      poured_from_bottle:      true,
+      installed_on_request:    true,
+      changed_files:           [],
+      linkage_files:           ["bin/foo"],
+      binary_relocation_files: ["libexec/foo"],
+      time:,
+      source_modified_time:    0,
+      compiler:                "clang",
+      stdlib:                  "libcxx",
+      runtime_dependencies:    [],
+      source:                  {
         "tap"          => CoreTap.instance.to_s,
         "path"         => CoreTap.instance.path.to_s,
         "spec"         => "stable",
@@ -29,8 +31,8 @@ RSpec.describe Tab do
           "head"   => "HEAD-1111111",
         },
       },
-      "arch"                 => Hardware::CPU.arch,
-      "built_on"             => DevelopmentTools.build_system_info,
+      arch:                    Hardware::CPU.arch,
+      built_on:                DevelopmentTools.build_system_info,
     )
   end
 
@@ -108,6 +110,8 @@ RSpec.describe Tab do
     expect(tab.unused_options).to be_empty
     expect(tab.used_options).to be_empty
     expect(tab.changed_files).to be_nil
+    expect(tab.linkage_files).to be_nil
+    expect(tab.binary_relocation_files).to be_nil
     expect(tab).not_to be_built_as_bottle
     expect(tab).not_to be_poured_from_bottle
     expect(tab).not_to be_installed_on_request
@@ -141,6 +145,17 @@ RSpec.describe Tab do
     expect(tab).to be_installed_on_request
     expect(tab).not_to be_loaded_from_api
     expect(tab).not_to be_loaded_from_internal_api
+  end
+
+  specify "#initialize" do
+    # Receipts written by other Homebrew versions carry attributes we no longer know about.
+    tab = described_class.new(installed_as_dependency: true, homebrew_version: "1.2.3")
+    expect(tab.homebrew_version).to eq("1.2.3")
+  end
+
+  specify "#installed_on_request_present?" do
+    expect(described_class.new).not_to be_installed_on_request_present
+    expect(described_class.new(installed_on_request: false)).to be_installed_on_request_present
   end
 
   specify "#parsed_homebrew_version" do
@@ -386,7 +401,7 @@ RSpec.describe Tab do
 
       f = formula do
         T.bind(self, T.class_of(Formula))
-        url "foo-1.0"
+        url "file:///foo-1.0"
         depends_on "bar"
         depends_on "user/repo/from_tap"
         depends_on "baz" => :build
@@ -429,11 +444,57 @@ RSpec.describe Tab do
       expect(tab.source["scm_revision"]).to be_nil
     end
 
+    it "records a dependency's bottle rebuild without checking its bottle locations" do
+      # don't try to load gcc/glibc
+      allow(DevelopmentTools).to receive_messages(needs_libc_formula?: false, needs_compiler_formula?: false)
+
+      tag = Utils::Bottles.tag
+      bar = formula("bar") do
+        T.bind(self, T.class_of(Formula))
+        url "bar-2.0"
+
+        bottle do
+          rebuild 1
+          sha256 tag.to_sym => "deadbeef" * 8
+        end
+      end
+      stub_formula_loader bar
+      bottle = bar.bottle_for_tag(tag)
+      allow(bar).to receive(:bottle_for_tag).with(tag).and_return(bottle)
+      expect(bottle).not_to receive(:compatible_locations?)
+
+      f = formula do
+        T.bind(self, T.class_of(Formula))
+        url "file:///foo-1.0"
+        depends_on "bar"
+      end
+
+      expect(described_class.create(f, DevelopmentTools.default_compiler, :libcxx).runtime_dependencies)
+        .to include(hash_including("full_name" => "bar", "bottle_rebuild" => 1))
+    end
+
+    it "records a non-default bottle build prefix" do
+      f.build = BuildOptions.new(Options.create(["--build-bottle"]), f.options)
+      allow(Homebrew).to receive(:default_prefix?).and_return(false)
+      stub_const("HOMEBREW_PREFIX", Pathname("/custom/prefix"))
+
+      expect(described_class.create(f, DevelopmentTools.default_compiler, :libcxx).built_prefix)
+        .to eq("/custom/prefix")
+    end
+
+    it "omits the default bottle build prefix" do
+      f.build = BuildOptions.new(Options.create(["--build-bottle"]), f.options)
+      allow(Homebrew).to receive(:default_prefix?).and_return(true)
+
+      expect(described_class.create(f, DevelopmentTools.default_compiler, :libcxx).to_bottle_hash)
+        .not_to have_key("built_prefix")
+    end
+
     it "can create a formula Tab from an alias" do
       alias_path = CoreTap.instance.alias_dir/"bar"
       f = formula(alias_path:) do
         T.bind(self, T.class_of(Formula))
-        url "foo-1.0"
+        url "file:///foo-1.0"
       end
       compiler = DevelopmentTools.default_compiler
       stdlib = :libcxx
@@ -452,7 +513,7 @@ RSpec.describe Tab do
         url "file://#{repo}", using: :git, branch: "master"
         version "1.0"
       end
-      f.public_send(f.active_spec_sym).fetch
+      f.active_spec.fetch
 
       tab = described_class.create(f, DevelopmentTools.default_compiler, :libcxx)
 
@@ -483,7 +544,7 @@ RSpec.describe Tab do
       expect(tab.source["path"]).to eq(f.path.to_s)
     end
 
-    it "can create a Tab for for a Formula from an alias" do
+    it "can create a Tab for a Formula from an alias" do
       alias_path = CoreTap.instance.alias_dir/"bar"
       f = formula(alias_path:) do
         T.bind(self, T.class_of(Formula))
@@ -544,13 +605,23 @@ RSpec.describe Tab do
   end
 
   specify "#to_json" do
-    json_tab = described_class.new(JSON.parse(tab.to_json))
+    tab.built_prefix = "/custom/prefix"
+    tab.padded_prefix = true
+    tab.relocated_build_prefix = "/custom/prefix"
+    tab.relocated_files = [Pathname("bin/foo")]
+    json_tab = described_class.new(**JSON.parse(tab.to_json).transform_keys(&:to_sym))
+    expect(json_tab.relocated_build_prefix).to eq(tab.relocated_build_prefix)
+    expect(json_tab.relocated_files).to eq(tab.relocated_files)
     expect(json_tab.homebrew_version).to eq(tab.homebrew_version)
     expect(json_tab.used_options.sort).to eq(tab.used_options.sort)
     expect(json_tab.unused_options.sort).to eq(tab.unused_options.sort)
     expect(json_tab.built_as_bottle).to eq(tab.built_as_bottle)
     expect(json_tab.poured_from_bottle).to eq(tab.poured_from_bottle)
     expect(json_tab.changed_files).to eq(tab.changed_files)
+    expect(json_tab.linkage_files).to eq(tab.linkage_files)
+    expect(json_tab.binary_relocation_files).to eq(tab.binary_relocation_files)
+    expect(json_tab.built_prefix).to eq(tab.built_prefix)
+    expect(json_tab.padded_prefix).to be true
     expect(json_tab.tap).to eq(tab.tap)
     expect(json_tab.spec).to eq(tab.spec)
     expect(json_tab.time).to eq(tab.time)
@@ -566,9 +637,17 @@ RSpec.describe Tab do
   end
 
   specify "#to_bottle_hash" do
-    json_tab = described_class.new(JSON.parse(tab.to_bottle_hash.to_json))
+    tab.built_prefix = "/custom/prefix"
+    tab.padded_prefix = true
+    tab.relocated_build_prefix = "/custom/prefix"
+    json_tab = described_class.new(**JSON.parse(tab.to_bottle_hash.to_json).transform_keys(&:to_sym))
+    expect(json_tab.relocated_build_prefix).to be_nil
     expect(json_tab.homebrew_version).to eq(tab.homebrew_version)
     expect(json_tab.changed_files).to eq(tab.changed_files)
+    expect(json_tab.linkage_files).to eq(tab.linkage_files)
+    expect(json_tab.binary_relocation_files).to eq(tab.binary_relocation_files)
+    expect(json_tab.built_prefix).to eq(tab.built_prefix)
+    expect(json_tab.padded_prefix).to be true
     expect(json_tab.source_modified_time).to eq(tab.source_modified_time)
     expect(json_tab.stdlib).to eq(tab.stdlib)
     expect(json_tab.compiler).to eq(tab.compiler)

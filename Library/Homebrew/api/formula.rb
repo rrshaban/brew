@@ -1,11 +1,9 @@
 # typed: strict
 # frozen_string_literal: true
 
-require "cachable"
+require "cacheable"
 require "api"
 require "api/source_download"
-require "local_patch"
-require "download_queue"
 require "api/formula/formula_struct_generator"
 
 module Homebrew
@@ -13,7 +11,7 @@ module Homebrew
     # Helper functions for using the formula JSON API.
     module Formula
       extend T::Generic
-      extend Cachable
+      extend Cacheable
 
       Cache = type_template { { fixed: T::Hash[String, T.untyped] } }
 
@@ -21,35 +19,18 @@ module Homebrew
 
       private_class_method :cache
 
-      sig { params(name: String).returns(T::Hash[String, T.untyped]) }
-      def self.formula_json(name)
-        fetch_formula_json! name if !cache.key?("formula_json") || !cache.fetch("formula_json").key?(name)
-
-        cache.fetch("formula_json").fetch(name)
-      end
-
-      sig { params(name: String).void }
-      def self.fetch_formula_json!(name)
-        endpoint = "formula/#{name}.json"
-        json_formula, updated = Homebrew::API.fetch_json_api_file endpoint
-
-        json_formula = JSON.parse((HOMEBREW_CACHE_API/endpoint).read) unless updated
-
-        cache["formula_json"] ||= {}
-        cache["formula_json"][name] = json_formula
-      end
-
       sig {
         params(
           formula:        ::Formula,
           path:           String,
           checksum:       T.nilable(Checksum),
-          download_queue: Homebrew::DownloadQueue,
+          download_queue: DownloadQueueType,
           enqueue:        T::Boolean,
         ).returns(Homebrew::API::SourceDownload)
       }
-      def self.source_download_path(formula, path, checksum: nil, download_queue: Homebrew.default_download_queue,
-                                    enqueue: false)
+      def self.source_download_path(formula, path, checksum: nil, download_queue: nil, enqueue: false)
+        require "local_patch"
+
         unless LocalPatch.valid_path?(path)
           raise ArgumentError, "API source path must be a relative path within the repository."
         end
@@ -62,13 +43,26 @@ module Homebrew
         download = Homebrew::API::SourceDownload.new(
           "https://raw.githubusercontent.com/#{tap}/#{git_head}/#{path}",
           checksum,
-          cache: HOMEBREW_CACHE_API_SOURCE/"#{tap}/#{git_head}"/path.dirname,
+          formula:,
+          cache:   HOMEBREW_CACHE_API_SOURCE/"#{tap}/#{git_head}"/path.dirname,
         )
 
         if enqueue
+          require "download_queue"
+          download_queue ||= Homebrew::DownloadQueue.default
           download_queue.enqueue(download)
-        elsif !download.symlink_location.exist? || !download.symlink_location.symlink?
-          download.fetch
+        else
+          begin
+            if !download.symlink_location.exist? || !download.symlink_location.symlink?
+              download.fetch
+            elsif checksum
+              download.verify_download_integrity(download.symlink_location)
+            end
+          rescue ChecksumMismatchError
+            # Remove the known-bad download so the next attempt fetches it again.
+            download.clear_cache
+            raise
+          end
         end
 
         download
@@ -77,11 +71,11 @@ module Homebrew
       sig {
         params(
           formula:        ::Formula,
-          download_queue: Homebrew::DownloadQueue,
+          download_queue: DownloadQueueType,
           enqueue:        T::Boolean,
         ).returns(Homebrew::API::SourceDownload)
       }
-      def self.source_download(formula, download_queue: Homebrew.default_download_queue, enqueue: false)
+      def self.source_download(formula, download_queue: nil, enqueue: false)
         path = formula.ruby_source_path || "Formula/#{formula.name}.rb"
         source_download_path(formula, path, checksum: formula.ruby_source_checksum, download_queue:, enqueue:)
       end
@@ -121,19 +115,18 @@ module Homebrew
       end
 
       sig {
-        params(download_queue: Homebrew::DownloadQueue, stale_seconds: T.nilable(Integer), enqueue: T::Boolean)
+        params(download_queue: DownloadQueueType, stale_seconds: T.nilable(Integer), enqueue: T::Boolean)
           .returns([T.any(T::Array[T.untyped], T::Hash[String, T.untyped]), T::Boolean])
       }
-      def self.fetch_api!(download_queue: Homebrew.default_download_queue, stale_seconds: nil, enqueue: false)
+      def self.fetch_api!(download_queue: nil, stale_seconds: nil, enqueue: false)
         Homebrew::API.fetch_json_api_file DEFAULT_API_FILENAME, stale_seconds:, download_queue:, enqueue:
       end
 
       sig {
-        params(download_queue: Homebrew::DownloadQueue, stale_seconds: T.nilable(Integer), enqueue: T::Boolean)
+        params(download_queue: DownloadQueueType, stale_seconds: T.nilable(Integer), enqueue: T::Boolean)
           .returns([T.any(T::Array[T.untyped], T::Hash[String, T.untyped]), T::Boolean])
       }
-      def self.fetch_tap_migrations!(download_queue: Homebrew.default_download_queue, stale_seconds: nil,
-                                     enqueue: false)
+      def self.fetch_tap_migrations!(download_queue: nil, stale_seconds: nil, enqueue: false)
         Homebrew::API.fetch_json_api_file "formula_tap_migrations.jws.json", stale_seconds:, download_queue:, enqueue:
       end
 
@@ -178,16 +171,6 @@ module Homebrew
         cache.fetch("aliases")
       end
 
-      sig { returns(T::Hash[String, String]) }
-      def self.all_renames
-        unless cache.key?("renames")
-          json_updated = download_and_cache_data!
-          write_names_and_aliases(regenerate: json_updated)
-        end
-
-        cache.fetch("renames")
-      end
-
       sig { returns(T::Hash[String, T.untyped]) }
       def self.tap_migrations
         unless cache.key?("tap_migrations")
@@ -202,9 +185,9 @@ module Homebrew
       def self.write_names_and_aliases(regenerate: false)
         download_and_cache_data! unless cache.key?("formulae")
 
-        Homebrew::API.write_names_file!(all_formulae.keys, "formula", regenerate:)
-        Homebrew::API.write_aliases_file!(all_aliases, "formula", regenerate:)
-        Homebrew::API.write_executables_file!(all_formulae, regenerate:)
+        Homebrew::API.write_names_file!("formula", regenerate:) { all_formulae.keys }
+        Homebrew::API.write_aliases_file!("formula", regenerate:) { all_aliases }
+        Homebrew::API.write_executables_file!(regenerate:, source: cached_json_file_path) { all_formulae }
       end
     end
   end

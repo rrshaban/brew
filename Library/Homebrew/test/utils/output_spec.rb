@@ -6,7 +6,43 @@ require "utils/github/actions"
 
 RSpec.describe Utils::Output do
   def esc(code)
-    /(\e\[\d+m)*\e\[#{code}m/
+    /(?:\e\[\d+m)*\e\[#{code}m/
+  end
+
+  describe "#opoo_once" do
+    it "prints the same warning once across receivers" do
+      expect do
+        2.times { Class.new { include Utils::Output::Mixin }.new.opoo_once("foo") }
+      end.to output("Warning: foo\n").to_stderr
+    end
+
+    it "prints distinct warnings" do
+      expect do
+        described_class.opoo_once("foo")
+        described_class.opoo_once("bar")
+      end.to output("Warning: foo\nWarning: bar\n").to_stderr
+    end
+
+    it "prints again after clearing the cache" do
+      allow(described_class).to receive(:opoo)
+      described_class.opoo_once("foo")
+      described_class.clear_cache
+
+      expect(described_class).to receive(:opoo).with("foo").once
+
+      described_class.opoo_once("foo")
+    end
+  end
+
+  describe ".claim_warning" do
+    it "allows only one concurrent caller to claim a warning" do
+      allow(described_class.cache).to receive(:[]).and_wrap_original do |original, message|
+        original.call(message).tap { Thread.pass }
+      end
+      threads = Array.new(8) { Thread.new { described_class.claim_warning("foo") } }
+
+      expect(threads.map(&:value).count(true)).to eq(1)
+    end
   end
 
   describe "#pretty_installed" do
@@ -70,7 +106,7 @@ RSpec.describe Utils::Output do
       before { allow($stdout).to receive(:tty?).and_return(true) }
 
       context "with HOMEBREW_NO_EMOJI unset" do
-        it "returns a string with a colored checkmark" do
+        it "returns a string with a red cross" do
           expect(pretty_uninstalled_output)
             .to match(/#{esc 1}foo #{esc 31}✘#{esc 0}/)
         end
@@ -91,6 +127,38 @@ RSpec.describe Utils::Output do
 
       it "returns plain text" do
         expect(pretty_uninstalled_output).to eq("foo")
+      end
+    end
+  end
+
+  describe "#pretty_cannot_install" do
+    subject(:pretty_cannot_install_output) { described_class.pretty_cannot_install("foo") }
+
+    context "when $stdout is a TTY" do
+      before { allow($stdout).to receive(:tty?).and_return(true) }
+
+      context "with HOMEBREW_NO_EMOJI unset" do
+        it "returns a string with a red ⊘ symbol" do
+          expect(pretty_cannot_install_output)
+            .to match(/#{esc 1}foo #{esc 31}⊘#{esc 0}/)
+        end
+      end
+
+      context "with HOMEBREW_NO_EMOJI set" do
+        before { ENV["HOMEBREW_NO_EMOJI"] = "1" }
+
+        it "returns a string with colored info" do
+          expect(pretty_cannot_install_output)
+            .to match(/#{esc 1}foo \(can't be installed\)#{esc 0}/)
+        end
+      end
+    end
+
+    context "when $stdout is not a TTY" do
+      before { allow($stdout).to receive(:tty?).and_return(false) }
+
+      it "returns plain text" do
+        expect(pretty_cannot_install_output).to eq("foo")
       end
     end
   end
@@ -133,6 +201,36 @@ RSpec.describe Utils::Output do
     it "omits the bold escape on every entry when bold is false" do
       expect(described_class.pretty_install_status("foo", installed: true, outdated: true, bold: false))
         .to match(/\Afoo #{esc 32}↑#{esc 0}/)
+    end
+
+    it "marks an uninstalled entry expected to be installed with a red cross" do
+      expect(described_class.pretty_install_status("foo", installed: false, mark_uninstalled: true))
+        .to match(/\Afoo #{esc 31}✘#{esc 0}\z/)
+    end
+
+    it "annotates an uninstalled disabled entry with `(disabled)`" do
+      expect(described_class.pretty_install_status("foo", installed: false, disabled: true, mark_uninstalled: false))
+        .to match(/\Afoo #{esc 31}\(disabled\)#{esc 0}\z/)
+    end
+
+    it "marks an uninstalled entry that cannot be installed with a red ⊘" do
+      expect(described_class.pretty_install_status("foo", installed: false, can_install: false))
+        .to match(/\Afoo #{esc 31}⊘#{esc 0}\z/)
+    end
+
+    it "marks a disabled uninstalled entry that cannot be installed with ⊘ and (disabled)" do
+      status = described_class.pretty_install_status(
+        "foo",
+        installed:   false,
+        disabled:    true,
+        can_install: false,
+      )
+      expect(status).to match(/\Afoo #{esc 31}⊘#{esc 0} #{esc 31}\(disabled\)#{esc 0}\z/)
+    end
+
+    it "keeps a disabled installed entry marked as installed" do
+      expect(described_class.pretty_install_status("foo", installed: true, disabled: true))
+        .to match(/foo #{esc 32}✔#{esc 0} #{esc 31}\(disabled\)#{esc 0}\z/)
     end
   end
 
@@ -224,6 +322,88 @@ RSpec.describe Utils::Output do
   end
 
   describe "#odeprecated" do
+    context "when deprecations are warnings" do
+      before do
+        Homebrew.raise_deprecation_exceptions = false
+        ENV.delete("HOMEBREW_DEVELOPER")
+      end
+
+      it "warns once across receivers and backtraces" do
+        expect do
+          2.times do |i|
+            Class.new { include Utils::Output::Mixin }.new
+                 .odeprecated("method", caller: ["formula.rb:12", "caller.rb:#{i}"])
+          end
+        end.to output("Warning: Calling method is deprecated! There is no replacement.\n").to_stderr
+      end
+
+      it "warns for each distinct tap location" do
+        expect(described_class).to receive(:opoo).exactly(3).times
+
+        %w[foo.rb:6 foo.rb:8 bar.rb:6].each do |location|
+          2.times do
+            described_class.odeprecated(
+              "method", caller: ["#{HOMEBREW_LIBRARY}/Taps/playbrew/homebrew-play/Casks/#{location}"]
+            )
+          end
+        end
+      end
+
+      it "does not cache warnings suppressed during auditing" do
+        allow(Homebrew).to receive(:auditing?).and_return(true, false)
+
+        expect do
+          2.times { described_class.odeprecated("method", caller: ["formula.rb:12"]) }
+        end.to output("Warning: Calling method is deprecated! There is no replacement.\n").to_stderr
+      end
+
+      it "raises after a warning when deprecation exceptions are enabled" do
+        allow(described_class).to receive(:opoo)
+        described_class.odeprecated("method", caller: ["formula.rb:12"])
+        Homebrew.raise_deprecation_exceptions = true
+
+        expect { described_class.odeprecated("method", caller: ["formula.rb:12"]) }
+          .to raise_error(MethodDeprecatedError)
+      end
+    end
+
+    it "raises on repeated calls to disabled methods" do
+      expect do
+        described_class.odisabled("method", caller: ["formula.rb:12"])
+      rescue MethodDeprecatedError
+        described_class.odisabled("method", caller: ["formula.rb:12"])
+      end.to raise_error(MethodDeprecatedError)
+    end
+
+    it "annotates deprecations that are not ignored" do
+      ENV["GITHUB_ACTIONS"] = "true"
+      ENV.delete("HOMEBREW_TESTS")
+
+      expect do
+        described_class.odeprecated("method", "replacement", caller: ["formula.rb:12"])
+      end.to output(
+        /\A::error(?: [^\r\n]*)?::Calling method is deprecated! Use replacement instead\.\n\z/,
+      ).to_stderr.and raise_error(MethodDeprecatedError, "Calling method is deprecated! Use replacement instead.")
+    end
+
+    it "preserves the backtrace without consulting a rejecting handler twice" do
+      require "ignorable"
+
+      errors = []
+      raised = nil
+      begin
+        Ignorable.hook_raise(on_ignorable: lambda { |error|
+          errors << error
+          :raise
+        }) do
+          described_class.odeprecated("method", "replacement", caller: ["formula.rb:12"])
+        end
+      rescue MethodDeprecatedError => e
+        raised = e
+      end
+      expect([raised&.backtrace, errors]).to match [["formula.rb:12"], [equal(raised)]]
+    end
+
     it "raises a MethodDeprecatedError when `disable` is true" do
       ENV.delete("HOMEBREW_DEVELOPER")
       expect do

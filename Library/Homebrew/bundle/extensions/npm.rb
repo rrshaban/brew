@@ -38,6 +38,17 @@ module Homebrew
           which("npm", ORIGINAL_PATHS)
         end
 
+        sig { override.params(_name: String, _options: Homebrew::Bundle::EntryOptions).returns(T::Boolean) }
+        def batch_installable?(_name, _options = {})
+          true
+        end
+
+        sig { override.params(entries: T::Array[Dsl::Entry], verbose: T::Boolean).returns(T::Boolean) }
+        def install_batch!(entries, verbose: false)
+          Bundle.system(package_manager_executable!.to_s, "install", *Language::Node.npm_install_security_args,
+                        "-g", *entries.map(&:name), verbose:)
+        end
+
         sig { override.returns(T::Array[String]) }
         def packages
           packages = @packages
@@ -46,7 +57,7 @@ module Homebrew
           @packages = if (npm = package_manager_executable) &&
                          (!npm.to_s.start_with?("/") || npm.exist?)
             with_env(package_manager_env(npm)) do
-              parse_package_list(`#{npm} list -g --depth=0 --json 2>/dev/null`)
+              parse_package_list(Utils.popen_read_text(npm, "list", "-g", "--depth=0", "--json", err: File::NULL))
             end
           end
           return [] if @packages.nil?

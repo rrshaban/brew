@@ -1,6 +1,7 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "package_manager_cache"
 require "release_cooldown"
 require "utils/output"
 require "utils/path"
@@ -12,9 +13,14 @@ module Language
   module Node
     extend ::Utils::Output::Mixin
 
+    class << self
+      sig { returns(T.nilable(T::Boolean)) }
+      attr_accessor :env_set
+    end
+
     sig { returns(String) }
     def self.npm_cache_config
-      "cache=#{HOMEBREW_CACHE}/npm_cache"
+      "cache=#{Homebrew::PackageManagerCache.path("npm_cache")}"
     end
 
     sig { params(ignore_scripts: T::Boolean).returns(T::Array[String]) }

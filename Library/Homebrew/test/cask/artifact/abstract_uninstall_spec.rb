@@ -1,27 +1,23 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 RSpec.describe Cask::Artifact::AbstractUninstall, :cask do
-  [
+  test_each([
     [Cask::Artifact::Uninstall, :uninstall],
     [Cask::Artifact::Zap, :zap],
-  ].each do |artifact_class, artifact_dsl_key|
+  ]) do |(artifact_class, artifact_dsl_key)|
     describe "#each_resolved_path for #{artifact_dsl_key.inspect}" do
       subject(:artifact) { cask.artifacts.find { |candidate| candidate.is_a?(artifact_class) } }
 
       let(:cask) { Cask::CaskLoader.load(cask_path("with-#{artifact_dsl_key}-delete")) }
 
-      around do |example|
-        old_home = Dir.home
+      before do
         ENV["HOME"] = TEST_TMPDIR
-        example.run
-      ensure
-        ENV["HOME"] = old_home
       end
 
       it "skips relative paths" do
         expect do
-          expect(artifact.send(:each_resolved_path, :delete, ["relative/path"]).to_a).to be_empty
+          expect(artifact.each_resolved_path(:delete, ["relative/path"]).to_a).to be_empty
         end.to output(%r{Skipping delete for relative path 'relative/path'\.}).to_stderr
       end
 
@@ -36,20 +32,20 @@ RSpec.describe Cask::Artifact::AbstractUninstall, :cask do
           tmpdir/"nested/./#{valid_path.basename}",
         ].each do |invalid_path|
           expect do
-            expect(artifact.send(:each_resolved_path, :delete, [invalid_path.to_s]).to_a).to be_empty
+            expect(artifact.each_resolved_path(:delete, [invalid_path.to_s]).to_a).to be_empty
           end.to output(
             /Skipping delete for path with relative segments '#{Regexp.escape(invalid_path.to_s)}'\./,
           ).to_stderr
         end
       ensure
-        FileUtils.rm_f valid_path
+        FileUtils.rm_f(valid_path) if valid_path
       end
 
       it "skips tilde paths containing relative segments" do
         invalid_path = "~/../each_resolved_path_#{artifact_dsl_key}"
 
         expect do
-          expect(artifact.send(:each_resolved_path, :delete, [invalid_path]).to_a).to be_empty
+          expect(artifact.each_resolved_path(:delete, [invalid_path]).to_a).to be_empty
         end.to output(
           /Skipping delete for path with relative segments '#{Regexp.escape(invalid_path)}'\./,
         ).to_stderr
@@ -66,13 +62,13 @@ RSpec.describe Cask::Artifact::AbstractUninstall, :cask do
         allow(artifact).to receive(:undeletable?) { |target| target == undeletable_path }
 
         expect do
-          expect(artifact.send(:each_resolved_path, :delete, ["#{glob_dir}/*.plist"]).to_a)
+          expect(artifact.each_resolved_path(:delete, ["#{glob_dir}/*.plist"]).to_a)
             .to eq([["#{glob_dir}/*.plist", [safe_path]]])
         end.to output(
           /Skipping delete for undeletable path '#{Regexp.escape(undeletable_path.to_s)}'\./,
         ).to_stderr
       ensure
-        FileUtils.rm_rf glob_dir
+        FileUtils.rm_rf(glob_dir) if glob_dir
       end
 
       it "surfaces Full Disk Access guidance when globbing raises EPERM" do
@@ -81,7 +77,7 @@ RSpec.describe Cask::Artifact::AbstractUninstall, :cask do
         allow(MacOS).to receive(:version).and_return(MacOSVersion.from_symbol(:ventura))
 
         expect do
-          artifact.send(:each_resolved_path, :delete, ["/tmp/each_resolved_path_#{artifact_dsl_key}"]).to_a
+          artifact.each_resolved_path(:delete, ["/tmp/each_resolved_path_#{artifact_dsl_key}"]).to_a
         end.to raise_error(SystemExit)
           .and output(/Full Disk Access/).to_stderr
       end

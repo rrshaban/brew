@@ -40,8 +40,6 @@ module Homebrew
         end
       end
 
-      private
-
       sig { params(taps: T::Array[Tap]).void }
       def print_tap_info(taps)
         if taps.none?
@@ -95,9 +93,6 @@ module Homebrew
         end
       end
 
-      LISTING_LIMIT = 30
-      private_constant :LISTING_LIMIT
-
       sig { params(tap: Tap).void }
       def print_tap_listings(tap)
         commands = tap.command_files
@@ -124,6 +119,51 @@ module Homebrew
         end
       end
 
+      sig { params(tap: Tap, name: String, installed: T::Boolean).returns(String) }
+      def decorate_formula(tap, name, installed:)
+        formula = Formulary.factory("#{tap.name}/#{name}")
+        pretty_install_status(
+          name,
+          installed:,
+          outdated:         installed && formula.outdated?,
+          deprecated:       formula.deprecated?,
+          disabled:         formula.disabled?,
+          can_install:      formula.valid_platform? && !formula.disabled?,
+          mark_uninstalled: false,
+        )
+      rescue
+        pretty_install_status(name, installed:, mark_uninstalled: false)
+      end
+
+      sig { params(tap: Tap, token: String, installed: T::Boolean).returns(String) }
+      def decorate_cask(tap, token, installed:)
+        cask = Cask::CaskLoader.load("#{tap.name}/#{token}")
+        pretty_install_status(
+          token,
+          installed:,
+          outdated:         installed && cask.outdated?,
+          deprecated:       cask.deprecated?,
+          disabled:         cask.disabled?,
+          can_install:      cask.valid_platform? && !cask.disabled?,
+          mark_uninstalled: false,
+        )
+      rescue
+        pretty_install_status(token, installed:, mark_uninstalled: false)
+      end
+
+      sig { params(taps: T::Array[Tap]).void }
+      def print_tap_json(taps)
+        # Tap#to_hash shells out to Git and queries the GitHub API.
+        hashes = Utils.parallel_map(taps, &:to_hash)
+
+        puts JSON.pretty_generate(hashes)
+      end
+
+      private
+
+      LISTING_LIMIT = 30
+      private_constant :LISTING_LIMIT
+
       sig {
         params(
           tap:       Tap,
@@ -148,44 +188,6 @@ module Homebrew
           opoo "Tap has more than #{LISTING_LIMIT} #{label.downcase} and none are installed."
           puts "See: #{tap.remote}" if tap.remote.present?
         end
-      end
-
-      sig { params(tap: Tap, name: String, installed: T::Boolean).returns(String) }
-      def decorate_formula(tap, name, installed:)
-        formula = Formulary.factory("#{tap.name}/#{name}")
-        pretty_install_status(
-          name,
-          installed:,
-          outdated:         installed && formula.outdated?,
-          deprecated:       formula.deprecated?,
-          disabled:         formula.disabled?,
-          mark_uninstalled: false,
-        )
-      rescue
-        pretty_install_status(name, installed:, mark_uninstalled: false)
-      end
-
-      sig { params(tap: Tap, token: String, installed: T::Boolean).returns(String) }
-      def decorate_cask(tap, token, installed:)
-        cask = Cask::CaskLoader.load("#{tap.name}/#{token}")
-        pretty_install_status(
-          token,
-          installed:,
-          outdated:         installed && cask.outdated?,
-          deprecated:       cask.deprecated?,
-          disabled:         cask.disabled?,
-          mark_uninstalled: false,
-        )
-      rescue
-        pretty_install_status(token, installed:, mark_uninstalled: false)
-      end
-
-      sig { params(taps: T::Array[Tap]).void }
-      def print_tap_json(taps)
-        # Tap#to_hash shells out to Git and queries the GitHub API.
-        hashes = Utils.parallel_map(taps, &:to_hash)
-
-        puts JSON.pretty_generate(hashes)
       end
     end
   end

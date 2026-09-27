@@ -1,5 +1,5 @@
 ---
-last_review_date: "2026-04-04"
+last_review_date: "2026-07-18"
 ---
 
 # Homebrew Bundle, `brew bundle` and `Brewfile`
@@ -12,7 +12,7 @@ Rather than specifying the `brew` commands you wish to run, you can specify the 
 
 See also the [`brew bundle` section of `man brew`](Manpage.md#bundle-subcommand) or `brew bundle --help`.
 
-## Basic Usage
+## Basic usage
 
 ### `brew bundle`
 
@@ -58,7 +58,7 @@ If this fails without `--verbose`, run `brew bundle check --verbose` to list unm
 
 ### Types
 
-As well as supporting formulae (`brew "..."`), you can also use `brew bundle` with casks, taps, Mac App Store apps, WinGet packages on WSL, VSCode extensions, Go packages, Cargo packages, uv tools, Flatpak packages and krew kubectl plugins and to start background services with `brew services`.
+As well as supporting formulae (`brew "..."`), you can also use `brew bundle` with casks, taps, Mac App Store apps, WinGet packages on WSL, VS Code extensions, Go packages, Cargo packages, npm packages, uv tools, Flatpak packages and krew kubectl plugins and to start background services with `brew services`.
 
 ```ruby
 tap "apple/apple"
@@ -71,6 +71,7 @@ winget "PowerToys", id: "XP89DCGQ3K6VLD", source: "msstore"
 vscode "editorconfig.editorconfig"
 go "github.com/charmbracelet/crush"
 cargo "ripgrep"
+cargo "bat", source: "https://github.com/sharkdp/bat"
 uv "mkdocs"
 uv "ruff", source: "git+https://github.com/astral-sh/ruff.git"
 krew "ctx"
@@ -80,6 +81,14 @@ flatpak "io.github.dvlv.boxbuddyrs", remote: "flathub-beta"
 ```
 
 WinGet installs run with installer interactivity disabled. If WinGet reports that elevation is required, `brew bundle` retries through Windows UAC.
+
+uv tools use the installed `python` or `python@` formula with the highest major/minor Python version, including keg-only versions.
+If no Homebrew Python is installed, uv selects Python as usual.
+Already-installed tools keep their existing Python until reinstalled.
+
+A uv tool's `source:` must resolve on another machine, so a local path and the `file://` URL that `uv tool list` reports for one are both rejected when the `Brewfile` is parsed, in their plain and their `git+`-prefixed spellings alike. A tool installed from any of them is dumped without a `source:`.
+
+A Cargo package's `source:` is a git URL (`https://`, `ssh://` or `git://`) and is installed with `cargo install --git`. Neither a local path nor a `file://` URL is accepted, since neither resolves on another machine, and a crate installed from one is dumped without a `source:`. The name is the crate's package name from its `Cargo.toml`, which is not always the name of the repository or of the binary it installs, so `brew bundle dump` output is the reliable thing to copy. A branch, tag or revision chosen when the package was installed is carried in the URL as `?branch=`, `?tag=` or `?rev=`, and is restored with the corresponding `cargo install` flag. Where none was chosen, only the repository is recorded and not the commit currently installed, so restoring a `Brewfile` builds the repository's default branch rather than the exact commit.
 
 Run `brew bundle` again and this outputs:
 
@@ -103,7 +112,8 @@ Adding a `Brewfile` to a project's repository (like you might a `package.json`, 
 
 It allows you to tell users to run a single command to install all dependencies for a project and start any services.
 
-As Homebrew supports both macOS, Linux and WSL: you can have this single command setup project dependencies on three operating systems and in continuous integration services like GitHub Actions (where it's installed by default on macOS and easily on Linux with [`Homebrew/actions/setup-homebrew`](https://github.com/Homebrew/actions/tree/HEAD/setup-homebrew)).
+Homebrew supports macOS, Linux and WSL, so one command can set up project dependencies across these environments and in continuous-integration services such as GitHub Actions.
+Homebrew is installed by default on GitHub-hosted macOS runners and can be installed on Linux with [`Homebrew/actions/setup-homebrew`](https://github.com/Homebrew/actions/tree/HEAD/setup-homebrew).
 
 See [GitHub's "Scripts To Rule Them All" `script/bootstrap` example](https://github.com/github/scripts-to-rule-them-all/blob/HEAD/script/bootstrap)
 for how you might use a `Brewfile` and `brew bundle` to install project dependencies with Homebrew.
@@ -135,11 +145,11 @@ You can then restore (and, by default, upgrade) all of these with:
 
 ```console
 brew bundle --global
-````
+```
 
 You can keep multiple snapshots by writing to different `Brewfile`s with `--file`, commit them to version control and compare them with standard diff tools. To make the active installed state match a snapshot more closely, run `brew bundle cleanup --force --file=/path/to/Brewfile` after installing it to remove supported dependencies not listed in that `Brewfile`.
 
-## Advanced Usage
+## Advanced usage
 
 ### `brew bundle cleanup`
 
@@ -150,6 +160,11 @@ $ brew bundle cleanup --global --force
 Uninstalling gcc... (1,914 files, 459.8MB)
 Uninstalled 1 formula
 ```
+
+Cleanup also makes Homebrew's global trust store match the selected `Brewfile`.
+It removes trust entries granted manually or by another `Brewfile` if they are
+not declared in the selected file. A `Brewfile` with no trust declarations
+removes every explicit trust entry.
 
 ### `brew bundle list`
 
@@ -390,9 +405,12 @@ trusted `brew`, `cask` and whole-tap entries. It writes tap-level trust hashes
 for trusted formulae, casks and commands from a tap that are not otherwise
 present in the dumped `Brewfile`.
 
-When `brew bundle cleanup --force` runs, it resets Homebrew's tap trust file to
-the trust values declared by the `Brewfile` and removes trust entries that are
-not declared there.
+Whenever `brew bundle cleanup` performs cleanup, either because `--force` was
+passed or the confirmation prompt was accepted, it resets Homebrew's global
+trust store to the values declared by the selected `Brewfile`. This removes
+trust granted manually or by another `Brewfile` when it is not declared in the
+selected file. If the selected `Brewfile` has no trust declarations, every
+explicit trust entry is removed.
 
 ## Versions
 
@@ -404,9 +422,9 @@ If you want `brew bundle` to stop upgrading installed dependencies, pass `--no-u
 
 For the tradeoffs and alternatives, see [Locking installed formulae at specific versions](Versions.md#locking-installed-formulae-at-specific-versions).
 
-## Adding New Packages Support
+## Adding new packages support
 
-`brew bundle` currently supports Homebrew, Homebrew Cask, Mac App Store, WinGet packages on WSL, Visual Studio Code (and forks/variants), Go packages, Cargo packages, uv tools, Flatpak packages and krew kubectl plugins.
+`brew bundle` currently supports Homebrew formulae and casks, Mac App Store apps, WinGet packages on WSL, Visual Studio Code extensions and variants, Go packages, Cargo packages, npm packages, uv tools, Flatpak packages and krew kubectl plugins.
 
 We are interested in contributions for other packages' installers/checkers/dumpers but they must:
 

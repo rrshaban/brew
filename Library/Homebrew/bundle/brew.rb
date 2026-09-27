@@ -43,6 +43,12 @@ module Homebrew
           @formula_oldnames = T.let(nil, T.nilable(T::Hash[String, String]))
         end
 
+        sig {
+          params(formulae_by_name: T.nilable(T::Hash[String, T::Hash[Symbol, T.untyped]]))
+            .returns(T.nilable(T::Hash[String, T::Hash[Symbol, T.untyped]]))
+        }
+        attr_writer :formulae_by_name
+
         sig { override.params(name: String, no_upgrade: T::Boolean, verbose: T::Boolean, options: T.untyped).returns(T::Boolean) }
         def preinstall!(name, no_upgrade: false, verbose: false, **options)
           new(name, options).preinstall!(no_upgrade:, verbose:)
@@ -189,20 +195,6 @@ module Homebrew
           formula.presence || formulae_by_name(name)
         end
 
-        sig { params(name: String).returns(T::Array[String]) }
-        def formula_dep_names(name)
-          find_formula(name)&.fetch(:dependencies, []) || []
-        end
-
-        # Returns recursive dependency names for lock conflict detection.
-        sig { params(name: String).returns(T::Set[String]) }
-        def recursive_dep_names(name)
-          require "formula"
-          Formula[name].recursive_dependencies.to_set(&:name)
-        rescue FormulaUnavailableError
-          Set.new
-        end
-
         sig { returns(T::Array[T::Hash[Symbol, T.untyped]]) }
         def formulae
           return @formulae if @formulae
@@ -275,15 +267,6 @@ module Homebrew
         sig { override.params(describe: T::Boolean, no_restart: T::Boolean).returns(String) }
         def dump_output(describe: false, no_restart: false)
           dump(describe:, no_restart:)
-        end
-
-        sig { override.params(name: String, options: T::Hash[Symbol, T.untyped], no_upgrade: T::Boolean).returns(T.nilable(String)) }
-        def fetchable_name(name, options = {}, no_upgrade: false)
-          _ = options
-
-          return if formula_installed_and_up_to_date?(name, no_upgrade:)
-
-          name
         end
 
         sig { returns(T::Hash[String, String]) }

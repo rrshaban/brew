@@ -1,6 +1,7 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "on_system"
 require "utils/user"
 require "open3"
 require "utils/output"
@@ -15,10 +16,10 @@ module Cask
 
     sig { params(access: String).returns(String) }
     def self.privacy_security_preference_pane(access)
-      navigation_path = if MacOS.version >= :ventura
-        "System Settings → Privacy & Security"
-      else
+      navigation_path = if OnSystem.os_condition_met?(:monterey, :or_older)
         "System Preferences → Security & Privacy → Privacy"
+      else
+        "System Settings → Privacy & Security"
       end
 
       "#{navigation_path} → #{access}"
@@ -37,17 +38,19 @@ module Cask
       if dir&.writable?
         path.mkpath
       else
-        command.run!("mkdir", args: ["-p", "--", path], sudo: true, print_stderr: false)
+        command.run!("mkdir", args: ["-p", "--", path], sudo: nil, print_stderr: false)
       end
     end
 
     sig { params(path: Pathname, command: T.class_of(SystemCommand)).void }
     def self.gain_permissions_rmdir(path, command: SystemCommand)
-      gain_permissions(path, [], command) do |p|
+      # `-h` unconditionally: it is a no-op on a real directory and avoids
+      # deciding from a path that could be replaced before the recovery runs.
+      gain_permissions(path, ["-h"], command) do |p|
         if p.parent.writable?
           FileUtils.rmdir p
         else
-          command.run!("rmdir", args: ["--", p], sudo: true, print_stderr: false)
+          command.run!("rmdir", args: ["--", p], sudo: nil, print_stderr: false)
         end
       end
     end
@@ -76,7 +79,7 @@ module Cask
           end
         else
           recursive_flag = directory ? ["-R"] : []
-          command.run!("/bin/rm", args: recursive_flag + ["-f", "--", p], sudo: true, print_stderr: false)
+          command.run!("/bin/rm", args: recursive_flag + ["-f", "--", p], sudo: nil, print_stderr: false)
         end
       end
     end
@@ -90,8 +93,8 @@ module Cask
       ).void
     }
     def self.gain_permissions(path, command_args, command, &_block)
-      tried_permissions = false
-      tried_ownership = false
+      tried_permissions = T.let(false, T::Boolean)
+      tried_ownership = T.let(false, T::Boolean)
       begin
         yield path
       rescue
@@ -115,10 +118,9 @@ module Cask
           retry # rmtree
         end
 
-        unless tried_ownership
-          # in case of ownership problems
-          # TODO: Further examine files to see if ownership is the problem
-          #       before using `sudo` and `chown`.
+        # in case of ownership problems
+        recursive = command_args.include?("-R")
+        if !tried_ownership && ownership_problem?(path, recursive:)
           ohai "Using sudo to gain ownership of path '#{path}'"
           command.run("chown",
                       args: command_args + ["--", User.current.to_s, path],
@@ -131,6 +133,23 @@ module Cask
 
         raise
       end
+    end
+
+    # Whether `sudo chown` could plausibly fix the failure we just rescued: the
+    # `chflags`/`chmod` above run without `sudo`, so they only fail on paths we
+    # do not own. `lstat` rather than `owned?`, which would follow a symlink.
+    sig { params(path: Pathname, recursive: T::Boolean).returns(T::Boolean) }
+    def self.ownership_problem?(path, recursive:)
+      return false if Process.euid.zero?
+
+      paths = recursive ? path.find : [path]
+      paths.any? do |candidate|
+        candidate.lstat.uid != Process.euid
+      rescue SystemCallError
+        false
+      end
+    rescue SystemCallError
+      false
     end
 
     sig { params(path: Pathname).returns(T::Boolean) }

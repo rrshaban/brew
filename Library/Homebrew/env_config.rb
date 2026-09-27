@@ -50,6 +50,7 @@ module Homebrew
                      "or in a tap on this list. Each entry is a `user/repository` name " \
                      "(which matches only taps using the default GitHub remote) or a remote " \
                      "URL (required to match taps with a custom remote).",
+        odeprecated: true,
       },
       HOMEBREW_API_AUTO_UPDATE_SECS:             {
         description: "Check Homebrew's API for new formulae or cask data every " \
@@ -67,6 +68,8 @@ module Homebrew
       HOMEBREW_ARCH:                             {
         description: "Linux only: Pass this value to a type name representing the compiler's `-march` option.",
         default:     "native",
+        replacement: "the default native CPU optimisation",
+        odeprecated: true,
       },
       HOMEBREW_ARTIFACT_DOMAIN:                  {
         description: "Prefix all download URLs, including those for bottles, with this value. " \
@@ -77,7 +80,12 @@ module Homebrew
                      "This results in e.g. " \
                      "`https://ghcr.io/v2/homebrew/core/gettext/manifests/0.21` " \
                      "to instead be downloaded from " \
-                     "`http://localhost:8080/v2/homebrew/core/gettext/manifests/0.21`",
+                     "`http://localhost:8080/v2/homebrew/core/gettext/manifests/0.21`. " \
+                     "If the value already contains a `/v2` path (e.g. an OCI registry proxying " \
+                     "GitHub Packages under a repository prefix such as " \
+                     "`https://mirror.example.com/v2/ghcr-io`), the `v2` path is not duplicated, " \
+                     "resulting in e.g. " \
+                     "`https://mirror.example.com/v2/ghcr-io/homebrew/core/gettext/manifests/0.21`.",
       },
       HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK:      {
         description: "When `$HOMEBREW_ARTIFACT_DOMAIN` and `$HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK` are both set, " \
@@ -94,7 +102,12 @@ module Homebrew
         disabled_by: :HOMEBREW_NO_ASK,
         default:     true,
         replacement: "the default behaviour",
-        odeprecated: true,
+        odisabled:   true,
+      },
+      HOMEBREW_AUTO_UPDATE_QUIET:                {
+        description: "If set, the auto-update run before commands like `brew install`, `brew upgrade` or " \
+                     "`brew tap` will not show information about new, outdated or deleted formulae and casks.",
+        boolean:     true,
       },
       HOMEBREW_AUTO_UPDATE_SECS:                 {
         description:  "Run `brew update` once every `$HOMEBREW_AUTO_UPDATE_SECS` seconds before some commands, " \
@@ -102,6 +115,16 @@ module Homebrew
                       "disable auto-update entirely with `$HOMEBREW_NO_AUTO_UPDATE`.",
         default_text: "`86400` (24 hours), `3600` (1 hour) if a developer command has been run " \
                       "or `300` (5 minutes) if `$HOMEBREW_NO_INSTALL_FROM_API` is set.",
+        # Keep in sync with the auto-update defaults in Library/Homebrew/brew.sh.
+        default:      lambda {
+          if ENV["HOMEBREW_NO_INSTALL_FROM_API"].present? || ENV["HOMEBREW_AUTO_UPDATE_TAP"].present?
+            300
+          elsif ENV["HOMEBREW_DEV_CMD_RUN"].present?
+            3600
+          else
+            86400
+          end
+        },
       },
       HOMEBREW_AVOID_NESTED_SANDBOXING:          {
         description: "If set, skip Homebrew's sandbox when it is itself running inside another " \
@@ -112,25 +135,28 @@ module Homebrew
         boolean:     :set,
       },
       HOMEBREW_BAT:                              {
-        description: "If set, use `bat` for the `brew cat` command.",
+        description: "If set, use `bat` for the `brew cat` command. " \
+                     "Set `$BAT_CONFIG_PATH` to use a custom configuration file and `$BAT_THEME` to select a theme.",
         boolean:     true,
       },
       HOMEBREW_BAT_CONFIG_PATH:                  {
-        description:  "Use this as the `bat` configuration file.",
-        default_text: "`$BAT_CONFIG_PATH`.",
+        description: "Use this as the `bat` configuration file.",
+        odeprecated: true,
+        replacement: "$BAT_CONFIG_PATH",
       },
       HOMEBREW_BAT_THEME:                        {
-        description:  "Use this as the `bat` theme for syntax highlighting.",
-        default_text: "`$BAT_THEME`.",
+        description: "Use this as the `bat` theme for syntax highlighting.",
+        odeprecated: true,
+        replacement: "$BAT_THEME",
       },
       HOMEBREW_BOTTLE_DOMAIN:                    {
-        description:  "Use this URL as the download mirror for bottles. " \
-                      "If bottles at that URL are temporarily unavailable, " \
-                      "the default bottle domain will be used as a fallback mirror. " \
+        description:  "Use this URL as the download mirror for bottles and their manifests. " \
+                      "If a bottle or manifest is unavailable at the mirror, " \
+                      "the default bottle domain will be used as a fallback. " \
+                      "Prefer `$HOMEBREW_ARTIFACT_DOMAIN` for a mirror that transparently proxies all " \
+                      "Homebrew downloads. " \
                       "For example, `export HOMEBREW_BOTTLE_DOMAIN=http://localhost:8080` will cause all bottles " \
-                      "to download from the prefix `http://localhost:8080/`. " \
-                      "If bottles are not available at `$HOMEBREW_BOTTLE_DOMAIN` " \
-                      "they will be downloaded from the default bottle domain.",
+                      "to download from the prefix `http://localhost:8080/`.",
         default_text: "`https://ghcr.io/v2/homebrew/core`.",
         default:      HOMEBREW_BOTTLE_DEFAULT_DOMAIN,
       },
@@ -151,30 +177,34 @@ module Homebrew
         disabled_by: :HOMEBREW_BUNDLE_NO_DESCRIBE,
         default:     true,
         replacement: "the default behaviour",
-        odeprecated: true,
+        odisabled:   true,
       },
       HOMEBREW_BUNDLE_DUMP_DESCRIBE:             {
         description: "If set, add a description comment above each line in `brew bundle dump` " \
                      "unless the dependency does not have a description. Use `$HOMEBREW_BUNDLE_DESCRIBE` instead.",
         boolean:     true,
         replacement: :HOMEBREW_BUNDLE_DESCRIBE,
-        odeprecated: true,
+        odisabled:   true,
       },
       **BUNDLE_DISABLE_ENVS.select { |env,| env > :HOMEBREW_BUNDLE_DESCRIBE },
       HOMEBREW_BUNDLE_FORCE_INSTALL_CLEANUP:     {
         description: "If set, run `brew bundle cleanup --force` after `brew bundle install`.",
         boolean:     true,
+        replacement: "`brew bundle cleanup --force` after `brew bundle install`",
+        odeprecated: true,
       },
       HOMEBREW_BUNDLE_INSTALL_CLEANUP:           {
         description: "If set, run `brew bundle cleanup` after `brew bundle install`.",
         boolean:     true,
-        hidden:      true,
+        replacement: "`brew bundle cleanup` after `brew bundle install`",
+        odeprecated: true,
       },
       HOMEBREW_BUNDLE_JOBS:                      {
-        # `HOMEBREW_BUNDLE_JOBS=auto` is the default.
-        description: "Use this value as the number of formula installations to run in parallel for " \
-                     "`brew bundle install`. Use `auto` for the number of CPU cores (max 4).",
+        description: "Ignored. `brew bundle install` batches its formula installations into a single " \
+                     "`brew install`, whose download concurrency is set by `$HOMEBREW_DOWNLOAD_CONCURRENCY`.",
         default:     "auto",
+        odisabled:   true,
+        replacement: "$HOMEBREW_DOWNLOAD_CONCURRENCY",
       },
       HOMEBREW_BUNDLE_NO_DESCRIBE:               {
         description: "If set, do not enable bundle description comments from `$HOMEBREW_BUNDLE_DESCRIBE` or " \
@@ -182,9 +212,10 @@ module Homebrew
         boolean:     true,
       },
       HOMEBREW_BUNDLE_NO_JOBS:                   {
-        description: "If set, do not enable parallel jobs from `$HOMEBREW_BUNDLE_JOBS` or its default. " \
-                     "This does not disable an explicit `--jobs`.",
+        description: "Ignored. `brew bundle install` no longer runs formula installations in parallel.",
         boolean:     true,
+        odisabled:   true,
+        replacement: "$HOMEBREW_DOWNLOAD_CONCURRENCY",
       },
       HOMEBREW_BUNDLE_NO_SECRETS:                {
         description: "If set, `brew bundle exec`, `brew bundle env` and `brew bundle sh` will attempt to remove " \
@@ -193,7 +224,7 @@ module Homebrew
         disabled_by: :HOMEBREW_BUNDLE_SECRETS,
         default:     true,
         replacement: "the default behaviour",
-        odeprecated: true,
+        odisabled:   true,
       },
       HOMEBREW_BUNDLE_SECRETS:                   {
         description: "If set, do not enable the default secret scrubbing. " \
@@ -220,12 +251,12 @@ module Homebrew
         description: "Enable linking of helper executables for casks. Use " \
                      "`$HOMEBREW_CASK_OPTS` instead.",
         replacement: "HOMEBREW_CASK_OPTS",
-        odeprecated: true,
+        odisabled:   true,
       },
       HOMEBREW_CASK_OPTS_REQUIRE_SHA:            {
         description: "Require all casks to have a checksum. Use `$HOMEBREW_CASK_OPTS` instead.",
         replacement: "HOMEBREW_CASK_OPTS",
-        odeprecated: true,
+        odisabled:   true,
       },
       HOMEBREW_CLEANUP_MAX_AGE_DAYS:             {
         description: "Cleanup all cached files older than this many days.",
@@ -294,7 +325,7 @@ module Homebrew
       HOMEBREW_DOCKER_REGISTRY_BASIC_AUTH_TOKEN: {
         description: "Use this base64 encoded username and password for authenticating with a Docker registry " \
                      "proxying GitHub Packages. If set to `none`, no authentication header will be sent. " \
-                     "This can be used, if remote `$HOMEBREW_BOTTLE_DOMAIN` does not support any authentication. " \
+                     "This can be used, if remote `$HOMEBREW_ARTIFACT_DOMAIN` does not support any authentication. " \
                      "If `$HOMEBREW_DOCKER_REGISTRY_TOKEN` is set, it will be used instead.",
       },
       HOMEBREW_DOCKER_REGISTRY_TOKEN:            {
@@ -321,12 +352,11 @@ module Homebrew
         boolean:     true,
       },
       HOMEBREW_EVAL_ALL:                         {
-        description: "If set, `brew` commands evaluate all trusted formulae and casks, " \
-                     "executing their arbitrary code. Use `$HOMEBREW_REQUIRE_TAP_TRUST` or " \
-                     "`$HOMEBREW_NO_REQUIRE_TAP_TRUST` instead.",
+        description: "Previously made `brew` commands evaluate all formulae and casks. Commands now evaluate " \
+                     "formulae and casks from trusted taps by default.",
         boolean:     true,
-        replacement: "HOMEBREW_REQUIRE_TAP_TRUST or HOMEBREW_NO_REQUIRE_TAP_TRUST",
-        odeprecated: true,
+        replacement: "the default trusted-tap behaviour",
+        odisabled:   true,
       },
       HOMEBREW_FAIL_LOG_LINES:                   {
         description: "Output this many lines of output on formula `system` failures.",
@@ -343,15 +373,16 @@ module Homebrew
                      "`artifact`, `prefpane`, `qlplugin`, `dictionary`, `font`, `service`, `colorpicker`, " \
                      "`inputmethod`, `internetplugin`, `audiounitplugin`, `vstplugin`, `vst3plugin`, " \
                      "`screensaver`, `keyboardlayout`, `mdimporter`, `preflight`, `postflight`, " \
-                     "`manpage`, `bashcompletion`, `fishcompletion`, `zshcompletion`, `stageonly`.",
+                     "`manpage`, `bashcompletion`, `zshcompletion`, `fishcompletion`, `pwshcompletion`, `stageonly`.",
+        odeprecated: true,
       },
       HOMEBREW_FORBIDDEN_FORMULAE:               {
         description: "A space-separated list of formulae. Homebrew will refuse to install a " \
                      "formula or cask if it or any of its dependencies is on this list.",
       },
       HOMEBREW_FORBIDDEN_LICENSES:               {
-        description: "A space-separated list of SPDX license identifiers. Homebrew will refuse to install a " \
-                     "formula if it or any of its dependencies has a license on this list.",
+        description: "A space-separated list of SPDX licence identifiers. Homebrew will refuse to install a " \
+                     "formula if it or any of its dependencies has a licence on this list.",
       },
       HOMEBREW_FORBIDDEN_OWNER:                  {
         description: "The person who has set any `$HOMEBREW_FORBIDDEN_*` variables.",
@@ -370,12 +401,15 @@ module Homebrew
       HOMEBREW_FORBID_CASKS:                     {
         description: "If set, Homebrew will refuse to install any casks.",
         boolean:     true,
+        odeprecated: true,
       },
       HOMEBREW_FORBID_PACKAGES_FROM_PATHS:       {
         description:  "If set, Homebrew will refuse to read formulae or casks provided from file paths, " \
                       "e.g. `brew install ./package.rb`.",
-        boolean:      true,
+        boolean:      :set,
         default_text: "true unless `$HOMEBREW_DEVELOPER` is set.",
+        # Keep in sync with forbid_packages_from_paths? below.
+        default:      -> { ENV["HOMEBREW_TESTS"].blank? && ENV["HOMEBREW_DEVELOPER"].blank? },
       },
       HOMEBREW_FORCE_API_AUTO_UPDATE:            {
         description: "If set, update the Homebrew API formula or cask data even if " \
@@ -383,8 +417,7 @@ module Homebrew
         boolean:     true,
       },
       HOMEBREW_FORCE_BREWED_CA_CERTIFICATES:     {
-        description: "If set, always use a Homebrew-installed `ca-certificates` rather than the system version. " \
-                     "Automatically set if the system version is too old.",
+        description: "If set, always use a Homebrew-installed `ca-certificates` rather than the system version.",
         boolean:     :set,
       },
       HOMEBREW_FORCE_BREWED_CURL:                {
@@ -398,12 +431,14 @@ module Homebrew
         boolean:     :set,
       },
       HOMEBREW_FORCE_BREW_WRAPPER:               {
-        description: "If set, require `brew` to be invoked by the value of " \
-                     "`$HOMEBREW_FORCE_BREW_WRAPPER` for non-trivial `brew` commands.",
+        description: "No longer used.",
+        replacement: "your wrapper directly",
+        odeprecated: true,
       },
       HOMEBREW_FORCE_BREW_WRAPPER_HELP_MESSAGE:  {
-        description: "If set, appended to the `$HOMEBREW_FORCE_BREW_WRAPPER` error message to provide " \
-                     "additional help or context to the user.",
+        description: "No longer used.",
+        replacement: "custom help in your wrapper",
+        odeprecated: true,
       },
       HOMEBREW_FORCE_VENDOR_RUBY:                {
         description: "If set, always use Homebrew's vendored, relocatable Ruby version even if the system version " \
@@ -537,16 +572,17 @@ module Homebrew
         boolean:     :set,
       },
       HOMEBREW_NO_EVAL_ENV_SCRUBBING:            {
-        # odeprecated: remove in a later release
         description: "If set, sensitive environment variables are available while evaluating " \
                      "formulae and casks. `$HOMEBREW_GITHUB_API_TOKEN` is still available during evaluation " \
                      "when this is unset. This setting will be removed in a later release.",
         boolean:     true,
-        odeprecated: true,
+        odisabled:   true,
       },
       HOMEBREW_NO_FORCE_BREW_WRAPPER:            {
-        description: "`Deprecated:` If set, disables `$HOMEBREW_FORCE_BREW_WRAPPER` behaviour, even if set.",
+        description: "No longer used.",
         boolean:     :set,
+        replacement: "an environment without $HOMEBREW_NO_FORCE_BREW_WRAPPER",
+        odeprecated: true,
       },
       HOMEBREW_NO_GITHUB_API:                    {
         description: "If set, do not use the GitHub API, e.g. for searches or fetching relevant issues " \
@@ -588,22 +624,34 @@ module Homebrew
                      "shadowed by other commands earlier on `$PATH`.",
         boolean:     true,
       },
+      HOMEBREW_NO_RELOCATE_BUILD_PREFIX:         {
+        description: "If set, do not relocate bottles built for a different prefix at install time. " \
+                     "Homebrew will build from source instead.",
+        boolean:     true,
+      },
       HOMEBREW_NO_REQUIRE_TAP_TRUST:             {
-        # odeprecated: remove in a later release after tap trust checks are the default.
         description: "If set, do not require non-official tap formulae, casks or commands to be trusted. " \
-                     "This is not recommended and will be removed in a later release. Also enables commands " \
-                     "that evaluate all formulae and casks.",
+                     "This is not recommended and will be removed in a later release.",
         boolean:     :set,
+        replacement: "`brew trust` for each non-official tap, formula, cask or command",
+        odeprecated: true,
       },
       HOMEBREW_NO_SANDBOX_CASK:                  {
-        # odeprecated: make cask executable sandboxing mandatory in a future release.
         description: "If set, disable sandboxing for cask artifacts that generate files by running " \
                      "executables.",
         boolean:     true,
-        odeprecated: true,
+        odisabled:   true,
       },
       HOMEBREW_NO_SANDBOX_LINUX:                 {
         description: "If set, disable the Linux sandbox.",
+        boolean:     :set,
+        replacement: "a Landlock-enabled Linux kernel",
+        odeprecated: true,
+      },
+      HOMEBREW_NO_SUDO:                          {
+        description: "If set, do not run commands with `sudo`(8). Automatically enabled when `sudo` is missing, " \
+                     "reports a recognised inability to elevate privileges or explicitly denies access. " \
+                     "A password requirement or an inconclusive check preserves normal `sudo` behaviour.",
         boolean:     :set,
       },
       HOMEBREW_NO_UPDATE_REPORT_NEW:             {
@@ -621,34 +669,37 @@ module Homebrew
       },
       HOMEBREW_NO_VERIFY_ATTESTATIONS:           {
         description: "If set, Homebrew will not verify cryptographic attestations of build provenance for bottles " \
-                     "from homebrew-core.",
+                     "from `homebrew/core` or supported third-party taps.",
         boolean:     :set,
       },
       HOMEBREW_PIP_INDEX_URL:                    {
         description:  "If set, `brew install` <formula> will use this URL to download PyPI package resources.",
         default_text: "`https://pypi.org/simple`.",
+        default:      "https://pypi.org/simple",
       },
       HOMEBREW_PRY:                              {
-        description: "If set, use Pry for the `brew irb` command.",
+        description: "This variable no longer has any effect because Pry is largely unmaintained upstream.",
         boolean:     true,
+        odisabled:   true,
+        replacement: "the default IRB backend (Pry is largely unmaintained upstream)",
       },
       HOMEBREW_REQUIRE_TAP_TRUST:                {
-        # odeprecated: make tap trust checks default in a later release.
-        description: "If set, require non-official tap formulae, casks and commands to be trusted with " \
-                     "`brew trust` before Homebrew loads them. This is the default unless " \
-                     "`$HOMEBREW_NO_REQUIRE_TAP_TRUST` is set. Also enables commands that evaluate all formulae " \
-                     "and casks.",
+        description: "Previously made Homebrew require non-official tap formulae, casks and commands to be trusted " \
+                     "with `brew trust` before loading them. This is now the default unless " \
+                     "`$HOMEBREW_NO_REQUIRE_TAP_TRUST` is set.",
         boolean:     :set,
         disabled_by: :HOMEBREW_NO_REQUIRE_TAP_TRUST,
         default:     true,
+        replacement: "the default behaviour",
+        odeprecated: true,
       },
       HOMEBREW_SANDBOX_LINUX:                    {
-        description: "The `bwrap`(1) sandbox is the default for formula installation and testing " \
+        description: "The Landlock sandbox is the default for formula installation and testing " \
                      "on Linux unless `$HOMEBREW_NO_SANDBOX_LINUX` is set.",
         boolean:     :set,
         disabled_by: :HOMEBREW_NO_SANDBOX_LINUX,
         default:     true,
-        odeprecated: true,
+        odisabled:   true,
       },
       HOMEBREW_SBOM:                             {
         description: "Write SBOM files for source installs.",
@@ -680,6 +731,7 @@ module Homebrew
         description:  "If set, Homebrew will use the given config file instead of `~/.ssh/config` when " \
                       "fetching Git repositories over SSH.",
         default_text: "`~/.ssh/config`",
+        default:      -> { "#{Dir.home}/.ssh/config" },
       },
       HOMEBREW_SUDO_THROUGH_SUDO_USER:           {
         description: "If set, Homebrew will use the `$SUDO_USER` environment variable to define the user to " \
@@ -718,7 +770,7 @@ module Homebrew
         disabled_by: :HOMEBREW_NO_UPGRADE_AUTO_UPDATES_CASKS,
         default:     true,
         replacement: "the default behaviour",
-        odeprecated: true,
+        odisabled:   true,
       },
       HOMEBREW_UPGRADE_GREEDY:                   {
         description: "If set, pass `--greedy` to all cask upgrade commands.",
@@ -732,7 +784,7 @@ module Homebrew
         description: "If set, fetch formula and cask data from Homebrew's internal API. This is now the default.",
         boolean:     :set,
         replacement: "the default behaviour",
-        odeprecated: true,
+        odisabled:   true,
       },
       HOMEBREW_VERBOSE:                          {
         description: "If set, always assume `--verbose` when running commands.",
@@ -745,7 +797,7 @@ module Homebrew
       },
       HOMEBREW_VERIFY_ATTESTATIONS:              {
         description: "If set, Homebrew will use the `gh` tool to verify cryptographic attestations " \
-                     "of build provenance for bottles from homebrew-core.",
+                     "of build provenance for bottles from `homebrew/core` or supported third-party taps.",
         boolean:     :set,
         disabled_by: :HOMEBREW_NO_VERIFY_ATTESTATIONS,
       },
@@ -770,6 +822,8 @@ module Homebrew
       },
     }.freeze, T::Hash[Symbol, T::Hash[Symbol, T.untyped]])
 
+    ANALYTICS_VARIABLES = T.let((ENVS.keys - [:HOMEBREW_NO_ANALYTICS]).freeze, T::Array[Symbol])
+
     sig { params(env: Symbol, hash: T::Hash[Symbol, T.untyped]).returns(String) }
     def env_method_name(env, hash)
       method_name = env.to_s
@@ -784,9 +838,22 @@ module Homebrew
       !!(hash[:hidden] || hash[:odeprecated] || hash[:odisabled])
     end
 
+    # The default value as human text, e.g. for the manpage or analytics:
+    # `default_text` summarises defaults that vary by platform or machine.
+    sig { params(env: Symbol).returns(T.nilable(String)) }
+    def default_description(env)
+      hash = ENVS[env]
+      return if hash.nil?
+
+      default_text = hash[:default_text]
+      return default_text if default_text
+
+      default = hash[:default]
+      "`#{default}`." if default
+    end
+
     # Defaults and parsing that cannot be expressed by the generated helpers.
     CUSTOM_IMPLEMENTATIONS = T.let(Set.new([
-      :HOMEBREW_BUNDLE_JOBS,
       :HOMEBREW_CASK_OPTS,
       :HOMEBREW_DOWNLOAD_CONCURRENCY,
       :HOMEBREW_FORBID_PACKAGES_FROM_PATHS,
@@ -802,6 +869,42 @@ module Homebrew
     # `_NO_` variants, where any non-empty value must mean enabled. Use
     # `disabled_by:` when one boolean env var should override another.
     FALSY_VALUES = %w[false no off nil 0].freeze
+
+    sig { params(env: Symbol).returns(T::Boolean) }
+    def non_default_variable?(env)
+      value = ENV.fetch(env.to_s, nil)
+      # Blank values behave like unset in the generated accessors.
+      return false if value.blank?
+
+      config = ENVS.fetch(env)
+      default = config.fetch(:default, config[:boolean] ? false : nil)
+      default = default.call if default.respond_to?(:call)
+      if config[:boolean]
+        enabled = config[:boolean] == :set || FALSY_VALUES.exclude?(value.downcase)
+        enabled != default
+      else
+        value != default.to_s
+      end
+    end
+
+    # Whether the user set this variable rather than Homebrew exporting
+    # it itself, e.g. `HOMEBREW_EDITOR` from `EDITOR`. The matching Bash
+    # records `HOMEBREW_USER_SET_VARS` in `bin/brew` before any exports.
+    sig { params(env: Symbol).returns(T::Boolean) }
+    def user_set_variable?(env)
+      return false if ENV.fetch(env.to_s, nil).blank?
+      return true unless env.to_s.start_with?("HOMEBREW_")
+
+      ENV.fetch("HOMEBREW_USER_SET_VARS", "").split.include?(env.to_s)
+    end
+
+    sig { returns(T::Array[String]) }
+    def non_default_variables
+      ENV.filter_map do |env, _value|
+        env_symbol = env.to_sym
+        env if ENVS.key?(env_symbol) && user_set_variable?(env_symbol) && non_default_variable?(env_symbol)
+      end.sort
+    end
 
     ENVS.each do |env, hash|
       # Needs a custom implementation.
@@ -824,13 +927,27 @@ module Homebrew
         end
       elsif hash[:default].present?
         define_method(method_name) do
-          env_value(env, hash).presence || hash.fetch(:default).to_s
+          value = env_value(env, hash).presence
+          next value if value
+
+          default = hash.fetch(:default)
+          default = default.call if default.respond_to?(:call)
+          default.to_s
         end
       else
         define_method(method_name) do
           env_value(env, hash).presence
         end
       end
+    end
+
+    sig { void }
+    def self.check_deprecated_bash_variables
+      force_brew_wrapper
+      force_brew_wrapper_help_message
+      no_force_brew_wrapper?
+
+      nil
     end
 
     sig { params(env: T.any(String, Symbol), hash: T::Hash[Symbol, T.untyped]).returns(T.nilable(String)) }
@@ -873,6 +990,11 @@ module Homebrew
       true
     end
 
+    sig { returns(T::Boolean) }
+    def bottle_domain_custom?
+      Homebrew::EnvConfig.bottle_domain != HOMEBREW_BOTTLE_DEFAULT_DOMAIN
+    end
+
     sig { returns(String) }
     def make_jobs
       jobs = ENV["HOMEBREW_MAKE_JOBS"].to_i
@@ -890,7 +1012,7 @@ module Homebrew
     end
 
     sig { returns(T::Boolean) }
-    def cask_opts_binaries?
+    def self.cask_opts_binaries?
       cask_opts.reverse_each do |opt|
         return true if opt == "--binaries"
         return false if opt == "--no-binaries"
@@ -904,35 +1026,12 @@ module Homebrew
     end
 
     sig { returns(T::Boolean) }
-    def cask_opts_quarantine?
-      cask_opts.reverse_each do |opt|
-        return true if opt == "--quarantine"
-        return false if opt == "--no-quarantine"
-      end
-
-      true
-    end
-
-    sig { returns(T::Boolean) }
     def cask_opts_require_sha?
       return true if cask_opts.include?("--require-sha")
 
       method_name = :cask_opts_require_sha
       env_value = T.cast(Homebrew::EnvConfig.public_send(method_name), T.nilable(String))
       env_value.present? && FALSY_VALUES.exclude?(env_value.downcase)
-    end
-
-    sig { returns(T.nilable(String)) }
-    def bundle_jobs
-      if (env_value = ENV.fetch("HOMEBREW_BUNDLE_NO_JOBS", nil)).present? && FALSY_VALUES.exclude?(env_value.downcase)
-        return
-      end
-
-      default = ENVS.fetch(:HOMEBREW_BUNDLE_JOBS).fetch(:default).to_s
-      jobs = ENV["HOMEBREW_BUNDLE_JOBS"].presence
-      opoo "HOMEBREW_BUNDLE_JOBS=#{default} is now the default and no longer needs to be set." if jobs == default
-
-      jobs || default
     end
 
     sig { returns(T::Boolean) }
@@ -944,6 +1043,7 @@ module Homebrew
 
       # Provide an opt-out for tests and developers.
       # Our testing framework installs formulae from file paths all over the place.
+      # Keep in sync with the HOMEBREW_FORBID_PACKAGES_FROM_PATHS default above.
       ENV["HOMEBREW_TESTS"].blank? && ENV["HOMEBREW_DEVELOPER"].blank?
     end
 
@@ -969,11 +1069,6 @@ module Homebrew
       end
 
       [concurrency, 1].max
-    end
-
-    sig { returns(T::Boolean) }
-    def tap_trust_configured?
-      Homebrew::EnvConfig.require_tap_trust? || Homebrew::EnvConfig.no_require_tap_trust?
     end
   end
 end

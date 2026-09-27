@@ -58,7 +58,7 @@ module RuboCop
         def patch_problems(patch_url_node, sha256_node)
           patch_url = string_content(patch_url_node)
 
-          if regex_match_group(patch_url_node, %r{https://github.com/[^/]*/[^/]*/pull})
+          if regex_match_group(patch_url_node, %r{https://github\.com/[^/]*/[^/]*/pull})
             problem "Use a commit hash URL rather than an unstable pull request URL: #{patch_url}"
           end
 
@@ -66,7 +66,7 @@ module RuboCop
             problem "Use a commit hash URL rather than an unstable merge request URL: #{patch_url}"
           end
 
-          if regex_match_group(patch_url_node, %r{https://github.com/[^/]*/[^/]*/commit/[a-fA-F0-9]*\.diff})
+          if regex_match_group(patch_url_node, %r{https://github\.com/[^/]*/[^/]*/commit/[a-fA-F0-9]*\.diff})
             problem "GitHub patches should end with .patch, not .diff: #{patch_url}" do |corrector|
               # Replace .diff with .patch, keeping either the closing quote or query parameter start
               correct = patch_url_node.source.sub(/\.diff(["?])/, '.patch\1')
@@ -115,7 +115,7 @@ module RuboCop
           end
 
           gh_patch_diff_pattern =
-            %r{https?://patch-diff\.githubusercontent\.com/raw/(.+)/(.+)/pull/(.+)\.(?:diff|patch)}
+            %r{https?://patch-diff\.githubusercontent\.com/raw/.+/.+/pull/.+\.(?:diff|patch)}
           if regex_match_group(patch_url_node, gh_patch_diff_pattern)
             problem "Use a commit hash URL rather than patch-diff: #{patch_url}"
           end
@@ -143,13 +143,14 @@ module RuboCop
         def resolves_problems(node)
           unless node.str_type?
             offending_node(node)
-            problem "`resolves` should be passed identifier strings (CVE/GHSA id or issue URL)"
+            problem "`resolves` should be passed identifier strings (CVE/GHSA/OSV id or issue URL)"
             return
           end
 
           value = string_content(node)
           return if value.match?(/\ACVE-\d{4}-\d{4,}\z/)
           return if value.match?(/\AGHSA(-[23456789cfghjmpqrvwx]{4}){3}\z/)
+          return if value.match?(/\AOSV-\d{4}-\d+\z/)
           return if value.match?(%r{\Ahttps?://})
 
           offending_node(node)
@@ -159,7 +160,7 @@ module RuboCop
               corrector.replace(node.source_range, corrected.inspect)
             end
           else
-            problem "`resolves` should be a CVE/GHSA identifier or issue URL, got: #{value.inspect}"
+            problem "`resolves` should be a CVE/GHSA/OSV identifier or issue URL, got: #{value.inspect}"
           end
         end
 

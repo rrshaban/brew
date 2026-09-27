@@ -1,8 +1,13 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/browser"
+
+require "utils/text"
+
 require "abstract_command"
 require "formula"
+require "cask/cask"
 require "cask/caskroom"
 require "dependencies_helpers"
 
@@ -72,13 +77,17 @@ module Homebrew
         switch "--installed",
                description: "List dependencies for formulae that are currently installed. If <formula> is " \
                             "specified, list only its dependencies that are currently installed."
+        flag   "--brewfile",
+               description: "Use formulae and casks listed in a Brewfile as inputs. " \
+                            "Defaults to `./Brewfile`; use `--brewfile=`<path> to specify another."
         switch "--missing",
                description: "Show only missing dependencies."
         switch "--eval-all",
                description: "Evaluate all available formulae and casks, whether installed or not, to list " \
                             "their dependencies.",
                env:         :eval_all,
-               odeprecated: true
+               replacement: "the default trusted-tap behaviour",
+               odisabled:   true
         switch "--for-each",
                description: "Switch into the mode used when evaluating all formulae and casks, but only list " \
                             "dependencies for each provided <formula>, one formula per line."
@@ -96,6 +105,7 @@ module Homebrew
         conflicts "--tree", "--graph"
         conflicts "--installed", "--missing"
         conflicts "--installed", "--eval-all"
+        conflicts "--brewfile", "--eval-all"
         conflicts "--formula", "--cask"
         formula_options
 
@@ -114,13 +124,11 @@ module Homebrew
         raise UsageError, "`brew deps --arch=all` is not supported." if args.arch == "all"
 
         os, arch = args.os_arch_combinations.fetch(0)
-        eval_all = args.eval_all?
-        eval_all ||= args.no_named? && !args.installed? && Homebrew::EnvConfig.tap_trust_configured?
-
         Formulary.enable_factory_cache!
 
         SimulateSystem.with(os:, arch:) do
-          installed = args.installed? || dependents(args.named.to_formulae_and_casks).all?(&:any_version_installed?)
+          inputs = input_formulae_and_casks
+          installed = args.installed? || dependents(inputs).all?(&:any_version_installed?)
           unless installed
             not_using_runtime_dependencies_reason = if args.installed?
               "not all the named formulae were installed"
@@ -159,8 +167,8 @@ module Homebrew
           recursive = !args.direct?
 
           if args.tree? || args.graph?
-            dependents = if args.named.present?
-              sorted_dependents(args.named.to_formulae_and_casks)
+            dependents = if inputs.any?
+              sorted_dependents(inputs)
             elsif args.installed?
               case args.only_formula_or_cask
               when :formula
@@ -179,24 +187,22 @@ module Homebrew
               if args.dot?
                 puts dot_code
               else
-                exec_browser "https://dreampuf.github.io/GraphvizOnline/##{ERB::Util.url_encode(dot_code)}"
+                Utils::Browser.open "https://dreampuf.github.io/GraphvizOnline/##{ERB::Util.url_encode(dot_code)}"
               end
               return
             end
 
             puts_deps_tree(dependents, recursive:)
             return
-          elsif eval_all
-            puts_deps(sorted_dependents(
-                        Formula.all(eval_all:) + Cask::Cask.all(eval_all:),
-                      ), recursive:)
+          elsif args.no_named? && !args.installed? && !args.brewfile
+            puts_deps(sorted_dependents(Formula.all + Cask::Cask.all), recursive:)
             return
-          elsif !args.no_named? && args.for_each?
-            puts_deps(sorted_dependents(args.named.to_formulae_and_casks), recursive:)
+          elsif inputs.any? && args.for_each?
+            puts_deps(sorted_dependents(inputs), recursive:)
             return
           end
 
-          if args.no_named?
+          if inputs.empty?
             raise FormulaUnspecifiedError unless args.installed?
 
             sorted_dependents_formulae_and_casks = case args.only_formula_or_cask
@@ -211,7 +217,7 @@ module Homebrew
             return
           end
 
-          dependents = dependents(args.named.to_formulae_and_casks)
+          dependents = dependents(inputs)
           check_head_spec(dependents) if args.HEAD?
 
           deps_combine_mode = args.union? ? DepsCombineMode::Union : DepsCombineMode::Intersection
@@ -229,6 +235,32 @@ module Homebrew
       end
 
       private
+
+      sig { returns(T::Array[T.any(Formula, Keg, Cask::Cask)]) }
+      def input_formulae_and_casks
+        named = args.named.to_formulae_and_casks
+        brewfile = args.brewfile
+        return named unless brewfile
+
+        require "bundle/brewfile"
+        require "cask/cask_loader"
+        only = args.only_formula_or_cask
+        from_brewfile = Homebrew::Bundle::Brewfile.read(file: brewfile_path(brewfile)).entries.filter_map do |e|
+          case e.type
+          when :brew then Formulary.resolve(e.name) if only != :cask
+          when :cask then Cask::CaskLoader.load(e.name) if only != :formula
+          end
+        end
+        (named + from_brewfile).uniq
+      end
+
+      # A bare `--brewfile` (no `=path`) yields `true` from OptionParser at
+      # runtime; the generated RBI types it as `T.nilable(String)`, so accept
+      # the wider type here and normalise `true`/`""` to the `nil` default.
+      sig { params(value: T.nilable(T.any(String, TrueClass))).returns(T.nilable(String)) }
+      def brewfile_path(value)
+        value.presence if value.is_a?(String)
+      end
 
       sig {
         params(formulae_or_casks: T::Array[T.any(Formula, Keg, Cask::Cask)])
@@ -321,8 +353,10 @@ module Homebrew
 
       sig { params(dependents: T::Array[T.any(Formula, CaskDependent)]).void }
       def check_head_spec(dependents)
-        headless = dependents.select { it.is_a?(Formula) && it.active_spec_sym != :head }
-                             .to_sentence two_words_connector: " or ", last_word_connector: " or "
+        headless = Utils::Text.to_sentence(
+          dependents.select { it.is_a?(Formula) && it.active_spec_sym != :head },
+          conjunction: "or",
+        )
         opoo "No head spec for #{headless}, using stable spec instead" unless headless.empty?
       end
 

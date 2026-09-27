@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/timer"
+
 # Strategy for downloading files using `curl`.
 #
 # @api public
@@ -39,13 +41,26 @@ class CurlDownloadStrategy < AbstractFileDownloadStrategy
 
     download_lock = DownloadLock.new(temporary_path)
     begin
-      download_lock.lock
+      download_lock.lock_or_wait(quiet: quiet?, timeout: Utils::Timer.remaining(end_time))
 
       urls = [url, *mirrors]
 
       if (domain = Homebrew::EnvConfig.artifact_domain)
+        domain = domain.chomp("/")
+        # If the artifact domain already contains the Docker Registry API's
+        # `/v2/` path (e.g. an OCI registry proxying ghcr.io under a repository
+        # prefix: https://mirror.example.com/v2/ghcr-io), skip the `v2/` from
+        # the original URL rather than producing a duplicate `/v2/`.
+        # Keep this in sync with the portable-ruby URL handling in
+        # Library/Homebrew/cmd/vendor-install.sh.
+        domain_contains_v2 = %r{\Ahttps?://[^/]+/v2(?:/|\z)}.match?(domain)
+
         artifact_urls = urls.map do |u|
-          u.sub(%r{^https?://#{GitHubPackages::URL_DOMAIN}/}o, "#{domain.chomp("/")}/")
+          if domain_contains_v2
+            u.sub(%r{^https?://#{GitHubPackages::URL_DOMAIN}/v2/}o, "#{domain}/")
+          else
+            u.sub(%r{^https?://#{GitHubPackages::URL_DOMAIN}/}o, "#{domain}/")
+          end
         end
 
         urls = if Homebrew::EnvConfig.artifact_domain_no_fallback?
@@ -62,7 +77,8 @@ class CurlDownloadStrategy < AbstractFileDownloadStrategy
       end
 
       begin
-        url = T.must(urls.shift)
+        url = urls.shift
+        raise "No URLs left to download #{name} from" if url.nil?
 
         ohai "Downloading #{url}"
 
@@ -106,10 +122,13 @@ class CurlDownloadStrategy < AbstractFileDownloadStrategy
         if cached_location_valid
           puts "Already downloaded: #{cached_location}"
         else
+          raise "Could not resolve #{url}" if resolved_url.nil?
+
           begin
-            _fetch(url:, resolved_url: T.must(resolved_url), timeout: Utils::Timer.remaining!(end_time))
+            _fetch(url:, resolved_url:, timeout: Utils::Timer.remaining!(end_time))
           rescue ErrorDuringExecution => e
-            raise CurlDownloadStrategyError.new(url, e.stderr.strip)
+            clean_stderr = strip_progress_bar(Tty.collapse_carriage_returns(e.stderr)).strip
+            raise CurlDownloadStrategyError.new(url, clean_stderr)
           end
           cached_location.dirname.mkpath
           temporary_path.rename(cached_location.to_s)
@@ -143,7 +162,35 @@ class CurlDownloadStrategy < AbstractFileDownloadStrategy
   sig { params(timeout: T.nilable(T.any(Float, Integer))).returns([T.nilable(Time), Integer]) }
   def resolved_time_file_size(timeout: nil)
     _, _, time, file_size, = resolve_url_basename_time_file_size(url, timeout:)
-    [time, T.must(file_size)]
+    raise "Could not determine the file size of #{url}" if file_size.nil?
+
+    [time, file_size]
+  end
+
+  sig { void }
+  def allow_deferred_environment_expansion!
+    @expand_deferred_environment = true
+  end
+
+  # Curl options to be always passed to curl,
+  # with raw head calls (`curl --head`) or with actual `fetch`.
+  sig { returns(T::Array[String]) }
+  def _curl_args
+    args = []
+
+    args += ["-b", meta.fetch(:cookies).map { |k, v| "#{k}=#{v}" }.join(";")] if meta.key?(:cookies)
+
+    args += ["-e", meta.fetch(:referer)] if meta.key?(:referer)
+
+    args += ["--user", meta.fetch(:user)] if meta.key?(:user)
+
+    if meta.fetch(:headers, []).any? { |header| header.include?(EnvSensitive::DEFERRED_PLACEHOLDER_PREFIX) }
+      args += ["--max-redirs", "0"]
+    end
+
+    args += expand_deferred_environment_args(meta.fetch(:headers, [])).flat_map { |h| ["--header", h.strip] }
+
+    args
   end
 
   private
@@ -202,30 +249,25 @@ class CurlDownloadStrategy < AbstractFileDownloadStrategy
       [*parse_content_disposition.call("Content-Disposition: #{header}")]
     end
 
-    time =  parsed_headers
-            .flat_map { |headers| [*headers["last-modified"]] }
-            .filter_map do |t|
-              t.match?(/^\d+$/) ? Time.at(t.to_i) : Time.parse(t)
-            rescue ArgumentError # When `Time.parse` gets a badly formatted date.
-              nil
-            end
+    final_headers = parsed_headers.last || {}
 
-    file_size = parsed_headers
-                .flat_map { |headers| [*headers["content-length"]&.to_i] }
-                .last
+    time = [*final_headers["last-modified"]].filter_map do |t|
+      t.match?(/^\d+$/) ? Time.at(t.to_i) : Time.parse(t)
+    rescue ArgumentError # When `Time.parse` gets a badly formatted date.
+      nil
+    end
+
+    file_size = [*final_headers["content-length"]].last&.to_i
 
     # Fallback to content-range header if content-length is not available.
     # Content-Range format: "bytes start-end/total" or "bytes */total" or "bytes start-end/*"
     if file_size.nil? || file_size.zero?
-      file_size = parsed_headers
-                  .flat_map { |headers| [*headers["content-range"]] }
+      file_size = [*final_headers["content-range"]]
                   .filter_map { |range| Integer(range.split("/").last, 10, exception: false) }
                   .last
     end
 
-    content_type = parsed_headers
-                   .flat_map { |headers| [*headers["content-type"]] }
-                   .last
+    content_type = [*final_headers["content-type"]].last
 
     is_redirection = url != final_url
     basename = filenames.last || parse_basename(final_url, search_query: !is_redirection)
@@ -262,39 +304,33 @@ class CurlDownloadStrategy < AbstractFileDownloadStrategy
     curl_download resolved_url, to:, try_partial: @try_partial, timeout:
   end
 
-  sig { void }
-  def allow_deferred_environment_expansion!
-    @expand_deferred_environment = true
-  end
-
   sig { params(args: T::Array[String]).returns(T::Array[String]) }
   def expand_deferred_environment_args(args)
     return args unless @expand_deferred_environment
 
+    # Variables the formula or cask actually named. A server can put a
+    # placeholder in a `Location:` target, and expanding one it never declared
+    # would send it a secret it was never given.
+    declared = [url, *@mirrors, *meta.fetch(:headers, [])]
+    placeholder_pattern = /#{Regexp.escape(EnvSensitive::DEFERRED_PLACEHOLDER_PREFIX)}\w+
+                           #{Regexp.escape(EnvSensitive::DEFERRED_PLACEHOLDER_SUFFIX)}/xo
+
     with_context(deferred_environment_expansion: true) do
-      args.map { |arg| ENV.expand_deferred_environment(arg) }
+      args.map do |arg|
+        next arg unless arg.include?(EnvSensitive::DEFERRED_PLACEHOLDER_PREFIX)
+
+        undeclared = arg.gsub(placeholder_pattern) do |placeholder|
+          (declared.any? { |value| value.include?(placeholder) }) ? "" : placeholder
+        end
+        next ENV.expand_deferred_environment(arg) if undeclared.exclude?(
+          EnvSensitive::DEFERRED_PLACEHOLDER_PREFIX,
+        )
+
+        raise CurlDownloadStrategyError.new(
+          url, "Refusing to expand a deferred secret the download did not declare."
+        )
+      end
     end
-  end
-
-  # Curl options to be always passed to curl,
-  # with raw head calls (`curl --head`) or with actual `fetch`.
-  sig { returns(T::Array[String]) }
-  def _curl_args
-    args = []
-
-    args += ["-b", meta.fetch(:cookies).map { |k, v| "#{k}=#{v}" }.join(";")] if meta.key?(:cookies)
-
-    args += ["-e", meta.fetch(:referer)] if meta.key?(:referer)
-
-    args += ["--user", meta.fetch(:user)] if meta.key?(:user)
-
-    if meta.fetch(:headers, []).any? { |header| header.include?(EnvSensitive::DEFERRED_PLACEHOLDER_PREFIX) }
-      args += ["--max-redirs", "0"]
-    end
-
-    args += expand_deferred_environment_args(meta.fetch(:headers, [])).flat_map { |h| ["--header", h.strip] }
-
-    args
   end
 
   sig { returns(T::Hash[Symbol, T.any(String, Symbol)]) }

@@ -9,20 +9,21 @@ module Cask
     class Binary < Symlinked
       sig {
         override.params(
-          force:    T::Boolean,
-          adopt:    T::Boolean,
-          command:  T.class_of(SystemCommand),
-          _options: T.anything,
+          force:     T::Boolean,
+          adopt:     T::Boolean,
+          overwrite: T::Boolean,
+          dry_run:   T::Boolean,
+          command:   T.class_of(SystemCommand),
         ).void
       }
-      def link(force: false, adopt: false, command: SystemCommand, **_options)
+      def link(force: false, adopt: false, overwrite: false, dry_run: false, command: SystemCommand)
         super
-        return if source.executable?
+        return if dry_run || source.executable?
 
         if source.writable?
           FileUtils.chmod "+x", source
         else
-          command.run!("chmod", args: ["+x", source], sudo: true)
+          command.run!("chmod", args: ["+x", source], sudo: nil)
         end
       end
     end

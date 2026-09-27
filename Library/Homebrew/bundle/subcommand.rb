@@ -32,13 +32,13 @@ module Homebrew
           ENV["HOMEBREW_ASK"] = nil
           ENV["HOMEBREW_NO_ASK"] = "1"
 
-          Homebrew::EnvConfig.bundle_dump_describe? if !args.describe? && !args.no_describe?
+          Homebrew::EnvConfig.bundle_dump_describe?
 
           context = context(args, extensions:, ask:)
           Homebrew::Bundle.upgrade_formulae = args.upgrade_formulae
 
           if args.install?
-            redirect_stdout($stderr) do
+            Utils::Output.redirect_stdout($stderr) do
               InstallSubcommand.new(args, context:, quiet: true, cleanup: false).run
             end
           end
@@ -60,12 +60,6 @@ module Homebrew
         }
         def context(args, extensions:, ask: false)
           subcommand = T.let(args.subcommand || "install", String)
-          jobs_arg = args.jobs || Homebrew::EnvConfig.bundle_jobs
-          jobs = if jobs_arg == "auto"
-            [Etc.nprocessors, 4].min
-          else
-            jobs_arg&.to_i || 1
-          end
           no_upgrade = if args.upgrade?
             false
           else
@@ -80,7 +74,6 @@ module Homebrew
             verbose:      args.verbose?,
             force:        args.force?,
             ask:,
-            jobs:         [jobs, 1].max,
             zap:          args.zap?,
             no_type_args: no_type_args?(args, extensions:),
             extensions:,

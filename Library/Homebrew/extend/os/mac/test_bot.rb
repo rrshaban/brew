@@ -38,18 +38,14 @@ module OS
         def setup_bottle_sudo_purge!(args:)
           # This is needed where sparse files may be handled (bsdtar >=3.0).
           # We use gnu-tar with sparse files disabled when --only-json-tab is passed.
-          ENV["HOMEBREW_BOTTLE_SUDO_PURGE"] = "1" if MacOS.version >= :catalina && !args.only_json_tab?
+          ENV["HOMEBREW_BOTTLE_SUDO_PURGE"] = "1" unless args.only_json_tab?
         end
-      end
 
-      module FormulaeDependents
-        extend T::Helpers
-
-        requires_ancestor { ::Homebrew::TestBot::FormulaeDependents }
-
-        sig { params(_formula: Formula, args: ::Homebrew::Cmd::TestBotCmd::Args).returns(T::Boolean) }
-        def skip_recursive_dependents?(_formula, args:)
-          super || ::Hardware::CPU.intel?
+        sig { returns(T::Boolean) }
+        def integration_test_portable_ruby?
+          # tests fail on macOS when currently running portable Ruby is replaced using same path
+          portable_ruby_version = (HOMEBREW_LIBRARY_PATH/"vendor/portable-ruby-version").read.chomp
+          portable_ruby_version != ::Formula["portable-ruby"].pkg_version.to_s
         end
       end
 
@@ -81,5 +77,4 @@ end
 Homebrew::TestBot.singleton_class.prepend(OS::Mac::TestBot::ClassMethods)
 Homebrew::TestBot::TestFormulae.prepend(OS::Mac::TestBot::TestFormulae)
 Homebrew::TestBot::Formulae.prepend(OS::Mac::TestBot::Formulae)
-Homebrew::TestBot::FormulaeDependents.prepend(OS::Mac::TestBot::FormulaeDependents)
 Homebrew::TestBot::CleanupBefore.prepend(OS::Mac::TestBot::CleanupBefore)

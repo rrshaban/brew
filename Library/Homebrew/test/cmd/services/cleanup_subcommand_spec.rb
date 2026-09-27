@@ -6,12 +6,6 @@ require "services/system"
 require "services/cli"
 
 RSpec.describe Homebrew::Cmd::Services::CleanupSubcommand do
-  describe "#TRIGGERS" do
-    it "contains all restart triggers" do
-      expect(Homebrew::Cmd::Services::CleanupSubcommand::TRIGGERS).to eq(%w[cleanup clean cl rm])
-    end
-  end
-
   describe "#run" do
     it "root - prints on empty cleanup" do
       expect(Homebrew::Services::System).to receive(:root?).once.and_return(true)
@@ -19,7 +13,7 @@ RSpec.describe Homebrew::Cmd::Services::CleanupSubcommand do
       expect(Homebrew::Services::Cli).to receive(:remove_unused_service_files).once.and_return([])
 
       expect do
-        described_class.new(nil).run
+        described_class.new(Homebrew::CLI::Args.new).run
       end.to output("All root services OK, nothing cleaned...\n").to_stdout
     end
 
@@ -29,7 +23,7 @@ RSpec.describe Homebrew::Cmd::Services::CleanupSubcommand do
       expect(Homebrew::Services::Cli).to receive(:remove_unused_service_files).once.and_return([])
 
       expect do
-        described_class.new(nil).run
+        described_class.new(Homebrew::CLI::Args.new).run
       end.to output("All user-space services OK, nothing cleaned...\n").to_stdout
     end
 
@@ -39,7 +33,7 @@ RSpec.describe Homebrew::Cmd::Services::CleanupSubcommand do
       expect(Homebrew::Services::Cli).to receive(:remove_unused_service_files).once.and_return(["b"])
 
       expect do
-        described_class.new(nil).run
+        described_class.new(Homebrew::CLI::Args.new).run
       end.not_to output("All user-space services OK, nothing cleaned...\n").to_stdout
     end
   end

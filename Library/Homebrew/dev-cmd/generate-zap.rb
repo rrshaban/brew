@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/text"
+
 require "abstract_command"
 require "cask"
 require "system_command"
@@ -86,7 +88,10 @@ module Homebrew
         "/Library/Preferences",
       ].freeze
 
-      UUID_PATTERN = /[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}/i
+      UUID_PATTERN = /[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}/i
+
+      # Keep in sync with `RuboCop::Cop::Cask::SharedFilelistGlob`.
+      SHARED_FILELIST_PATTERN = /\.sfl\d\z/
 
       sig { override.void }
       def run
@@ -112,8 +117,8 @@ module Homebrew
           odie message
         end
 
-        trash_paths  = replace_uuids(collapse_to_wildcards(trash_paths))
-        delete_paths = replace_uuids(collapse_to_wildcards(delete_paths))
+        trash_paths  = glob_shared_filelists(replace_uuids(collapse_to_wildcards(trash_paths)))
+        delete_paths = glob_shared_filelists(replace_uuids(collapse_to_wildcards(delete_paths)))
 
         rmdir_paths = derive_rmdir_candidates(trash_paths + delete_paths)
 
@@ -126,36 +131,60 @@ module Homebrew
         puts format_stanza(trash: trash_paths, delete: delete_paths, rmdir: rmdir_paths)
       end
 
-      private
-
       sig { params(cask: Cask::Cask).returns(T::Array[String]) }
       def resolve_patterns_from_cask(cask)
         app_artifact = cask.artifacts.find { |a| a.is_a?(Cask::Artifact::App) }
         if app_artifact
-          patterns = [app_artifact.target.basename(".app").to_s]
-          patterns.concat(bundle_identifiers(app_artifact))
-          patterns.uniq
-        else
-          ohai "No app artifact found in cask \"#{cask.token}\"; using token as app name."
-          [cask.token.tr("-", " ").split.map(&:capitalize).join(" ")]
+          return patterns_from_app_paths([app_artifact.target])
         end
+
+        token_pattern = cask.token.tr("-", " ").split.map(&:capitalize).join(" ")
+        pkgutil_receipt_patterns = T.let([], T::Array[String])
+        cask.artifacts.each do |artifact|
+          next unless artifact.is_a?(Cask::Artifact::AbstractUninstall)
+
+          pkgutil = artifact.directives[:pkgutil]
+          if pkgutil.is_a?(String)
+            pkgutil_receipt_patterns << pkgutil
+          elsif pkgutil.is_a?(Array)
+            pkgutil.each { |pattern| pkgutil_receipt_patterns << pattern if pattern.is_a?(String) }
+          end
+        end
+
+        pkg_app_paths = pkgutil_receipt_patterns.uniq.flat_map do |receipt_pattern|
+          Cask::Pkg.all_matching(receipt_pattern, SystemCommand).flat_map do |pkg|
+            pkg.pkgutil_bom_all.filter_map do |path|
+              match = path.to_s.match(%r{\A(?<app_path>.*?\.app)(?:/|\z)}i)
+              next if match.nil?
+
+              Pathname.new(match[:app_path])
+            end
+          end
+        end.uniq.select(&:directory?)
+
+        unless pkg_app_paths.empty?
+          ohai "No app artifact found in cask \"#{cask.token}\"; using installed package receipts."
+          patterns = patterns_from_app_paths(pkg_app_paths)
+          patterns << token_pattern unless patterns.any? { |pattern| pattern.casecmp?(token_pattern) }
+          return patterns
+        end
+
+        ohai "No app artifact or installed package app found in cask \"#{cask.token}\"; using token as app name."
+        [token_pattern]
       end
 
-      sig { params(patterns: T::Array[String]).returns(String) }
-      def format_patterns(patterns)
-        patterns.map { |pattern| "\"#{pattern}\"" }.to_sentence
-      end
+      sig { params(app_paths: T::Array[Pathname]).returns(T::Array[String]) }
+      def patterns_from_app_paths(app_paths)
+        app_paths.flat_map do |app_path|
+          patterns = [app_path.basename(".app").to_s]
+          info_plist = app_path/"Contents/Info.plist"
+          next patterns if !info_plist.exist? || !info_plist.readable?
 
-      sig { params(app_artifact: Cask::Artifact::App).returns(T::Array[String]) }
-      def bundle_identifiers(app_artifact)
-        info_plist = app_artifact.target/"Contents/Info.plist"
-        return [] if !info_plist.exist? || !info_plist.readable?
-
-        plist = system_command!("plutil", args: ["-convert", "xml1", "-o", "-", info_plist]).plist
-        bundle_identifier = plist["CFBundleIdentifier"]
-        return [] unless bundle_identifier.is_a?(String)
-
-        [bundle_identifier]
+          plist = system_command!("plutil", args: ["-convert", "xml1", "-o", "-", info_plist]).plist
+          bundle_identifier = plist["CFBundleIdentifier"]
+          patterns << bundle_identifier if bundle_identifier.is_a?(String)
+          patterns
+        end.uniq
       end
 
       sig {
@@ -226,7 +255,7 @@ module Homebrew
           basenames = entries.map { |e| File.basename(e) }
           wildcarded = find_wildcard_groups(basenames)
 
-          dir = File.dirname(T.must(entries.first))
+          dir = File.dirname(entries.fetch(0))
           wildcarded.each do |name|
             result << File.join(dir, name)
           end
@@ -235,38 +264,14 @@ module Homebrew
         result.uniq.sort
       end
 
-      sig { params(basenames: T::Array[String]).returns(T::Array[String]) }
-      def find_wildcard_groups(basenames)
-        return basenames if basenames.size <= 1
-
-        used = Array.new(basenames.size, false)
-        result = []
-
-        basenames.each_with_index do |name, i|
-          next if used[i]
-
-          group_indices = [i]
-          basenames.each_with_index do |other, j|
-            next if i == j || used[j]
-            next unless other.start_with?(name)
-
-            group_indices << j
-          end
-
-          if group_indices.size > 1
-            result << "#{name}*"
-            group_indices.each { |idx| used[idx] = true }
-          else
-            result << name
-          end
-        end
-
-        result
-      end
-
       sig { params(paths: T::Array[String]).returns(T::Array[String]) }
       def replace_uuids(paths)
         paths.map { |p| p.gsub(UUID_PATTERN, "*") }.uniq.sort
+      end
+
+      sig { params(paths: T::Array[String]).returns(T::Array[String]) }
+      def glob_shared_filelists(paths)
+        paths.map { |p| p.sub(SHARED_FILELIST_PATTERN, ".sfl*") }.uniq.sort
       end
 
       sig { params(paths: T::Array[String]).returns(T::Array[String]) }
@@ -311,6 +316,42 @@ module Homebrew
 
         directives.join(",\n")
                   .prepend("zap ")
+      end
+
+      private
+
+      sig { params(patterns: T::Array[String]).returns(String) }
+      def format_patterns(patterns)
+        Utils::Text.to_sentence(patterns.map { |pattern| "\"#{pattern}\"" })
+      end
+
+      sig { params(basenames: T::Array[String]).returns(T::Array[String]) }
+      def find_wildcard_groups(basenames)
+        return basenames if basenames.size <= 1
+
+        used = Array.new(basenames.size, false)
+        result = []
+
+        basenames.each_with_index do |name, i|
+          next if used[i]
+
+          group_indices = [i]
+          basenames.each_with_index do |other, j|
+            next if i == j || used[j]
+            next unless other.start_with?(name)
+
+            group_indices << j
+          end
+
+          if group_indices.size > 1
+            result << "#{name}*"
+            group_indices.each { |idx| used[idx] = true }
+          else
+            result << name
+          end
+        end
+
+        result
       end
 
       sig { params(key: String, paths: T::Array[String]).returns(String) }

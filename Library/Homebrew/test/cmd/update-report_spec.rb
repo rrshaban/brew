@@ -12,6 +12,13 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
 
   it_behaves_like "reinstall_pkgconf_if_needed"
 
+  it "links to the donations section" do
+    allow(Homebrew::Settings).to receive(:read).with("donationmessage").and_return("false")
+
+    expect { described_class.new([]).donation_message }
+      .to output(include("https://github.com/Homebrew/brew#-donations")).to_stdout
+  end
+
   # Simulate update.sh after a redirected fetch has advanced HEAD and origin/<branch>.
   def setup_redirected_tap(name)
     tap = Tap.fetch("allowed", name)
@@ -28,6 +35,14 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
     branch = Utils.popen_read("git", "-C", tap.path.to_s, "symbolic-ref", "--short", "HEAD").chomp
     system "git", "-C", tap.path.to_s, "update-ref", "refs/remotes/origin/#{branch}", "HEAD"
     [tap, before_revision, branch]
+  end
+
+  def run_quiet_update_report
+    with_env(
+      HOMEBREW_UPDATE_BEFORE: "abc",
+      HOMEBREW_UPDATE_AFTER:  "abc",
+      HOMEBREW_UPDATE_TEST:   "1",
+    ) { described_class.new(["--quiet"]).run }
   end
 
   it "copies update revisions for redirected tap names" do
@@ -146,12 +161,15 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
     FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"allowed"
   end
 
-  it "migrates supported Caskroom Ruby and internal JSON metadata to JSON for developers" do
+  it "migrates supported Caskroom Ruby and internal JSON metadata to JSON for all users" do
     caskroom = mktmpdir/"Caskroom"
     rb_caskfile = caskroom/"local-caffeine/.metadata/1.0/20250101000000.000/Casks/local-caffeine.rb"
     json_caskfile = rb_caskfile.sub_ext(".json")
     uninstall_flight_caskfile =
       caskroom/"with-uninstall-preflight/.metadata/1.0/20250101000000.000/Casks/with-uninstall-preflight.rb"
+    receiptless_caskfile =
+      caskroom/"receiptless-cask/.metadata/1.0/20250101000000.000/Casks/receiptless-cask.rb"
+    receiptless_json_caskfile = receiptless_caskfile.sub_ext(".json")
     internal_json_caskfile = caskroom/"api-cask/.metadata/1.0/20250101000000.000/Casks/api-cask.internal.json"
     api_caskfile = internal_json_caskfile.dirname/"api-cask.json"
     rb_caskfile.dirname.mkpath
@@ -180,6 +198,20 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
         end
       end
     RUBY
+    receiptless_caskfile.dirname.mkpath
+    receiptless_caskfile.write <<~RUBY
+      cask "receiptless-cask" do
+        version "1.0"
+        sha256 :no_check
+        url "https://example.com/receiptless-cask.zip"
+        name "Receipt-less Cask"
+        homepage "https://example.com/receiptless-cask"
+        app "Receipt-less Cask.app"
+
+        uninstall quit: "com.example.receiptless-cask"
+        zap trash: "~/Library/Preferences/com.example.receiptless-cask.plist"
+      end
+    RUBY
     (caskroom/"local-caffeine/.metadata/INSTALL_RECEIPT.json").write JSON.pretty_generate({
       "source"              => { "version" => "1.0" },
       "uninstall_artifacts" => [{ "app" => ["Caffeine.app"] }],
@@ -199,16 +231,13 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
     })
 
     allow(Cask::Caskroom).to receive(:path).and_return(caskroom)
-    allow(Homebrew::EnvConfig).to receive_messages(developer?: true, disable_load_formula?: true,
+    allow(Homebrew::EnvConfig).to receive_messages(developer?: false, disable_load_formula?: true,
                                                    no_install_from_api?: true)
 
-    with_env(
-      HOMEBREW_UPDATE_BEFORE: "abc",
-      HOMEBREW_UPDATE_AFTER:  "abc",
-      HOMEBREW_UPDATE_TEST:   "1",
-    ) { described_class.new(["--quiet"]).run }
+    run_quiet_update_report
 
     loaded_cask = Cask::CaskLoader.load_from_installed_caskfile(json_caskfile)
+    loaded_receiptless_cask = Cask::CaskLoader.load_from_installed_caskfile(receiptless_json_caskfile)
     loaded_api_cask = Cask::CaskLoader.load_from_installed_caskfile(api_caskfile)
     expect([
       rb_caskfile.exist?,
@@ -218,11 +247,153 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
       uninstall_flight_caskfile.exist?,
       uninstall_flight_caskfile.sub_ext(".json").exist?,
       Cask::CaskLoader.load_from_installed_caskfile(uninstall_flight_caskfile).uninstall_flight_blocks?,
+      receiptless_caskfile.exist?,
+      JSON.parse(receiptless_json_caskfile.read).fetch("artifacts"),
+      loaded_receiptless_cask.artifacts_list(uninstall_only: true),
       internal_json_caskfile.exist?,
       JSON.parse(api_caskfile.read).keys,
       loaded_api_cask.loaded_from_internal_api?,
       loaded_api_cask.artifacts.grep(Cask::Artifact::App).count,
-    ]).to eq([false, [], "1.0", 1, true, false, true, false, [], false, 1])
+    ]).to eq([
+      false,
+      [],
+      "1.0",
+      1,
+      true,
+      false,
+      true,
+      false,
+      [
+        { "uninstall" => [{ "quit" => "com.example.receiptless-cask" }] },
+        { "app" => ["Receipt-less Cask.app"] },
+        { "zap" => [{ "trash" => "~/Library/Preferences/com.example.receiptless-cask.plist" }] },
+      ],
+      [
+        { uninstall: [{ quit: "com.example.receiptless-cask" }] },
+        { app: ["Receipt-less Cask.app"] },
+        { zap: [{ trash: "~/Library/Preferences/com.example.receiptless-cask.plist" }] },
+      ],
+      false,
+      [],
+      false,
+      1,
+    ])
+  end
+
+  it "repairs migrated Cask metadata that differs" do
+    caskroom = mktmpdir/"Caskroom"
+    caskfile = caskroom/"mismatched/.metadata/1.0/20250101000000.000/Casks/mismatched.rb"
+    json_caskfile = caskfile.sub_ext(".json")
+    caskfile.dirname.mkpath
+    caskfile.write <<~RUBY
+      cask "mismatched" do
+        version "2.0"
+        sha256 :no_check
+        url "https://example.com/mismatched.zip"
+        name "Mismatched"
+        homepage "https://example.com/mismatched"
+        app "Mismatched.app"
+      end
+    RUBY
+    (caskroom/"mismatched/.metadata/INSTALL_RECEIPT.json").write JSON.pretty_generate({
+      "source"              => { "version" => "1.0" },
+      "uninstall_artifacts" => [{ "app" => ["Wrong.app"] }],
+    })
+    allow(Cask::Caskroom).to receive(:path).and_return(caskroom)
+    allow(Homebrew::EnvConfig).to receive_messages(developer?: false, disable_load_formula?: true,
+                                                   no_install_from_api?: true)
+
+    2.times { run_quiet_update_report }
+    migrated_cask = Cask::CaskLoader.load_from_installed_caskfile(json_caskfile)
+    expect([
+      caskfile.exist?,
+      JSON.parse(json_caskfile.read),
+      migrated_cask.version.to_s,
+      migrated_cask.artifacts_list(uninstall_only: true),
+    ]).to eq([
+      false,
+      {
+        "version"   => "2.0",
+        "artifacts" => [{ "app" => ["Mismatched.app"] }],
+      },
+      "2.0",
+      [{ app: ["Mismatched.app"] }],
+    ])
+  end
+
+  it "repairs existing JSON metadata once" do
+    caskroom = mktmpdir/"Caskroom"
+    caskfile = caskroom/"stubbed/.metadata/1.0/20250101000000.000/Casks/stubbed.json"
+    caskfile.dirname.mkpath
+    caskfile.write("{}")
+    allow(Cask::Caskroom).to receive(:path).and_return(caskroom)
+    allow(Homebrew::EnvConfig).to receive_messages(developer?: false, disable_load_formula?: true,
+                                                   no_install_from_api?: true)
+    allow(Cask::CaskLoader::FromNameLoader).to receive(:try_new).and_call_original
+    expect(Cask::CaskLoader::FromNameLoader).to receive(:try_new).once.with("stubbed", warn: false).and_return(
+      Cask::CaskLoader::FromInstanceLoader.new(Cask::Cask.new("stubbed") { app "Stubbed.app" }),
+    )
+
+    2.times { run_quiet_update_report }
+    expect(JSON.parse(caskfile.read)).to eq({
+      "artifacts" => [{ "app" => ["Stubbed.app"] }],
+    })
+  end
+
+  it "migrates the aged Caskroom fixture eras and preserves their artifacts" do
+    # The fixture holds installed metadata byte-for-byte as older Homebrew versions wrote it.
+    caskroom = Cask::Caskroom.path
+    FileUtils.cp_r TEST_FIXTURE_DIR/"cask/aged_caskroom", caskroom
+    pre_receipt_rb_caskfile = caskroom/"pre-receipt-rb/.metadata/1.0/20250101000000.000/Casks/pre-receipt-rb.rb"
+    pre_receipt_rb_json_caskfile = pre_receipt_rb_caskfile.sub_ext(".json")
+    pre_receipt_stubbed_caskfile =
+      caskroom/"pre-receipt-stubbed/.metadata/1.0/20250101000000.000/Casks/pre-receipt-stubbed.json"
+    receipt_era_stub_caskfile =
+      caskroom/"receipt-era-stub/.metadata/1.0/20250101000000.000/Casks/receipt-era-stub.json"
+    internal_json_caskfile =
+      caskroom/"internal-json/.metadata/1.0/20250101000000.000/Casks/internal-json.internal.json"
+    migrated_internal_caskfile = internal_json_caskfile.dirname/"internal-json.json"
+    uninstall_flight_caskfile =
+      caskroom/"uninstall-flight-block/.metadata/1.0/20250101000000.000/Casks/uninstall-flight-block.rb"
+    pre_receipt_stubbed_cask = Cask::Cask.new("pre-receipt-stubbed") { app "Pre Receipt Stubbed.app" }
+    allow(Cask::CaskLoader::FromAPILoader).to receive(:try_new).and_call_original
+    expect(Cask::CaskLoader::FromAPILoader).to receive(:try_new).once.with("pre-receipt-stubbed")
+                                                                .and_return(Cask::CaskLoader::FromInstanceLoader.new(pre_receipt_stubbed_cask))
+
+    described_class.new(["--quiet"]).migrate_caskroom_caskfiles_to_json
+
+    migrated_rb_cask = Cask::CaskLoader.load_from_installed_caskfile(pre_receipt_rb_json_caskfile)
+    receipt_era_stub_cask = Cask::CaskLoader.load_from_installed_caskfile(receipt_era_stub_caskfile)
+    migrated_internal_cask = Cask::CaskLoader.load_from_installed_caskfile(migrated_internal_caskfile)
+    expect([
+      pre_receipt_rb_caskfile.exist?,
+      JSON.parse(pre_receipt_rb_json_caskfile.read),
+      migrated_rb_cask.version.to_s,
+      migrated_rb_cask.artifacts_list(uninstall_only: true),
+      JSON.parse(pre_receipt_stubbed_caskfile.read),
+      JSON.parse(receipt_era_stub_caskfile.read),
+      receipt_era_stub_cask.artifacts_list(uninstall_only: true),
+      internal_json_caskfile.exist?,
+      JSON.parse(migrated_internal_caskfile.read),
+      migrated_internal_cask.artifacts_list(uninstall_only: true),
+      uninstall_flight_caskfile.exist?,
+      uninstall_flight_caskfile.sub_ext(".json").exist?,
+      Cask::CaskLoader.load_from_installed_caskfile(uninstall_flight_caskfile).uninstall_flight_blocks?,
+    ]).to eq([
+      false,
+      { "artifacts" => [{ "app" => ["Pre Receipt Rb.app"] }] },
+      "1.0",
+      [{ app: ["Pre Receipt Rb.app"] }],
+      { "artifacts" => [{ "app" => ["Pre Receipt Stubbed.app"] }] },
+      {},
+      [{ app: ["Receipt Era Stub.app"] }],
+      false,
+      {},
+      [{ app: ["Internal JSON.app"] }],
+      true,
+      false,
+      true,
+    ])
   end
 
   describe Reporter do
@@ -300,7 +471,7 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
 
       expect(hub.select_formula_or_cask(:A)).to be_empty
       expect(hub.select_formula_or_cask(:D)).to be_empty
-      expect(hub.instance_variable_get(:@hash)[:R]).to eq([["cv", "progress"]])
+      expect(hub.renamed_formulae).to eq([["cv", "progress"]])
     end
 
     context "when updating a Tap other than the core Tap" do
@@ -319,7 +490,7 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
 
         expect(hub.select_formula_or_cask(:A)).to be_empty
         expect(hub.select_formula_or_cask(:D)).to be_empty
-        expect(hub.instance_variable_get(:@hash)[:R]).to be_nil
+        expect(hub.renamed_formulae).to be_empty
       end
 
       specify "with renamed Formula and restructured Tap" do
@@ -328,7 +499,7 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
 
         expect(hub.select_formula_or_cask(:A)).to be_empty
         expect(hub.select_formula_or_cask(:D)).to be_empty
-        expect(hub.instance_variable_get(:@hash)[:R]).to eq([%w[foo/bar/xchat foo/bar/xchat2]])
+        expect(hub.renamed_formulae).to eq([%w[foo/bar/xchat foo/bar/xchat2]])
       end
 
       specify "with simulated 'homebrew/php' restructuring" do
@@ -336,7 +507,7 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
 
         expect(hub.select_formula_or_cask(:A)).to be_empty
         expect(hub.select_formula_or_cask(:D)).to be_empty
-        expect(hub.instance_variable_get(:@hash)[:R]).to be_nil
+        expect(hub.renamed_formulae).to be_empty
       end
 
       specify "with Formula changes" do
@@ -344,7 +515,7 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
 
         expect(hub.select_formula_or_cask(:A)).to eq(%w[foo/bar/lua])
         expect(hub.select_formula_or_cask(:M)).to eq(%w[foo/bar/git])
-        expect(hub.instance_variable_get(:@hash)[:R]).to be_nil
+        expect(hub.renamed_formulae).to be_empty
       end
 
       specify "with formula migrated to cask in same tap" do
@@ -374,19 +545,29 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
 
       it "recommends trusting just the migrated package then migrating a rename" do
         expect(other_tap).not_to receive(:ensure_installed!)
-        expect { reporter.send(:ensure_trusted_tap_installed!, "oldfoo", "newfoo", other_tap) }
+        expect { reporter.ensure_trusted_tap_installed!("oldfoo", "newfoo", other_tap) }
           .to output(%r{brew trust foo/bar/newfoo.*brew migrate oldfoo}m).to_stderr
       end
 
       it "recommends a reinstall for an unchanged-name tap migration" do
-        expect { reporter.send(:ensure_trusted_tap_installed!, "foo", "foo", other_tap) }
+        expect { reporter.ensure_trusted_tap_installed!("foo", "foo", other_tap) }
           .to output(/brew reinstall foo/).to_stderr
       end
 
       it "taps a trusted tap" do
         allow(other_tap).to receive(:official?).and_return(true)
         expect(other_tap).to receive(:ensure_installed!)
-        reporter.send(:ensure_trusted_tap_installed!, "foo", "foo", other_tap)
+        reporter.ensure_trusted_tap_installed!("foo", "foo", other_tap)
+      end
+    end
+
+    describe "#ensure_trusted_migration_target!" do
+      it "refuses to install an untrusted migration target" do
+        allow(Homebrew::Trust).to receive(:trusted?).with(:formula, "foo/bar/payload").and_return(false)
+
+        expect do
+          expect(reporter.ensure_trusted_migration_target!(:formula, "foo/bar/payload")).to be(false)
+        end.to output(%r{not trusted.*brew trust --formula foo/bar/payload}mi).to_stderr
       end
     end
 
@@ -406,7 +587,7 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
             -baz
           DIFF
 
-          expect(reporter.send(:diff)).to eq(<<~DIFF.strip)
+          expect(reporter.diff).to eq(<<~DIFF.strip)
             A api/bar.rb
             D api/baz.rb
           DIFF
@@ -422,7 +603,7 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
             -baz
           DIFF
 
-          expect(reporter.send(:diff)).to eq(<<~DIFF.strip)
+          expect(reporter.diff).to eq(<<~DIFF.strip)
             A api/baz.rb
           DIFF
         end
@@ -438,12 +619,25 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
       allow(hub).to receive(:select_formula_or_cask).and_return([])
     end
 
+    it "migrates installed cask renames once" do
+      cask = instance_double(Cask::Cask)
+
+      expect(Cask::Caskroom).to receive(:casks).once.and_return([cask])
+      expect(Cask::Migrator).to receive(:migrate_if_needed).with(cask).once
+
+      hub.migrate_cask_renames
+    end
+
     it "dumps new formulae report" do
       allow(hub).to receive(:select_formula_or_cask).with(:A).and_return(["foo", "bar", "baz"])
-      allow(hub).to receive_messages(installed?: false, all_formula_json: [
-        { "name" => "foo", "desc" => "foobly things" },
-        { "name" => "baz", "desc" => "baz desc" },
-      ])
+      allow(hub).to receive(:installed?).and_return(false)
+      allow(Homebrew::API::Internal).to receive(:formula_hash) do |name|
+        {
+          "foo" => { "desc" => "foobly things" },
+          "baz" => { "desc" => "baz desc" },
+        }[name]
+      end
+      allow(Homebrew::API).to receive(:fetch_json_api_file).and_raise("unexpected public API lookup")
       expect { hub.dump }.to output(<<~EOS).to_stdout
         ==> New Formulae
         bar
@@ -454,10 +648,14 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
 
     it "dumps new casks report" do
       allow(hub).to receive(:select_formula_or_cask).with(:AC).and_return(["cask1", "cask2", "foo/tap/cask3"])
-      allow(hub).to receive_messages(cask_installed?: false, all_cask_json: [
-        { "token" => "cask1", "desc" => "desc1" },
-        { "token" => "cask3", "desc" => "desc3" },
-      ])
+      allow(hub).to receive(:cask_installed?).and_return(false)
+      allow(Homebrew::API::Internal).to receive(:cask_hash) do |token|
+        {
+          "cask1" => { "desc" => "desc1" },
+          "cask3" => { "desc" => "desc3" },
+        }[token]
+      end
+      allow(Homebrew::API).to receive(:fetch_json_api_file).and_raise("unexpected public API lookup")
       allow(Cask::Caskroom).to receive(:any_casks_installed?).and_return(true)
       expect { hub.dump }.to output(<<~EOS).to_stdout
         ==> New Casks
@@ -465,6 +663,22 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
         cask2
         cask3
       EOS
+    end
+
+    it "does not dump update details when HOMEBREW_AUTO_UPDATE_QUIET is set during auto-update" do
+      ENV["HOMEBREW_AUTO_UPDATE_QUIET"] = "1"
+      allow(hub).to receive(:select_formula_or_cask).with(:A).and_return(["foo"])
+      allow(hub).to receive(:installed?).and_return(false)
+
+      expect { hub.dump(auto_update: true) }.not_to output.to_stdout
+    end
+
+    it "dumps update details when HOMEBREW_AUTO_UPDATE_QUIET is set during an explicit update" do
+      ENV["HOMEBREW_AUTO_UPDATE_QUIET"] = "1"
+      allow(hub).to receive(:select_formula_or_cask).with(:A).and_return(["foo"])
+      allow(hub).to receive_messages(installed?: false, description: nil)
+
+      expect { hub.dump }.to output("==> New Formulae\nfoo\n").to_stdout
     end
 
     it "dumps deleted installed formulae and casks report" do
@@ -527,13 +741,14 @@ RSpec.describe Homebrew::Cmd::UpdateReport do
     end
 
     it "merges frozen report arrays" do
+      allow(hub).to receive(:select_formula_or_cask).and_call_original
       first_reporter = instance_double(Reporter, report: { A: ["foo"].freeze })
       second_reporter = instance_double(Reporter, report: { A: ["bar"] })
 
       hub.add(first_reporter)
       hub.add(second_reporter)
 
-      expect(hub.instance_variable_get(:@hash)[:A]).to eq(%w[foo bar])
+      expect(hub.select_formula_or_cask(:A)).to eq(%w[foo bar])
     end
   end
 end

@@ -2,19 +2,20 @@
 # frozen_string_literal: true
 
 require "bundle_version"
+require "cask/cask_base"
 require "cask/cask_loader"
 require "cask/config"
 require "cask/dsl"
 require "cask/metadata"
 require "cask/tab"
 require "utils/output"
+require "utils/path"
 require "api_hashable"
 require "trust"
 
 module Cask
   # An instance of a cask.
   class Cask
-    extend Forwardable
     extend APIHashable
     extend ::Utils::Output::Mixin
     include Metadata
@@ -51,14 +52,8 @@ module Cask
     sig { returns(T::Boolean) }
     attr_accessor :allow_reassignment
 
-    sig { params(eval_all: T::Boolean).returns(T::Array[Cask]) }
-    def self.all(eval_all: false)
-      if !eval_all && !Homebrew::EnvConfig.tap_trust_configured?
-        raise ArgumentError,
-              "Cask::Cask#all cannot be used without `HOMEBREW_REQUIRE_TAP_TRUST=1` or " \
-              "`HOMEBREW_NO_REQUIRE_TAP_TRUST=1`"
-      end
-
+    sig { returns(T::Array[Cask]) }
+    def self.all
       # Load core casks from tokens so they load from the API when the core cask is not tapped.
       tokens_and_files = CoreCaskTap.instance.cask_tokens
       tokens_and_files += Tap.reject(&:core_cask_tap?).flat_map(&:cask_files)
@@ -94,6 +89,7 @@ module Cask
         tap:                      T.nilable(Tap),
         loaded_from_api:          T::Boolean,
         loaded_from_internal_api: T::Boolean,
+        loaded_from_metadata:     T::Boolean,
         api_source:               T.nilable(T::Hash[String, T.untyped]),
         config:                   T.nilable(Config),
         allow_reassignment:       T::Boolean,
@@ -102,8 +98,8 @@ module Cask
       ).void
     }
     def initialize(token, sourcefile_path: nil, source: nil, tap: nil, loaded_from_api: false,
-                   loaded_from_internal_api: false, api_source: nil, config: nil, allow_reassignment: false,
-                   loader: nil, &block)
+                   loaded_from_internal_api: false, loaded_from_metadata: false, api_source: nil, config: nil,
+                   allow_reassignment: false, loader: nil, &block)
       @token = token
       @sourcefile_path = sourcefile_path
       @source = source
@@ -111,7 +107,9 @@ module Cask
       @allow_reassignment = allow_reassignment
       @loaded_from_api = loaded_from_api
       @loaded_from_internal_api = loaded_from_internal_api
+      @loaded_from_metadata = loaded_from_metadata
       @api_source = api_source
+      @language_evaluator = T.let(nil, T.nilable(T.proc.params(languages: T::Array[String]).returns(T.nilable(String))))
       @loader = loader
       # Sorbet has trouble with bound procs assigned to instance variables:
       # https://github.com/sorbet/sorbet/issues/6843
@@ -119,11 +117,14 @@ module Cask
 
       @default_config = T.let(config || Config.new, Config)
 
-      @config = T.let(if config_path.exist?
-                        Config.from_json(File.read(config_path), ignore_invalid_keys: true)
-                      else
-                        @default_config
-      end, Config)
+      @config = T.let(
+        if config_path.exist?
+          Config.from_json(File.read(config_path), ignore_invalid_keys: true)
+        else
+          @default_config
+        end,
+        Config,
+      )
       refresh
     end
 
@@ -132,6 +133,10 @@ module Cask
 
     sig { returns(T::Boolean) }
     def loaded_from_internal_api? = @loaded_from_internal_api
+
+    # Whether this cask was loaded from installed metadata.
+    sig { returns(T::Boolean) }
+    def loaded_from_metadata? = @loaded_from_metadata
 
     sig { returns(T.any(String, Pathname)) }
     def reloadable_ref
@@ -148,7 +153,7 @@ module Cask
     def old_tokens
       @old_tokens ||= T.let(
         if (t = tap)
-          Tap.tap_migration_oldnames(t, token) +
+          Tap.tap_migration_oldnames(t, token, cask: true) +
             t.cask_reverse_renames.fetch(token, [])
         else
           []
@@ -193,7 +198,20 @@ module Cask
       nil
     end
 
-    def_delegators :@dsl, *::Cask::DSL::DSL_METHODS
+    def_delegators :@dsl, *(::Cask::DSL::DSL_METHODS - [:language])
+
+    sig {
+      params(
+        args:    String,
+        default: T::Boolean,
+        block:   T.nilable(T.proc.returns(String)),
+      ).returns(T.nilable(String))
+    }
+    def language(*args, default: false, &block)
+      return @language_evaluator.call(config.languages) if args.empty? && block.nil? && @language_evaluator
+
+      dsl!.language(*args, default:, &block)
+    end
 
     sig { returns(DSL::Caveats) }
     def caveats_object = dsl!.caveats_object
@@ -201,11 +219,10 @@ module Cask
     sig { params(caskroom_path: Pathname).returns(T::Array[[String, String]]) }
     def timestamped_versions(caskroom_path: self.caskroom_path)
       pattern = metadata_timestamped_path(version: "*", timestamp: "*", caskroom_path:).to_s
-      relative_paths = Pathname.glob(pattern)
-                               .map { |p| p.relative_path_from(p.parent.parent) }
-      # Sorbet is unaware that Pathname is sortable: https://github.com/sorbet/sorbet/issues/6844
-      T.unsafe(relative_paths).sort_by(&:basename) # sort by timestamp
-       .map { |p| p.split.map(&:to_s) }
+      Pathname.glob(pattern)
+              .map { |p| p.relative_path_from(p.parent.parent) }
+              .map { |p| [p.dirname.to_s, p.basename.to_s] }
+              .sort_by(&:last) # sort by timestamp
     end
 
     # The fully-qualified token of this {Cask}.
@@ -239,6 +256,13 @@ module Cask
     end
 
     sig { returns(T::Boolean) }
+    def installable_artifact?
+      artifacts.any? do |artifact|
+        artifact.respond_to?(:install_phase) || artifact.is_a?(Artifact::StageOnly)
+      end
+    end
+
+    sig { returns(T::Boolean) }
     def supports_linux?
       return true if depends_on.requires_linux?
 
@@ -250,11 +274,14 @@ module Cask
       !depends_on.requires_linux?
     end
 
-    # The caskfile is needed during installation when there are
-    # `*flight` blocks or the cask has multiple languages
+    # True if this cask can be installed on this platform.
     sig { returns(T::Boolean) }
-    def caskfile_only?
-      languages.any? || artifacts.any?(Artifact::AbstractFlightBlock)
+    def valid_platform?
+      if Homebrew::SimulateSystem.simulating_or_running_on_macos?
+        supports_macos?
+      else
+        supports_linux?
+      end
     end
 
     sig { returns(T::Boolean) }
@@ -304,7 +331,7 @@ module Cask
     sig { void }
     def unpin
       pin_path.unlink if pin_path.symlink?
-      HOMEBREW_PINNED_CASKS.rmdir_if_possible
+      ::Utils::Path.rmdir_if_possible(HOMEBREW_PINNED_CASKS)
     end
 
     sig { returns(T::Boolean) }
@@ -321,7 +348,7 @@ module Cask
 
     sig { returns(T.nilable(String)) }
     def pinned_version
-      pin_path.resolved_path.basename.to_s if pinned?
+      ::Utils::Path.resolved_path(pin_path).basename.to_s if pinned?
     end
 
     sig { returns(Pathname) }
@@ -351,7 +378,7 @@ module Cask
 
     sig { returns(T::Boolean) }
     def checksumable?
-      return false if (url = self.url).nil?
+      return false if (url = self.url).nil? || url.to_s.blank?
 
       DownloadStrategyDetector.detect(url.to_s, url.using) <= AbstractFileDownloadStrategy || false
     end
@@ -496,6 +523,7 @@ module Cask
       raise ArgumentError, "Expected cask to be loaded from the API" unless loaded_from_api?
 
       @languages = cask_struct.languages
+      @language_evaluator = ->(languages) { cask_struct.language(languages) }
       @tap_git_head = tap_git_head
       @ruby_source_path = cask_struct.ruby_source_path
       @ruby_source_checksum = cask_struct.ruby_source_checksum
@@ -590,22 +618,27 @@ module Cask
         return api_to_local_hash(json_cask.dup)
       end
 
-      hash = to_h
+      hash = to_h_with_language_variations
       variations = {}
+      supported_platforms = []
+      on_system_blocks_exist = dsl!.on_system_blocks_exist?
 
-      if dsl!.on_system_blocks_exist?
+      if on_system_blocks_exist
         begin
           OnSystem::VALID_OS_ARCH_TAGS.each do |bottle_tag|
-            next if bottle_tag.linux? && dsl!.os.nil? && !dsl!.sha256_set_for_linux?
-
             macos_requirements = [depends_on.macos, depends_on.maximum_macos].compact
             next if bottle_tag.macos? &&
                     macos_requirements.present? &&
                     !dsl!.depends_on_set_in_block? &&
-                    macos_requirements.any? { |requirement| !requirement.allows?(bottle_tag.to_macos_version) }
+                    macos_requirements.any? do |requirement|
+                      # Avoid recursive equality between cached version-comparison keys across casks.
+                      !requirement.allows?(MacOSVersion.from_symbol(bottle_tag.system))
+                    end
 
             refresh_for_tag(bottle_tag) do
-              to_h.each do |key, value|
+              supported_platforms << bottle_tag.to_sym if platform_supported?(bottle_tag)
+
+              to_h_with_language_variations.each do |key, value|
                 next if HASH_KEYS_TO_SKIP.include? key
                 next if value.to_s == hash[key].to_s
 
@@ -617,10 +650,51 @@ module Cask
         ensure
           refresh
         end
+      else
+        supported_platforms = OnSystem::VALID_OS_ARCH_TAGS.filter_map do |bottle_tag|
+          bottle_tag.to_sym if platform_supported?(bottle_tag)
+        end
       end
 
       hash["variations"] = variations
+      hash["supported_platforms"] = supported_platforms
       hash
+    end
+
+    sig { returns(T::Hash[String, T.untyped]) }
+    def to_h_with_language_variations
+      language_groups = dsl!.language_groups
+      return to_h if language_groups.empty?
+
+      default_language_group = dsl!.default_language_group
+      raise CaskInvalidError.new(self, "No default language specified.") if default_language_group.nil?
+
+      original_config = config
+      language_hashes = language_groups.to_h do |languages|
+        localised_config = original_config.dup
+        localised_config.explicit = original_config.explicit.dup
+        localised_config.languages = [languages.fetch(0)]
+        self.config = localised_config
+        [languages, [to_h, dsl!.language_eval]]
+      end
+      hash = language_hashes.fetch(default_language_group).first
+      hash["language_variations"] = language_hashes.map do |languages, (language_hash, value)|
+        variation = {
+          "languages" => languages,
+          "default"   => languages == default_language_group,
+          "value"     => value,
+        }
+        language_hash.each do |key, language_value|
+          next if HASH_KEYS_TO_SKIP.include? key
+          next if language_value.to_s == hash[key].to_s
+
+          variation[key] = language_value
+        end
+        variation
+      end
+      hash
+    ensure
+      self.config = original_config if original_config
     end
 
     sig { returns(T::Hash[String, T.untyped]) }
@@ -661,6 +735,29 @@ module Cask
     def rename_list(uninstall_only: false)
       rename.filter_map do |rename|
         { from: rename.from, to: rename.to }
+      end
+    end
+
+    sig { params(bottle_tag: ::Utils::Bottles::Tag, installable: T::Boolean).returns(T::Boolean) }
+    def platform_supported?(bottle_tag, installable: true)
+      if bottle_tag.linux?
+        return false unless supports_linux?
+      else
+        return false unless supports_macos?
+      end
+      return false if version.blank? || sha256.blank? || url.blank?
+      return false if installable && !installable_artifact?
+
+      arch_supported = depends_on.arch&.any? do |arch|
+        required_arch = ::Utils::Bottles::Tag.new(system: bottle_tag.system, arch: arch[:type]).standardized_arch
+        required_arch == bottle_tag.standardized_arch
+      end
+      return false if arch_supported == false
+
+      return true unless bottle_tag.macos?
+
+      [depends_on.macos, depends_on.maximum_macos].compact.all? do |requirement|
+        requirement.allows?(bottle_tag.to_macos_version)
       end
     end
 
@@ -743,6 +840,8 @@ module Cask
         end
         return false if combined_version_comparisons.include?(0)
         return false if combined_version_comparisons.present? && combined_version_comparisons.exclude?(-1)
+        return false if combined_version_comparisons.empty? &&
+                        installed_short_version == tap_short_version.rpartition("-").first
       end
 
       return false if [installed_short_version, installed_bundle_version].any? do |installed_plist_version|

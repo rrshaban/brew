@@ -4,6 +4,9 @@
 module Homebrew
   module TestBot
     class FormulaeDependents < TestFormulae
+      MAX_DEPENDENTS_FROM_SOURCE = 10
+      private_constant :MAX_DEPENDENTS_FROM_SOURCE
+
       DependentWithDependencies = T.type_alias { [Formula, T::Array[Dependency]] }
       private_constant :DependentWithDependencies
 
@@ -67,7 +70,7 @@ module Homebrew
 
         if args.formulae_dependents_shard.present?
           dependent_pairs = @dependent_testing_formulae.flat_map do |formula_name|
-            dependent_pairs_for_formula(Formulary.factory(formula_name), formula_name, args:)
+            dependent_pairs_for_formula(formula_name, args:)
           end
           dependent_pairs.uniq! { |dependent, _| dependent.full_name }
 
@@ -76,6 +79,7 @@ module Homebrew
         end
 
         @dependent_testing_formulae.each do |formula_name|
+          cleanup_package_manager_caches
           dependent_formulae!(formula_name, args:)
           puts
         end
@@ -88,6 +92,122 @@ module Homebrew
         return unless @dependent_testing_formulae.include?("bash")
 
         test "brew", "uninstall", "--formula", "--force", "bash"
+      end
+
+      sig {
+        params(
+          dependents: T::Array[DependentWithDependencies],
+          shard:      String,
+        ).returns(T::Array[DependentWithDependencies])
+      }
+      def dependents_for_shard(dependents, shard)
+        unless shard.match?(%r{\A[1-9]\d*/[1-9]\d*\z})
+          raise UsageError, "`--formulae-dependents-shard` must use the format <SHARD/TOTAL>."
+        end
+
+        shard_parts = shard.split("/", 2)
+        shard_index = shard_parts.fetch(0).to_i
+        shard_count = shard_parts.fetch(1).to_i
+        if shard_index > shard_count
+          raise UsageError, "`--formulae-dependents-shard` must not be greater than the total shard count."
+        end
+
+        return dependents if shard_count == 1
+
+        dependents_by_name = dependents.to_h { |dependent, deps| [dependent.full_name, [dependent, deps]] }
+        edges = dependents.to_h { |dependent, _| [dependent.full_name, T.let([], T::Array[String])] }
+
+        dependents.each do |dependent, deps|
+          deps.each do |dep|
+            dep_name = dep.to_formula.full_name
+            next unless edges.key?(dep_name)
+
+            edges.fetch(dependent.full_name) << dep_name
+            edges.fetch(dep_name) << dependent.full_name
+          end
+        end
+
+        seen = T.let(Set.new, T::Set[String])
+        groups = T.let([], T::Array[T::Array[DependentWithDependencies]])
+        max_group_size = (dependents.size + shard_count - 1) / shard_count
+
+        dependents.map(&:first).each do |dependent|
+          next if seen.include?(dependent.full_name)
+
+          group = T.let([], T::Array[DependentWithDependencies])
+          queue = T.let([dependent.full_name], T::Array[String])
+
+          until queue.empty?
+            name = queue.fetch(0)
+            queue.shift
+            next if seen.include?(name)
+
+            seen << name
+            group << dependents_by_name.fetch(name)
+            break if group.size >= max_group_size
+
+            queue.concat(edges.fetch(name).reject { |edge| seen.include?(edge) })
+          end
+
+          groups << group
+        end
+
+        shards = Array.new(shard_count) { T.let([], T::Array[DependentWithDependencies]) }
+        groups.sort_by { |group| [-group.count, group.map { |dependent, _| dependent.full_name }.min.to_s] }
+              .each do |group|
+          group_shard_index = 0
+          shards.each_with_index do |current_shard, index|
+            group_shard_index = index if current_shard.count < shards.fetch(group_shard_index).count
+          end
+          shards.fetch(group_shard_index).concat(group)
+        end
+
+        shards.fetch(shard_index - 1).sort_by { |dependent, _| dependent.full_name }
+      end
+
+      sig {
+        params(
+          dependents: T::Array[DependentWithDependencies],
+          max:        Integer,
+        ).returns([T::Array[DependentWithDependencies], T::Array[DependentWithDependencies]])
+      }
+      def split_source_dependents(dependents, max = MAX_DEPENDENTS_FROM_SOURCE)
+        source_dependents, dependents = dependents.partition do |dependent, deps|
+          next false unless build_dependent_from_source?(dependent)
+
+          deps.all? do |d|
+            bottled_or_built?(d.to_formula, @dependent_testing_formulae)
+          end
+        end
+
+        return [source_dependents, dependents] if source_dependents.count <= max
+
+        ohai "Only source building #{max} of #{source_dependents.count} dependents"
+
+        @formula_install_ranks ||= T.let(begin
+          analytics = begin
+            require "api/analytics"
+            Homebrew::API::Analytics.fetch "install", 90
+          rescue ArgumentError
+            {}
+          end
+          analytics["items"].to_a.each_with_object({}) do |item, hash|
+            formula = item["formula"]
+            number = item["number"]
+            next if formula.blank? || number.blank?
+
+            hash[formula.to_s] = number.to_i
+          end
+        end, T.nilable(T::Hash[String, Integer]))
+
+        if @formula_install_ranks.present?
+          last = @formula_install_ranks.each_value.max.to_i + 1
+          source_dependents.sort_by! do |dependent, _|
+            [@formula_install_ranks.fetch(dependent.full_name, last), dependent.full_name]
+          end
+        end
+        dependents.concat(source_dependents.slice!(max..).to_a)
+        [source_dependents, dependents]
       end
 
       private
@@ -168,7 +288,7 @@ module Homebrew
       def dependents_for_formula(formula, formula_name, args:)
         info_header "Determining dependents..."
 
-        dependents = dependent_pairs_for_formula(formula, formula_name, args:)
+        dependents = dependent_pairs_for_formula(formula_name, args:)
         if (filter = @formulae_dependents_filter)
           dependents = dependents.select do |dependent, _|
             filter.include?(dependent.name) || filter.include?(dependent.full_name)
@@ -177,16 +297,12 @@ module Homebrew
         dependents.reject! { |dependent, _| @tested_dependents.include?(dependent.full_name) }
 
         # Split into dependents that we could potentially be building from source and those
-        # we should not. The criteria is that a dependent must have bottled dependencies, and
-        # either the `--build-dependents-from-source` flag was passed or a dependent has no
-        # bottle on the current OS.
-        source_dependents, dependents = dependents.partition do |dependent, deps|
-          next false unless build_dependent_from_source?(dependent)
-
-          all_deps_bottled_or_built = deps.all? do |d|
-            bottled_or_built?(d.to_formula, @dependent_testing_formulae)
-          end
-          args.build_dependents_from_source? && all_deps_bottled_or_built
+        # we should not. The criteria is that a dependent must have bottled dependencies and
+        # the `--build-dependents-from-source` flag was passed. Total source build dependents
+        # are limited per formula per shard to avoid overly long CI runtime.
+        source_dependents = []
+        if args.build_dependents_from_source?
+          source_dependents, dependents = split_source_dependents(dependents)
         end
 
         # From the non-source list, get rid of any dependents we are only a build dependency to
@@ -216,20 +332,14 @@ module Homebrew
       end
 
       sig {
-        params(formula: Formula, formula_name: String, args: Homebrew::Cmd::TestBotCmd::Args)
+        params(formula_name: String, args: Homebrew::Cmd::TestBotCmd::Args)
           .returns(T::Array[DependentWithDependencies])
       }
-      def dependent_pairs_for_formula(formula, formula_name, args:)
+      def dependent_pairs_for_formula(formula_name, args:)
         @dependent_pairs_by_formula[formula_name] ||= begin
-          # Always skip recursive dependents on Intel. It's really slow.
-          # Also skip recursive dependents on Linux unless it's a Linux-only formula.
-          #
-          skip_recursive_dependents = skip_recursive_dependents?(formula, args:)
-
           uses_args = %w[--formula]
           uses_include_test_args = [*uses_args, "--include-test"]
-          uses_include_test_args << "--recursive" unless skip_recursive_dependents
-          uses_env = require_current_tap_trust_env.merge("HOMEBREW_STDERR" => "1")
+          uses_env = { "HOMEBREW_STDERR" => "1" }
           dependents = with_env(uses_env) do
             Utils.safe_popen_read("brew", "uses", *uses_include_test_args, formula_name)
                  .split("\n")
@@ -250,14 +360,7 @@ module Homebrew
           dependents = dependents.map { |d| Formulary.factory(d) }
 
           dependents = dependents.zip(dependents.map do |f|
-            if skip_recursive_dependents
-              f.deps.reject(&:implicit?)
-            else
-              Dependency.expand(f, cache_key: "test-bot-dependents") do |_, dependency|
-                next Dependable::SKIP if dependency.implicit?
-                next Dependable::KEEP_BUT_PRUNE_RECURSIVE_DEPS if dependency.build? || dependency.test?
-              end
-            end.reject(&:optional?)
+            f.deps.reject { |dependency| dependency.implicit? || dependency.optional? }
           end)
 
           # Defer formulae which could be tested later
@@ -271,77 +374,6 @@ module Homebrew
 
           dependents
         end
-      end
-
-      sig {
-        params(
-          dependents: T::Array[DependentWithDependencies],
-          shard:      String,
-        ).returns(T::Array[DependentWithDependencies])
-      }
-      def dependents_for_shard(dependents, shard)
-        unless shard.match?(%r{\A[1-9]\d*/[1-9]\d*\z})
-          raise UsageError, "`--formulae-dependents-shard` must use the format <SHARD/TOTAL>."
-        end
-
-        shard_parts = shard.split("/", 2)
-        shard_index = shard_parts.fetch(0).to_i
-        shard_count = shard_parts.fetch(1).to_i
-        if shard_index > shard_count
-          raise UsageError, "`--formulae-dependents-shard` must not be greater than the total shard count."
-        end
-
-        return dependents if shard_count == 1
-
-        dependents_by_name = dependents.to_h { |dependent, deps| [dependent.full_name, [dependent, deps]] }
-        edges = dependents.to_h { |dependent, _| [dependent.full_name, T.let([], T::Array[String])] }
-
-        dependents.each do |dependent, deps|
-          deps.each do |dep|
-            dep_name = dep.to_formula.full_name
-            next unless edges.key?(dep_name)
-
-            edges.fetch(dependent.full_name) << dep_name
-            edges.fetch(dep_name) << dependent.full_name
-          end
-        end
-
-        seen = T.let(Set.new, T::Set[String])
-        groups = T.let([], T::Array[T::Array[DependentWithDependencies]])
-        max_group_size = (dependents.size + shard_count - 1) / shard_count
-
-        dependents.map(&:first).each do |dependent|
-          next if seen.include?(dependent.full_name)
-
-          group = T.let([], T::Array[DependentWithDependencies])
-          queue = T.let([dependent.full_name], T::Array[String])
-
-          until queue.empty?
-            name = queue.fetch(0)
-            queue.shift
-            next if seen.include?(name)
-
-            seen << name
-            group << dependents_by_name.fetch(name)
-            break if group.size >= max_group_size
-
-            queue.concat(edges.fetch(name).reject { |edge| seen.include?(edge) })
-          end
-
-          groups << group
-        end
-
-        shards = Array.new(shard_count) { T.let([], T::Array[DependentWithDependencies]) }
-        groups.sort_by { |group| [-group.count, group.map { |dependent, _| dependent.full_name }.min.to_s] }
-              .each do |group|
-          group_shard_index = 0
-          shards.each_with_index do |current_shard, index|
-            group_shard_index = index if current_shard.count < shards.fetch(group_shard_index).count
-          end
-          shards.fetch(group_shard_index).concat(group)
-        end
-
-        shards.fetch(shard_index - 1).sort_by { |dependent, _| dependent.full_name }
       end
 
       sig {
@@ -502,11 +534,6 @@ module Homebrew
             title: "#{dependent} should be bottled for #{Homebrew::TestBot.runner_os_title}!",
           )
         end
-      end
-
-      sig { params(_formula: Formula, args: Homebrew::Cmd::TestBotCmd::Args).returns(T::Boolean) }
-      def skip_recursive_dependents?(_formula, args:)
-        args.skip_recursive_dependents? != false
       end
 
       sig { params(_dependent: Formula).returns(T::Boolean) }

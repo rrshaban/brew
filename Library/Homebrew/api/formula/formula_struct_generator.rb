@@ -28,7 +28,7 @@ module Homebrew
                   String,
                   T.any(Symbol, T::Array[Symbol]),
                 ],
-                # Hash like { since: :catalina } for uses_from_macos_bounds
+                # Hash like { since: :big_sur } for uses_from_macos_bounds
                 T::Hash[Symbol, Symbol],
               ),
             ],
@@ -42,10 +42,6 @@ module Homebrew
         sig { params(hash: T::Hash[String, T.untyped], bottle_tag: Utils::Bottles::Tag).returns(FormulaStruct) }
         def generate_formula_struct_hash(hash, bottle_tag: Homebrew::SimulateSystem.current_tag)
           hash = Homebrew::API.merge_variations(hash, bottle_tag:).dup.deep_stringify_keys
-
-          if (caveats = hash["caveats"])
-            hash["caveats"] = Formulary.replace_placeholders(caveats)
-          end
 
           hash["bottle_checksums"] = begin
             files = hash.dig("bottle", "stable", "files") || {}

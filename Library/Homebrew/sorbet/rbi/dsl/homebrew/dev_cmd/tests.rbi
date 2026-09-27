@@ -24,6 +24,9 @@ class Homebrew::DevCmd::Tests::Args < Homebrew::CLI::Args
   def generic?; end
 
   sig { returns(T::Boolean) }
+  def load_only?; end
+
+  sig { returns(T::Boolean) }
   def no_parallel?; end
 
   sig { returns(T::Boolean) }
@@ -40,6 +43,9 @@ class Homebrew::DevCmd::Tests::Args < Homebrew::CLI::Args
 
   sig { returns(T.nilable(String)) }
   def seed; end
+
+  sig { returns(T.nilable(String)) }
+  def shard; end
 
   sig { returns(T::Boolean) }
   def stackprof?; end

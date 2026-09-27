@@ -1,10 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
-require "cachable"
+require "cacheable"
 require "api"
-require "api/source_download"
-require "download_queue"
 require "api/cask/cask_struct_generator"
 
 module Homebrew
@@ -12,7 +10,7 @@ module Homebrew
     # Helper functions for using the cask JSON API.
     module Cask
       extend T::Generic
-      extend Cachable
+      extend Cacheable
 
       Cache = type_template { { fixed: T::Hash[String, T.untyped] } }
 
@@ -20,88 +18,24 @@ module Homebrew
 
       private_class_method :cache
 
-      sig { params(name: String).returns(T::Hash[String, T.untyped]) }
-      def self.cask_json(name)
-        fetch_cask_json! name if !cache.key?("cask_json") || !cache.fetch("cask_json").key?(name)
-
-        cache.fetch("cask_json").fetch(name)
-      end
-
-      sig { params(name: String).void }
-      def self.fetch_cask_json!(name)
-        endpoint = "cask/#{name}.json"
-        json_cask, updated = Homebrew::API.fetch_json_api_file endpoint
-
-        json_cask = JSON.parse((HOMEBREW_CACHE_API/endpoint).read) unless updated
-
-        cache["cask_json"] ||= {}
-        cache["cask_json"][name] = json_cask
-      end
-
-      sig {
-        params(
-          cask:           ::Cask::Cask,
-          download_queue: Homebrew::DownloadQueue,
-          enqueue:        T::Boolean,
-        ).returns(Homebrew::API::SourceDownload)
-      }
-      def self.source_download(cask, download_queue: Homebrew.default_download_queue, enqueue: false)
-        download = source_download_for(cask)
-
-        if enqueue
-          download_queue.enqueue(download)
-        elsif !download.symlink_location.exist?
-          download.fetch
-        end
-
-        download
-      end
-
-      sig { params(cask: ::Cask::Cask).returns(Homebrew::API::SourceDownload) }
-      def self.source_download_for(cask)
-        path = cask.ruby_source_path.to_s
-        sha256 = cask.ruby_source_checksum[:sha256]
-        checksum = Checksum.new(sha256) if sha256
-        git_head = cask.tap_git_head || "HEAD"
-        tap = cask.tap&.full_name || "Homebrew/homebrew-cask"
-
-        Homebrew::API::SourceDownload.new(
-          "https://raw.githubusercontent.com/#{tap}/#{git_head}/#{path}",
-          checksum,
-          mirrors: [
-            "#{HOMEBREW_API_DEFAULT_DOMAIN}/cask-source/#{File.basename(path)}",
-          ],
-          cache:   HOMEBREW_CACHE_API_SOURCE/"#{tap}/#{git_head}/Cask",
-        )
-      end
-
-      sig { params(cask: ::Cask::Cask).returns(::Cask::Cask) }
-      def self.source_download_cask(cask)
-        download = source_download(cask)
-
-        ::Cask::CaskLoader::FromPathLoader.new(download.symlink_location)
-                                          .load(config: cask.config)
-      end
-
       sig { returns(Pathname) }
       def self.cached_json_file_path
         HOMEBREW_CACHE_API/DEFAULT_API_FILENAME
       end
 
       sig {
-        params(download_queue: ::Homebrew::DownloadQueue, stale_seconds: T.nilable(Integer), enqueue: T::Boolean)
+        params(download_queue: DownloadQueueType, stale_seconds: T.nilable(Integer), enqueue: T::Boolean)
           .returns([T.any(T::Array[T.untyped], T::Hash[String, T.untyped]), T::Boolean])
       }
-      def self.fetch_api!(download_queue: Homebrew.default_download_queue, stale_seconds: nil, enqueue: false)
+      def self.fetch_api!(download_queue: nil, stale_seconds: nil, enqueue: false)
         Homebrew::API.fetch_json_api_file DEFAULT_API_FILENAME, stale_seconds:, download_queue:, enqueue:
       end
 
       sig {
-        params(download_queue: ::Homebrew::DownloadQueue, stale_seconds: T.nilable(Integer), enqueue: T::Boolean)
+        params(download_queue: DownloadQueueType, stale_seconds: T.nilable(Integer), enqueue: T::Boolean)
           .returns([T.any(T::Array[T.untyped], T::Hash[String, T.untyped]), T::Boolean])
       }
-      def self.fetch_tap_migrations!(download_queue: Homebrew.default_download_queue, stale_seconds: nil,
-                                     enqueue: false)
+      def self.fetch_tap_migrations!(download_queue: nil, stale_seconds: nil, enqueue: false)
         Homebrew::API.fetch_json_api_file "cask_tap_migrations.jws.json", stale_seconds:, download_queue:, enqueue:
       end
 
@@ -134,16 +68,6 @@ module Homebrew
         cache.fetch("casks")
       end
 
-      sig { returns(T::Hash[String, String]) }
-      def self.all_renames
-        unless cache.key?("renames")
-          json_updated = download_and_cache_data!
-          write_names(regenerate: json_updated)
-        end
-
-        cache.fetch("renames")
-      end
-
       sig { returns(T::Hash[String, T.untyped]) }
       def self.tap_migrations
         unless cache.key?("tap_migrations")
@@ -158,7 +82,7 @@ module Homebrew
       def self.write_names(regenerate: false)
         download_and_cache_data! unless cache.key?("casks")
 
-        Homebrew::API.write_names_file!(all_casks.keys, "cask", regenerate:)
+        Homebrew::API.write_names_file!("cask", regenerate:) { all_casks.keys }
       end
     end
   end

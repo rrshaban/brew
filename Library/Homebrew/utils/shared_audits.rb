@@ -1,6 +1,7 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "system_command"
 require "utils/curl"
 require "utils/github/api"
 
@@ -12,9 +13,132 @@ module SharedAudits
   GITLAB_NOTABILITY_THRESHOLDS = T.let({ forks: 30, stars: 75 }.freeze, T::Hash[Symbol, Integer])
   BITBUCKET_NOTABILITY_THRESHOLDS = T.let({ forks: 30, watchers: 75 }.freeze, T::Hash[Symbol, Integer])
   FORGEJO_NOTABILITY_THRESHOLDS = T.let({ forks: 30, watchers: 30, stars: 75 }.freeze, T::Hash[Symbol, Integer])
+  NEW_DOMAIN_THRESHOLD_DAYS = 30
+  GIT_FORGE_DOMAINS = %w[
+    bitbucket.org
+    codeberg.org
+    github.com
+    github.io
+    gitlab.com
+    gitlab.io
+    sr.ht
+  ].freeze
+  WHOIS_TIMEOUT_SECONDS = 5
+  WHOIS_CREATION_DATE_REGEX = /^\s*(?:creation\s+date|created(?:\s+on)?|registered(?:\s+on)?|
+                                registration\s+(?:date|time))\s*:\s*(\S+)/ix
+  # RDAP is the IETF successor to WHOIS: ICANN requires every gTLD registry to serve it
+  # and IANA's bootstrap file lists the server for each TLD (gTLD or ccTLD) that does.
+  RDAP_BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
+  RDAP_TIMEOUT_SECONDS = 10
+  RdapServices = T.type_alias { T::Array[[T::Array[String], T::Array[String]]] }
   @pull_request_author = T.let(nil, T.nilable(String))
   @pull_request_author_computed = T.let(false, T::Boolean)
   @self_submission_cache = T.let({}, T::Hash[String, T::Boolean])
+  @rdap_services = T.let(nil, T.nilable(RdapServices))
+
+  class << self
+    sig { params(rdap_services: T.nilable(RdapServices)).returns(T.nilable(RdapServices)) }
+    attr_writer :rdap_services
+  end
+
+  sig { params(browsed: T.nilable(Date)).returns(T::Boolean) }
+  def self.homepage_browsed_recently?(browsed)
+    return false unless browsed
+
+    today = Date.today
+    browsed <= today && browsed.next_year > today
+  end
+
+  sig { params(homepage: String).returns(T.nilable(String)) }
+  def self.new_domain_problem(homepage)
+    host = begin
+      URI(homepage).host
+    rescue URI::InvalidURIError
+      nil
+    end
+    return if host.blank?
+
+    domain = host.downcase.delete_prefix("www.")
+    return if GIT_FORGE_DOMAINS.any? { |forge| domain == forge || domain.end_with?(".#{forge}") }
+
+    @rdap_services ||= begin
+      result = Utils::Curl.curl_output(RDAP_BOOTSTRAP_URL, max_time: RDAP_TIMEOUT_SECONDS)
+      (JSON.parse(result.stdout).fetch("services") if result.status.success?) || []
+    rescue JSON::ParserError, KeyError, TypeError
+      []
+    end
+
+    registered_domain = domain
+    registered_on = T.let(nil, T.nilable(Date))
+    tld = domain.split(".").last
+    rdap_urls = @rdap_services.find { |tlds, _| tlds.include?(tld) }&.fetch(1)
+    if rdap_urls.present?
+      rdap_base_url = (rdap_urls.find { |url| url.start_with?("https://") } || rdap_urls.fetch(0)).delete_suffix("/")
+      # Registries answer 4xx for subdomains, so walk up to the registered domain.
+      labels = domain.split(".")
+      while labels.length >= 2
+        candidate = labels.join(".")
+        result = Utils::Curl.curl_output(
+          "--include", "--location", "#{rdap_base_url}/domain/#{candidate}",
+          header: "Accept: application/rdap+json", max_time: RDAP_TIMEOUT_SECONDS
+        )
+        break unless result.status.success?
+
+        parsed = Utils::Curl.parse_curl_output(result.stdout)
+        case parsed.fetch(:responses).last&.fetch(:status_code).to_i
+        when 200
+          registered_on = begin
+            events = JSON.parse(parsed.fetch(:body)).fetch("events", [])
+            registration = events.find { |event| event["eventAction"] == "registration" }
+            Date.parse(registration.fetch("eventDate")) unless registration.nil?
+          rescue JSON::ParserError, KeyError, TypeError, Date::Error
+            nil
+          end
+          registered_domain = candidate unless registered_on.nil?
+          break
+        when 400..499
+          labels.shift
+        else
+          break
+        end
+      end
+    end
+
+    if registered_on.nil? && which("whois")
+      whois = begin
+        SystemCommand.run("whois", args: [domain], print_stderr: false, timeout: WHOIS_TIMEOUT_SECONDS)
+      rescue Timeout::Error
+        nil
+      end
+      lines = if whois.nil? || !whois.status.success?
+        []
+      else
+        whois.stdout.scrub.lines
+      end
+      # `whois` may print the IANA record for the TLD (whose creation date is always ancient)
+      # before following its referral to the registry, so only look after the referral marker:
+      # `# whois.nic.sh` on macOS, `Found a referral to whois.nic.sh.` on Linux.
+      if lines.first&.start_with?("% IANA WHOIS server")
+        referral_index = lines.index { |line| line.start_with?("# whois.", "Found a referral to ") }
+        lines = referral_index ? lines.drop(referral_index + 1) : []
+      end
+
+      lines.each do |line|
+        value = line[WHOIS_CREATION_DATE_REGEX, 1]
+        next if value.nil?
+
+        registered_on = Date.parse(value)
+        break
+      rescue Date::Error
+        nil
+      end
+    end
+    return if registered_on.nil?
+    return if (Date.today - registered_on) >= NEW_DOMAIN_THRESHOLD_DAYS
+
+    "`homepage` domain `#{registered_domain}` was registered on #{registered_on}: " \
+      "homepages should exist for at least #{NEW_DOMAIN_THRESHOLD_DAYS} days before inclusion"
+  end
 
   sig { returns(T.nilable(String)) }
   def self.pull_request_author
@@ -143,7 +267,7 @@ module SharedAudits
   def self.forgejo_repo_data(user, repo)
     @forgejo_repo_data ||= T.let({}, T.nilable(T::Hash[String, T.untyped]))
     @forgejo_repo_data["#{user}/#{repo}"] ||= begin
-      result = Utils::Curl.curl_output("https://codeberg.org/api/v1/repos/#{user}/#{repo}")
+      result = Utils::Curl.curl_output("https://codeberg.org/api/v1/repos/#{user}/#{repo}", "--fail")
 
       JSON.parse(result.stdout) if result.status.success?
     end
@@ -240,9 +364,10 @@ module SharedAudits
              "<#{notability_thresholds.fetch(:stars)} stars)"
     end
 
-    return if Date.parse(metadata["created_at"]) <= (Date.today - 30)
+    age_days = (Date.today - Date.parse(metadata["created_at"])).to_i
+    return if age_days >= 30
 
-    "GitHub repository too new (<30 days old)"
+    "GitHub repository too new (#{age_days} days old, 30 days required)"
   end
 
   sig { params(user: String, repo: String, self_submission: T::Boolean).returns(T.nilable(String)) }
@@ -265,9 +390,10 @@ module SharedAudits
              "<#{notability_thresholds.fetch(:stars)} stars)"
     end
 
-    return if Date.parse(metadata["created_at"]) <= (Date.today - 30)
+    age_days = (Date.today - Date.parse(metadata["created_at"])).to_i
+    return if age_days >= 30
 
-    "GitLab repository too new (<30 days old)"
+    "GitLab repository too new (#{age_days} days old, 30 days required)"
   end
 
   sig { params(user: String, repo: String, self_submission: T::Boolean).returns(T.nilable(String)) }
@@ -283,7 +409,8 @@ module SharedAudits
 
     return "Bitbucket fork (not canonical repository)" unless metadata["parent"].nil?
 
-    return "Bitbucket repository too new (<30 days old)" if Date.parse(metadata["created_on"]) >= (Date.today - 30)
+    age_days = (Date.today - Date.parse(metadata["created_on"])).to_i
+    return "Bitbucket repository too new (#{age_days} days old, 30 days required)" if age_days < 30
 
     forks_result = Utils::Curl.curl_output("--request", "GET", "#{api_url}/forks")
     return unless forks_result.status.success?
@@ -331,14 +458,15 @@ module SharedAudits
              "<#{notability_thresholds.fetch(:stars)} stars)"
     end
 
-    return if Date.parse(metadata["created_at"]) <= (Date.today - 30)
+    age_days = (Date.today - Date.parse(metadata["created_at"])).to_i
+    return if age_days >= 30
 
-    "Forgejo repository too new (<30 days old)"
+    "Forgejo repository too new (#{age_days} days old, 30 days required)"
   end
 
   sig { params(url: String).returns(T.nilable(String)) }
   def self.github_tag_from_url(url)
-    tag = url[%r{^https://github\.com/[\w-]+/[\w.-]+/archive/refs/tags/(.+)\.(tar\.gz|zip)$}, 1]
+    tag = url[%r{^https://github\.com/[\w-]+/[\w.-]+/archive/refs/tags/(.+)\.(?:tar\.gz|zip)$}, 1]
     tag || url[%r{^https://github\.com/[\w-]+/[\w.-]+/releases/download/([^/]+)/}, 1]
   end
 
@@ -349,7 +477,7 @@ module SharedAudits
 
   sig { params(url: String).returns(T.nilable(String)) }
   def self.forgejo_tag_from_url(url)
-    url[%r{^https://codeberg\.org/[\w-]+/[\w.-]+/archive/(.+)\.(tar\.gz|zip)$}, 1]
+    url[%r{^https://codeberg\.org/[\w-]+/[\w.-]+/archive/(.+)\.(?:tar\.gz|zip)$}, 1]
   end
 
   sig { params(formula_or_cask: T.any(Formula, Cask::Cask)).returns(T.nilable(String)) }

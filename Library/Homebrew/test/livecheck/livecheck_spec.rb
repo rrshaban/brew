@@ -22,7 +22,7 @@ RSpec.describe Homebrew::Livecheck do
 
       livecheck do
         url "https://formulae.brew.sh/api/formula/ruby.json"
-        regex(/"stable":"(\d+(?:\.\d+)+)"/i)
+        regex(/"stable":"\d+(?:\.\d+)+"/i)
       end
 
       resource "foo" do
@@ -31,7 +31,7 @@ RSpec.describe Homebrew::Livecheck do
 
         livecheck do
           url "https://brew.sh/test/releases"
-          regex(/foo[._-]v?(\d+(?:\.\d+)+)\.t/i)
+          regex(/foo[._-]v?\d+(?:\.\d+)+\.t/i)
         end
       end
     end
@@ -78,24 +78,26 @@ RSpec.describe Homebrew::Livecheck do
     context "when provided with a strategy class" do
       it "returns demodulized class name" do
         # We run this twice with the same argument to exercise the caching logic
-        expect(livecheck.send(:livecheck_strategy_names, Homebrew::Livecheck::Strategy::PageMatch)).to eq("PageMatch")
-        expect(livecheck.send(:livecheck_strategy_names, Homebrew::Livecheck::Strategy::PageMatch)).to eq("PageMatch")
+        expect(livecheck.livecheck_strategy_names(Homebrew::Livecheck::Strategy::PageMatch)).to eq("PageMatch")
+        expect(livecheck.livecheck_strategy_names(Homebrew::Livecheck::Strategy::PageMatch)).to eq("PageMatch")
       end
     end
   end
 
   describe "::livecheck_find_versions_parameters" do
     context "when provided with a strategy class" do
-      it "returns demodulized class name" do
-        page_match_parameters = T::Utils.signature_for_method(
-          Homebrew::Livecheck::Strategy::PageMatch.method(:find_versions),
-        ).parameters.map(&:second)
+      it "returns parameter names" do
+        strategy_class = Class.new do
+          extend Homebrew::Livecheck::Strategic
+
+          def self.match?(_url) = true
+          def self.find_versions(url:, regex: nil) = {}
+        end
+        parameters = strategy_class.method(:find_versions).parameters.map(&:second)
 
         # We run this twice with the same argument to exercise the caching logic
-        expect(livecheck.send(:livecheck_find_versions_parameters, Homebrew::Livecheck::Strategy::PageMatch))
-          .to eq(page_match_parameters)
-        expect(livecheck.send(:livecheck_find_versions_parameters, Homebrew::Livecheck::Strategy::PageMatch))
-          .to eq(page_match_parameters)
+        expect(livecheck.livecheck_find_versions_parameters(strategy_class)).to eq(parameters)
+        expect(livecheck.livecheck_find_versions_parameters(strategy_class)).to eq(parameters)
       end
     end
   end
@@ -173,7 +175,7 @@ RSpec.describe Homebrew::Livecheck do
 
           livecheck do
             url "https://brew.sh/test/releases"
-            regex(/foo[._-]v?(\d+(?:\.\d+)+)\.t/i)
+            regex(/foo[._-]v?\d+(?:\.\d+)+\.t/i)
           end
         end
       end
@@ -275,7 +277,7 @@ RSpec.describe Homebrew::Livecheck do
         desc "Test formula"
         homepage "https://brew.sh"
         url "https://brew.sh/test-0.0.1.tgz", using: :homebrew_curl
-        # head is deliberably omitted to exercise more of the method
+        # head is deliberately omitted to exercise more of the method
 
         livecheck do
           url "https://formulae.brew.sh/api/formula/ruby.json"
@@ -302,7 +304,7 @@ RSpec.describe Homebrew::Livecheck do
       RUBY
     end
 
-    it "returns `true` when URL matches a `using: :homebrew_curl` URL" do
+    it "returns `true` when the host matches a `using: :homebrew_curl` URL" do
       expect(livecheck.use_homebrew_curl?(f_homebrew_curl, livecheck_url)).to be(true)
       expect(livecheck.use_homebrew_curl?(f_homebrew_curl, homepage_url)).to be(true)
       expect(livecheck.use_homebrew_curl?(f_homebrew_curl, stable_url)).to be(true)
@@ -311,7 +313,16 @@ RSpec.describe Homebrew::Livecheck do
       expect(livecheck.use_homebrew_curl?(c_homebrew_curl, cask_url)).to be(true)
     end
 
-    it "returns `false` if URL root domain differs from `using: :homebrew_curl` URLs" do
+    it "automatically uses brewed curl for matching pages" do
+      allow(Homebrew::Livecheck::Strategy).to receive(:page_content).and_return({
+        content: '{"stable":"0.0.2"}',
+      })
+
+      expect { livecheck.latest_version(f_homebrew_curl, debug: true) }
+        .to output(a_string_matching(/Homebrew curl\?: +Yes/)).to_stdout
+    end
+
+    it "returns `false` if the host differs from `using: :homebrew_curl` URLs" do
       expect(livecheck.use_homebrew_curl?(f_homebrew_curl, example_url)).to be(false)
       expect(livecheck.use_homebrew_curl?(c_homebrew_curl, example_url)).to be(false)
     end
@@ -327,12 +338,24 @@ RSpec.describe Homebrew::Livecheck do
       expect(livecheck.use_homebrew_curl?(c, example_url)).to be(false)
     end
 
-    it "returns `false` if URL string does not contain a domain" do
+    it "returns `false` if the URL string does not contain a valid host" do
       expect(livecheck.use_homebrew_curl?(f_homebrew_curl, "test")).to be(false)
+      expect(livecheck.use_homebrew_curl?(f_homebrew_curl, "https://[")).to be(false)
     end
   end
 
   describe "::latest_version" do
+    let(:github_url) { head_url.delete_suffix(".git") }
+
+    let(:f_no_livecheck) do
+      formula("test_no_livecheck") do
+        T.bind(self, T.class_of(Formula))
+        desc "Test formula with no `livecheck` block"
+        homepage "https://github.com/Homebrew/brew"
+        url "https://brew.sh/test-0.0.1.tgz"
+      end
+    end
+
     let(:f_throttle_rate) do
       formula("test_throttle_rate") do
         T.bind(self, T.class_of(Formula))
@@ -441,6 +464,301 @@ RSpec.describe Homebrew::Livecheck do
         <a href="test-0.0.2.tgz">0.0.2</a>
       HTML
     end
+    let(:git_content) do
+      <<~EOS
+        ed9942fbd1ec4243f0a92ab8f9b2411c8b1fb091\trefs/tags/1.2.3
+      EOS
+    end
+
+    context "with terminal control characters" do
+      let(:terminal_control_version) { "0.0.2\e]0;changed-title\a" }
+      let(:f_terminal_control_version) do
+        formula("terminal_control_version") do
+          T.bind(self, T.class_of(Formula))
+          desc "Formula with terminal controls in an upstream version"
+          url "https://brew.sh/terminal-control-version-0.0.1.tgz"
+
+          livecheck do
+            url :stable
+            regex(/terminal-control-version-(.+)\.tgz/i)
+          end
+        end
+      end
+
+      before do
+        allow(Homebrew::Livecheck::Strategy).to receive(:page_content).and_return({
+          content: %Q(<a href="terminal-control-version-#{terminal_control_version}.tgz">Download</a>),
+        })
+      end
+
+      it "renders upstream terminal controls inert in human-readable output" do
+        expect { livecheck.run_checks([f_terminal_control_version], debug: true, verbose: true) }
+          .not_to output(/[\e\a\r]/).to_stdout
+      end
+
+      it "preserves upstream control characters as JSON data" do
+        expected = JSON.pretty_generate([
+          {
+            formula: "terminal_control_version",
+            version: {
+              current:             "0.0.1",
+              latest:              terminal_control_version,
+              outdated:            true,
+              newer_than_upstream: false,
+            },
+          },
+        ])
+
+        expect { livecheck.run_checks([f_terminal_control_version], json: true) }
+          .to output("#{expected}\n").to_stdout
+      end
+    end
+
+    it "can use a default check when there is no livecheck block" do
+      # Only check the Git URL, so we can ensure the strategy doesn't make
+      # network requests
+      allow(livecheck).to receive(:checkable_urls).with(f_no_livecheck).and_return([github_url])
+      allow(Homebrew::Livecheck::Strategy::Git).to receive(:ls_remote_tags)
+        .and_return({ content: git_content })
+
+      f_jv_version_info = livecheck.latest_version(f_no_livecheck, json: true, verbose: true)
+      expect(f_jv_version_info&.dig(:meta)).not_to include(:references)
+      expect(f_jv_version_info&.dig(:meta, :url, :original)).to eq(github_url)
+      expect(f_jv_version_info&.dig(:meta, :url, :processed)).to eq(head_url)
+      expect(f_jv_version_info&.dig(:latest)).to eq(Version.new("1.2.3"))
+    end
+
+    context "with a referenced formula/cask" do
+      let(:f_options) do
+        formula("test_options") do
+          T.bind(self, T.class_of(Formula))
+          desc "Test formula with `livecheck` block options"
+          homepage "https://brew.sh"
+          url "https://brew.sh/test-0.0.1.tgz"
+
+          livecheck do
+            url :homepage,
+                homebrew_curl: true,
+                post_json:     { key: "value" },
+                user_agent:    :browser
+            regex(/href=.*?test[._-]v?(\d+(?:\.\d+)+)\.(?:t|dmg)/i)
+          end
+        end
+      end
+      let(:f_reference) do
+        formula("test_reference") do
+          T.bind(self, T.class_of(Formula))
+          desc "Test formula referencing another formula"
+          homepage "https://brew.sh"
+          url "https://brew.sh/test-0.0.1.tgz"
+
+          livecheck do
+            formula "test_options"
+          end
+        end
+      end
+      let(:f_reference_with_overrides) do
+        formula("test_reference") do
+          T.bind(self, T.class_of(Formula))
+          desc "Test formula referencing another formula"
+          homepage "https://brew.sh"
+          url "https://brew.sh/test-0.0.1.tgz"
+
+          livecheck do
+            formula "test_options"
+            url "https://brew.sh/test-override-referenced-url/",
+                post_json:  { key: "overridden value" },
+                user_agent: :curl
+          end
+        end
+      end
+      let(:f_reference_no_livecheck) do
+        formula("test_reference") do
+          T.bind(self, T.class_of(Formula))
+          desc "Test formula referencing another formula"
+          homepage "https://brew.sh"
+          url "https://brew.sh/test-0.0.1.tgz"
+
+          livecheck do
+            formula "test_no_livecheck"
+          end
+        end
+      end
+
+      let(:c_options) do
+        Cask::CaskLoader.load(+<<-RUBY)
+          cask "test_options" do
+            version "0.0.1"
+
+            url "https://brew.sh/test-0.0.1.dmg"
+            name "Test"
+            desc "Test cask with `livecheck` block options"
+            homepage "https://brew.sh"
+
+            livecheck do
+              url :homepage,
+                  homebrew_curl: true,
+                  post_json:     { key: "value" },
+                  user_agent:    :browser
+              regex(/href=.*?test[._-]v?(\\d+(?:\\.\\d+)+)\\.(?:t|dmg)/i)
+            end
+          end
+        RUBY
+      end
+      let(:c_reference) do
+        Cask::CaskLoader.load(+<<-RUBY)
+          cask "test_reference" do
+            version "0.0.1"
+
+            url "https://brew.sh/test-0.0.1.dmg"
+            name "Test"
+            desc "Test cask referencing another cask"
+            homepage "https://brew.sh"
+
+            livecheck do
+              cask "test_options"
+            end
+          end
+        RUBY
+      end
+
+      it "uses options from the referenced `livecheck` block" do
+        options_hash = {
+          homebrew_curl: true,
+          post_json:     { key: "value" },
+          user_agent:    :browser,
+        }
+
+        expect(Homebrew::Livecheck::Strategy).to receive(:page_content)
+          .at_least(:once)
+          .with(
+            homepage_url,
+            options: Homebrew::Livecheck::Options.new(**options_hash),
+          ).and_return({ content: base_content })
+
+        expect do
+          livecheck.latest_version(
+            f_reference,
+            referenced_formula_or_cask: f_options,
+            livecheck_references:       [f_options],
+            debug:                      true,
+          )
+        end.to output(
+          a_string_matching(/Formula Ref:\s+test_options/)
+            .and(matching(/URL \(homepage\):\s+#{homepage_url}/))
+            .and(matching(/URL Options:\s+#{options_hash}/)),
+        ).to_stdout
+
+        f_jv_version_info = livecheck.latest_version(
+          f_reference,
+          referenced_formula_or_cask: f_options,
+          livecheck_references:       [f_options],
+          json:                       true,
+          verbose:                    true,
+        )
+        expect(f_jv_version_info&.dig(:meta, :references)).to eq([{ formula: "test_options" }])
+        expect(f_jv_version_info&.dig(:meta, :url, :symbol)).to eq(:homepage)
+        expect(f_jv_version_info&.dig(:meta, :url, :original)).to eq(homepage_url)
+        expect(f_jv_version_info&.dig(:meta, :url, :options)).to eq(options_hash)
+
+        expect do
+          livecheck.latest_version(
+            c_reference,
+            referenced_formula_or_cask: c_options,
+            livecheck_references:       [c_options],
+            debug:                      true,
+          )
+        end.to output(
+          a_string_matching(/Cask Ref:\s+test_options/)
+            .and(matching(/URL \(homepage\):\s+#{homepage_url}/))
+            .and(matching(/URL Options:\s+#{options_hash}/)),
+        ).to_stdout
+
+        c_jv_version_info = livecheck.latest_version(
+          c_reference,
+          referenced_formula_or_cask: c_options,
+          livecheck_references:       [c_options],
+          json:                       true,
+          verbose:                    true,
+        )
+        expect(c_jv_version_info&.dig(:meta, :references)).to eq([{ cask: "test_options" }])
+        expect(c_jv_version_info&.dig(:meta, :url, :symbol)).to eq(:homepage)
+        expect(c_jv_version_info&.dig(:meta, :url, :original)).to eq(homepage_url)
+        expect(c_jv_version_info&.dig(:meta, :url, :options)).to eq(options_hash)
+      end
+
+      it "merges options from the initial `livecheck` block into referenced options" do
+        overridden_url = "https://brew.sh/test-override-referenced-url/"
+        options_hash = {
+          homebrew_curl: true,
+          post_json:     { key: "overridden value" },
+          user_agent:    :curl,
+        }
+
+        expect(Homebrew::Livecheck::Strategy).to receive(:page_content)
+          .at_least(:once)
+          .with(
+            overridden_url,
+            options: Homebrew::Livecheck::Options.new(**options_hash),
+          ).and_return({ content: base_content })
+
+        expect do
+          livecheck.latest_version(
+            f_reference_with_overrides,
+            referenced_formula_or_cask: f_options,
+            livecheck_references:       [f_options],
+            debug:                      true,
+          )
+        end.to output(
+          a_string_matching(/Formula Ref:\s+test_options/)
+            .and(matching(/URL:\s+#{overridden_url}/))
+            .and(matching(/URL Options:\s+#{options_hash}/)),
+        ).to_stdout
+
+        f_jv_version_info = livecheck.latest_version(
+          f_reference_with_overrides,
+          referenced_formula_or_cask: f_options,
+          livecheck_references:       [f_options],
+          json:                       true,
+          verbose:                    true,
+        )
+        expect(f_jv_version_info&.dig(:meta, :references)).to eq([{ formula: "test_options" }])
+        expect(f_jv_version_info&.dig(:meta, :url, :original)).to eq(overridden_url)
+        expect(f_jv_version_info&.dig(:meta, :url, :options)).to eq(options_hash)
+      end
+
+      it "uses values from a referenced package without a `livecheck` block" do
+        # Only check the Git URL, so we can ensure the strategy doesn't make
+        # network requests
+        allow(livecheck).to receive(:checkable_urls).with(f_no_livecheck).and_return([github_url])
+        allow(Homebrew::Livecheck::Strategy::Git).to receive(:ls_remote_tags)
+          .and_return({ content: git_content })
+
+        expect do
+          livecheck.latest_version(
+            f_reference_no_livecheck,
+            referenced_formula_or_cask: f_no_livecheck,
+            livecheck_references:       [f_no_livecheck],
+            debug:                      true,
+          )
+        end.to output(
+          a_string_matching(/Formula Ref:\s+test_no_livecheck/)
+            .and(matching(/URL:\s+#{github_url}/))
+            .and(matching(/URL \(processed\):\s+#{head_url}/)),
+        ).to_stdout
+
+        f_jv_version_info = livecheck.latest_version(
+          f_reference_no_livecheck,
+          referenced_formula_or_cask: f_no_livecheck,
+          livecheck_references:       [f_no_livecheck],
+          json:                       true,
+          verbose:                    true,
+        )
+        expect(f_jv_version_info&.dig(:meta, :references)).to eq([{ formula: "test_no_livecheck" }])
+        expect(f_jv_version_info&.dig(:meta, :url, :original)).to eq(github_url)
+        expect(f_jv_version_info&.dig(:meta, :url, :processed)).to eq(head_url)
+      end
+    end
 
     it "sets `latest_throttled` to the highest throttled version" do
       allow(Homebrew::Livecheck::Strategy).to receive(:page_content).and_return({
@@ -520,61 +838,61 @@ RSpec.describe Homebrew::Livecheck do
     let(:version) { Version.new("1.2.3") }
 
     it "returns true if `throttle_rate` and `throttle_days` are nil" do
-      expect(livecheck.send(:throttle_allows_bump?, f, version)).to be(true)
+      expect(livecheck.throttle_allows_bump?(f, version)).to be(true)
     end
 
     it "returns true if patch version is divisible by `throttle_rate`" do
-      expect(livecheck.send(:throttle_allows_bump?, f, version, throttle_rate: 3)).to be(true)
-      expect(livecheck.send(:throttle_allows_bump?, f, "1.2.3", throttle_rate: 3)).to be(true)
+      expect(livecheck.throttle_allows_bump?(f, version, throttle_rate: 3)).to be(true)
+      expect(livecheck.throttle_allows_bump?(f, "1.2.3", throttle_rate: 3)).to be(true)
     end
 
     it "returns false if patch version is not divisible by `throttle_rate` and `throttle_days` is not set" do
-      expect(livecheck.send(:throttle_allows_bump?, f, version, throttle_rate: 5)).to be(false)
+      expect(livecheck.throttle_allows_bump?(f, version, throttle_rate: 5)).to be(false)
     end
 
     it "returns false if patch version is not divisible by `throttle_rate` and throttle interval has not elapsed" do
       allow(livecheck).to receive(:throttle_interval_elapsed?).and_return(false)
-      expect(livecheck.send(:throttle_allows_bump?, f, version, throttle_rate: 5, throttle_days: 1)).to be(false)
+      expect(livecheck.throttle_allows_bump?(f, version, throttle_rate: 5, throttle_days: 1)).to be(false)
     end
 
     it "returns true if patch version is not divisible by `throttle_rate` and throttle interval has elapsed" do
       allow(livecheck).to receive(:throttle_interval_elapsed?).and_return(true)
-      expect(livecheck.send(:throttle_allows_bump?, f, version, throttle_rate: 5, throttle_days: 1)).to be(true)
+      expect(livecheck.throttle_allows_bump?(f, version, throttle_rate: 5, throttle_days: 1)).to be(true)
     end
 
     it "returns false if only `throttle_days` is provided and throttle interval has not elapsed" do
       allow(livecheck).to receive(:throttle_interval_elapsed?).and_return(false)
-      expect(livecheck.send(:throttle_allows_bump?, f, version, throttle_days: 1)).to be(false)
+      expect(livecheck.throttle_allows_bump?(f, version, throttle_days: 1)).to be(false)
     end
 
     it "returns true if only `throttle_days` is provided and throttle interval has elapsed" do
       allow(livecheck).to receive(:throttle_interval_elapsed?).and_return(true)
-      expect(livecheck.send(:throttle_allows_bump?, f, version, throttle_days: 1)).to be(true)
+      expect(livecheck.throttle_allows_bump?(f, version, throttle_days: 1)).to be(true)
     end
   end
 
   describe "::throttle_interval_elapsed" do
     it "returns false if days is not positive" do
-      expect(livecheck.send(:throttle_interval_elapsed?, f, 0)).to be(false)
-      expect(livecheck.send(:throttle_interval_elapsed?, f, -1)).to be(false)
+      expect(livecheck.throttle_interval_elapsed?(f, 0)).to be(false)
+      expect(livecheck.throttle_interval_elapsed?(f, -1)).to be(false)
     end
 
     it "returns false if last_updated_timestamp can't be determined" do
       allow(livecheck).to receive(:formula_or_cask_last_updated_timestamp).and_return(nil)
 
-      expect(livecheck.send(:throttle_interval_elapsed?, f, 4)).to be(false)
+      expect(livecheck.throttle_interval_elapsed?(f, 4)).to be(false)
     end
 
     it "returns false if throttle interval has not elapsed" do
       allow(livecheck).to receive(:formula_or_cask_last_updated_timestamp).and_return(Time.now.to_i)
 
-      expect(livecheck.send(:throttle_interval_elapsed?, f, 4)).to be(false)
+      expect(livecheck.throttle_interval_elapsed?(f, 4)).to be(false)
     end
 
     it "returns true if throttle interval has elapsed" do
       allow(livecheck).to receive(:formula_or_cask_last_updated_timestamp).and_return(Time.now.to_i - 518400)
 
-      expect(livecheck.send(:throttle_interval_elapsed?, f, 4)).to be(true)
+      expect(livecheck.throttle_interval_elapsed?(f, 4)).to be(true)
     end
   end
 
@@ -621,7 +939,7 @@ RSpec.describe Homebrew::Livecheck do
         .with(Utils::Git.git, "show", "-s", "--format=%ct", "bbb222", chdir: tap_path)
         .and_return("1711731600\n")
 
-      expect(livecheck.send(:formula_or_cask_last_updated_timestamp, f)).to eq(1711731600)
+      expect(livecheck.formula_or_cask_last_updated_timestamp(f)).to eq(1711731600)
     end
 
     it "falls back to latest file commit timestamp for casks" do
@@ -632,7 +950,7 @@ RSpec.describe Homebrew::Livecheck do
       allow(Utils::Git).to receive(:available?).and_return(true)
       allow(Utils).to receive(:popen_read).and_return("1711731600\n")
 
-      expect(livecheck.send(:formula_or_cask_last_updated_timestamp, c)).to eq(1711731600)
+      expect(livecheck.formula_or_cask_last_updated_timestamp(c)).to eq(1711731600)
     end
   end
 end

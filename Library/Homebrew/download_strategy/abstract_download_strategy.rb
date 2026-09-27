@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/output"
+
 # @abstract Abstract superclass for all download strategies.
 class AbstractDownloadStrategy
   extend T::Helpers
@@ -113,14 +115,11 @@ class AbstractDownloadStrategy
     end
 
     if File.directory? entries.fetch(0)
-      # chdir yields the directory name as an argument, which is unused in our case
-      # However, sorbet requires us to pass a block with matching arity, so we use T.unsafe here
-      Dir.chdir(entries.fetch(0), &T.unsafe(block))
+      Dir.chdir(entries.fetch(0)) { |_dir| yield }
     else
       yield
     end
   end
-  private :chdir
 
   # Returns the most recent modified time for all files in the current working directory after stage.
   #

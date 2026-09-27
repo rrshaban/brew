@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/browser"
+
 require "abstract_command"
 require "bump"
 require "bump_version_parser"
@@ -49,7 +51,7 @@ module Homebrew
         flag   "--sha256=",
                description: "Specify the <SHA-256> checksum of the new download."
         flag   "--fork-org=",
-               description: "Use the specified GitHub organization for forking."
+               description: "Use the specified GitHub organisation for forking."
 
         conflicts "--dry-run", "--write"
         conflicts "--version", "--version-arm"
@@ -65,7 +67,7 @@ module Homebrew
         gem_groups = ["ast"]
         gem_groups << "style" if !args.no_audit? || !args.no_style?
         gem_groups << "audit" unless args.no_audit?
-        Homebrew.install_bundler_gems!(groups: gem_groups)
+        Utils::GemSetup.install_bundler_gems!(groups: gem_groups)
         require "utils/ast"
 
         # As this command is simplifying user-run commands then let's just use a
@@ -182,7 +184,10 @@ module Homebrew
         sourcefile_path.atomic_write(new_contents) unless args.dry_run?
 
         audit_exceptions = []
-        audit_exceptions << ["min_os", "rosetta", "signing"] if ENV["HOMEBREW_TEST_BOT_AUTOBUMP"].present?
+        if ENV["HOMEBREW_TEST_BOT_AUTOBUMP"].present?
+          audit_exceptions.push("min_os", "rosetta", "signing")
+          run_cask_audit_fix(cask)
+        end
         run_cask_audit(cask, old_contents, audit_exceptions)
         run_cask_style(cask, old_contents)
 
@@ -212,18 +217,7 @@ module Homebrew
         if args.no_browse?
           puts url
         else
-          exec_browser url
-        end
-      end
-
-      private
-
-      sig { params(version: Cask::DSL::Version, cask: Cask::Cask).returns(Cask::DSL::Version) }
-      def shortened_version(version, cask:)
-        if version.before_comma == cask.version.before_comma
-          version
-        else
-          version.before_comma
+          Utils::Browser.open url
         end
       end
 
@@ -276,7 +270,7 @@ module Homebrew
           # something that should be handled by better version replacement logic
           # but this is a workaround for now.
           arch_values = arch_values.sort_by do |type|
-            new_version_value = Version.new(new_version.send(type) || "0")
+            new_version_value = Version.new(new_version.public_send(type) || "0")
             Livecheck::LivecheckVersion.create(cask, new_version_value)
           end.reverse
         end
@@ -304,6 +298,9 @@ module Homebrew
         generate_system_options(cask, new_version).each do |os, arch|
           tag = Utils::Bottles::Tag.new(system: os, arch:)
           old_cask.refresh_for_tag(tag) do
+            next if tag.macos? && !old_cask.supports_macos?
+            next if tag.linux? && !old_cask.supports_linux?
+
             # Skip archs excluded by the cask's `depends_on arch:`.
             reloaded_archs = old_cask.depends_on.arch&.filter_map { |a| a[:type] }&.uniq
             next if reloaded_archs.present? && reloaded_archs.exclude?(arch)
@@ -314,7 +311,7 @@ module Homebrew
             next if unsupported_nested_arch_stanza?(contents, :version, arch) ||
                     unsupported_nested_arch_stanza?(contents, :sha256, arch)
 
-            bump_version = new_version.send(arch) || new_version.general
+            bump_version = new_version.public_send(arch) || new_version.general
             next unless bump_version
 
             version_scope = cask_stanza_scope(contents, :version, arch)
@@ -328,6 +325,11 @@ module Homebrew
             tmp_cask = Cask::CaskLoader::FromContentLoader.new(contents)
                                                           .load(config: nil)
             old_hash = tmp_cask.sha256
+            if old_hash.nil?
+              raise Cask::CaskError, "#{cask}: No checksum is defined for #{tag.to_sym.inspect}. " \
+                                     "Add `depends_on arch:` or an operating system `depends_on` to " \
+                                     "declare unsupported platforms."
+            end
             next if new_hash.is_a?(String) && old_hash.to_s == new_hash
 
             checksum_scope = cask_stanza_scope(contents, :sha256, arch)
@@ -353,7 +355,8 @@ module Homebrew
                 cask.languages
               end
               languages.each do |language|
-                new_cask        = Cask::CaskLoader.load(contents)
+                new_cask        = Cask::CaskLoader::FromContentLoader.new(contents)
+                                                                     .load(config: nil)
                 next unless new_cask.url
 
                 new_cask.config = if language.blank?
@@ -361,7 +364,7 @@ module Homebrew
                 else
                   tmp_cask.config.merge(Cask::Config.new(explicit: { languages: [language] }))
                 end
-                download = Cask::Download.new(new_cask, quarantine: true).fetch(verify_download_integrity: false)
+                download = Cask::Download.new(new_cask).fetch(verify_download_integrity: false)
                 Utils::Tar.validate_file(download)
 
                 if new_cask.sha256.to_s != download.sha256
@@ -373,6 +376,63 @@ module Homebrew
           end
         end
         contents
+      end
+
+      sig {
+        params(
+          contents:  String,
+          name:      Symbol,
+          old_value: T.any(Numeric, String, Symbol),
+          new_value: T.any(Numeric, String, Symbol),
+          within:    T.nilable(Symbol),
+        ).returns(String)
+      }
+      def replace_cask_stanza_value(contents, name, old_value, new_value, within: nil)
+        return contents if old_value == new_value
+
+        cask_ast = Utils::AST::CaskAST.new(contents)
+        replacement_count = cask_ast.replace_stanza_value(name, old_value, new_value, within:)
+        if replacement_count.zero?
+          # Treat an already-applied replacement as a successful no-op so the
+          # per-(os, arch) loop in `replace_version_and_checksum` can yield the
+          # same general version more than once without raising.
+          return contents if cask_ast.replace_stanza_value(name, new_value, new_value, within:).positive?
+
+          raise "Could not find '#{name}' stanza with value #{old_value.inspect}!"
+        end
+
+        cask_ast.process
+      end
+
+      sig { params(cask: Cask::Cask, new_version: BumpVersionParser).void }
+      def check_throttle(cask, new_version:)
+        return unless cask.tap
+
+        throttle_rate = cask.livecheck.throttle
+        throttle_days = cask.livecheck.throttle_days
+        return if throttle_rate.nil? && throttle_days.nil?
+
+        version = new_version.arm || new_version.intel || new_version.general
+        return unless version.is_a?(Cask::DSL::Version)
+
+        return if Livecheck.throttle_allows_bump?(cask, version.to_s, throttle_rate:, throttle_days:)
+
+        throttle_items = []
+        throttle_items << "#{throttle_rate} releases on multiples of #{throttle_rate}" if throttle_rate
+        throttle_items << "#{throttle_days} #{Utils.pluralize("day", throttle_days)}" if throttle_days
+
+        odie "#{cask.token} should only be updated every #{throttle_items.join(" or ")}"
+      end
+
+      private
+
+      sig { params(version: Cask::DSL::Version, cask: Cask::Cask).returns(Cask::DSL::Version) }
+      def shortened_version(version, cask:)
+        if version.before_comma == cask.version.before_comma
+          version
+        else
+          version.before_comma
+        end
       end
 
       sig {
@@ -434,52 +494,6 @@ module Homebrew
         nil
       end
 
-      sig {
-        params(
-          contents:  String,
-          name:      Symbol,
-          old_value: T.any(Numeric, String, Symbol),
-          new_value: T.any(Numeric, String, Symbol),
-          within:    T.nilable(Symbol),
-        ).returns(String)
-      }
-      def replace_cask_stanza_value(contents, name, old_value, new_value, within: nil)
-        return contents if old_value == new_value
-
-        cask_ast = Utils::AST::CaskAST.new(contents)
-        replacement_count = cask_ast.replace_stanza_value(name, old_value, new_value, within:)
-        if replacement_count.zero?
-          # Treat an already-applied replacement as a successful no-op so the
-          # per-(os, arch) loop in `replace_version_and_checksum` can yield the
-          # same general version more than once without raising.
-          return contents if cask_ast.replace_stanza_value(name, new_value, new_value, within:).positive?
-
-          raise "Could not find '#{name}' stanza with value #{old_value.inspect}!"
-        end
-
-        cask_ast.process
-      end
-
-      sig { params(cask: Cask::Cask, new_version: BumpVersionParser).void }
-      def check_throttle(cask, new_version:)
-        return unless cask.tap
-
-        throttle_rate = cask.livecheck.throttle
-        throttle_days = cask.livecheck.throttle_days
-        return if throttle_rate.nil? && throttle_days.nil?
-
-        version = new_version.arm || new_version.intel || new_version.general
-        return unless version.is_a?(Cask::DSL::Version)
-
-        return if Livecheck.throttle_allows_bump?(cask, version.to_s, throttle_rate:, throttle_days:)
-
-        throttle_items = []
-        throttle_items << "#{throttle_rate} releases on multiples of #{throttle_rate}" if throttle_rate
-        throttle_items << "#{throttle_days} #{Utils.pluralize("day", throttle_days)}" if throttle_days
-
-        odie "#{cask.token} should only be updated every #{throttle_items.join(" or ")}"
-      end
-
       sig { params(cask: Cask::Cask, new_version: BumpVersionParser).void }
       def check_pull_requests(cask, new_version:)
         tap = cask.tap
@@ -508,13 +522,31 @@ module Homebrew
         end
       end
 
+      # Corrects what `--fix` can for `min_os`, which `run_cask_audit` excepts.
+      sig { params(cask: Cask::Cask).void }
+      def run_cask_audit_fix(cask)
+        return if args.no_audit?
+
+        audit_args = ["audit", "--cask", "--online", "--fix", "--skip-style", "--only=min_os", cask.full_name]
+
+        if args.dry_run?
+          ohai "brew #{audit_args.join(" ")}"
+          return
+        end
+
+        system HOMEBREW_BREW_FILE.to_s, *audit_args
+      end
+
       sig { params(cask: Cask::Cask, old_contents: String, audit_exceptions: T::Array[String]).void }
       def run_cask_audit(cask, old_contents, audit_exceptions = [])
+        audit_args = ["audit", "--cask", "--online", "--fix", cask.full_name,
+                      "--except=#{audit_exceptions.join(",")}"]
+
         if args.dry_run?
           if args.no_audit?
             ohai "Skipping `brew audit`"
           else
-            ohai "brew audit --cask --online #{cask.full_name}"
+            ohai "brew #{audit_args.join(" ")}"
           end
           return
         end
@@ -522,8 +554,8 @@ module Homebrew
         if args.no_audit?
           ohai "Skipping `brew audit`"
         else
-          system HOMEBREW_BREW_FILE.to_s, "audit", "--cask", "--online", cask.full_name,
-                 "--except=#{audit_exceptions.join(",")}"
+          # Corrected problems don't fail the audit or stop the pull request.
+          system HOMEBREW_BREW_FILE.to_s, *audit_args
           failed_audit = !$CHILD_STATUS.success?
         end
         return unless failed_audit

@@ -92,6 +92,11 @@ RSpec.describe Homebrew::Search do
       expect(described_class.search_formulae(/testball/)).to contain_exactly(include("(disabled)"))
     end
 
+    it "does not show a red cross for disabled formulae" do
+      allow(formula).to receive(:disabled?).and_return(true)
+      expect(described_class.search_formulae(/testball/).join(" ")).not_to include("#{Tty.red}✘")
+    end
+
     it "does not annotate normal formulae" do
       expect(described_class.search_formulae(/testball/)).to eq(["testball"])
     end
@@ -129,8 +134,19 @@ RSpec.describe Homebrew::Search do
       expect(described_class.search_casks(/testball/)).to contain_exactly(include("(disabled)"))
     end
 
+    it "does not show a red cross for disabled casks", :needs_macos do
+      allow(cask).to receive(:disabled?).and_return(true)
+      expect(described_class.search_casks(/testball/).join(" ")).not_to include("#{Tty.red}✘")
+    end
+
     it "does not annotate normal casks", :needs_macos do
       expect(described_class.search_casks(/testball/)).to eq(["testball"])
+    end
+
+    it "skips casks from untrusted taps", :needs_macos do
+      allow(Cask::CaskLoader).to receive(:load).with("testball").and_raise(Homebrew::UntrustedTapError)
+
+      expect(described_class.search_casks(/testball/)).to be_empty
     end
 
     it "hides macOS-only casks on Linux", :needs_linux do
@@ -148,6 +164,13 @@ RSpec.describe Homebrew::Search do
 
       expect(described_class.search_casks(/testball/))
         .to eq([described_class.pretty_installed("testball")])
+    end
+
+    it "loads the cask loader itself" do
+      script = 'require "global"; require "search"; ' \
+               'print Homebrew::Search.search_casks("homebrew/cask/nonexistent-cask").inspect'
+      expect(Utils.popen_read({ "HOMEBREW_NO_INSTALL_FROM_API" => "1" },
+                              RUBY_PATH, "-I", HOMEBREW_LIBRARY_PATH.to_s, "-e", script, err: :out)).to eq("[]")
     end
   end
 
@@ -182,6 +205,12 @@ RSpec.describe Homebrew::Search do
 
       before do
         allow(Homebrew::API::Internal).to receive_messages(formula_hashes: api_formulae, cask_hashes: api_casks)
+        allow(Homebrew::API::Internal).to receive(:formula_names) { api_formulae.keys }
+        allow(Homebrew::API::Internal).to receive(:formula_name?) { |name| api_formulae.key?(name) }
+        allow(Homebrew::API::Internal).to receive(:formula_hash) { |name| api_formulae[name] }
+        allow(Homebrew::API::Internal).to receive(:cask_names) { api_casks.keys }
+        allow(Homebrew::API::Internal).to receive(:cask_name?) { |token| api_casks.key?(token) }
+        allow(Homebrew::API::Internal).to receive(:cask_hash) { |token| api_casks[token] }
       end
 
       it "searches formula descriptions" do
@@ -189,24 +218,31 @@ RSpec.describe Homebrew::Search do
           .to output(/testball: Some test/).to_stdout
       end
 
-      it "searches all trusted descriptions with tap trust enabled" do
+      it "searches all trusted descriptions" do
         cache_store = instance_double(DescriptionCacheStore)
         allow(DescriptionCacheStore).to receive(:new).and_return(cache_store)
         allow(CacheStoreDatabase).to receive(:use).with(:descriptions).and_yield(instance_double(CacheStoreDatabase))
         expect(Descriptions).to receive(:search)
-          .with("some", Descriptions::SearchField::Description, cache_store, eval_all: true)
+          .with("some", Descriptions::SearchField::Description, cache_store)
           .and_return(instance_double(Descriptions, print: nil))
 
-        with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-          args = Homebrew::Cmd::Desc.new(["--formula", "min_arg_placeholder"]).args
-          described_class.search_descriptions("some", args)
-        end
+        args = Homebrew::Cmd::Desc.new(["--formula", "min_arg_placeholder"]).args
+        described_class.search_descriptions("some", args)
       end
 
       it "searches cask descriptions", :needs_macos do
         expect { described_class.search_descriptions(described_class.query_regexp("ball"), args) }
           .to output(/testball: \(Test Ball\) Some test/).to_stdout
           .and not_to_output(/testball: Some test/).to_stdout
+      end
+
+      it "searches cask names without descriptions", :needs_macos do
+        api_casks["testball"]["desc"] = nil
+
+        expect do
+          described_class.search_descriptions(described_class.query_regexp("ball"), args, show_missing: true)
+        end
+          .to output(/testball: \(Test Ball\) \[no description\]/).to_stdout
       end
     end
   end

@@ -1,6 +1,12 @@
 # typed: strict
 # frozen_string_literal: true
 
+phase_timings_output = ENV.delete("HOMEBREW_PHASE_TIMINGS")
+if phase_timings_output
+  phase_timings_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC).to_f
+  phase_timings_command = ARGV.dup
+end
+
 # `HOMEBREW_STACKPROF` should be set via `brew prof --stackprof`, not manually.
 if ENV["HOMEBREW_STACKPROF"]
   require "rubygems"
@@ -17,6 +23,16 @@ std_trap = trap("INT") { exit! 130 } # no backtrace thanks
 
 require_relative "global"
 require "utils/output"
+require "utils/ruby"
+
+require "utils/phase_timings"
+if phase_timings_output
+  Homebrew::PhaseTimings.start!(
+    output_path: phase_timings_output,
+    started_at:  phase_timings_started_at,
+    command:     phase_timings_command,
+  )
+end
 
 begin
   trap("INT", std_trap) # restore default CTRL-C handler
@@ -46,8 +62,10 @@ begin
 
   ARGV.delete_at(help_cmd_index) if help_cmd_index
 
-  require "cli/parser"
-  args = Homebrew::CLI::Parser.new(Homebrew::Cmd::Brew).parse(ARGV.dup.freeze, ignore_invalid_options: true)
+  args = Homebrew::PhaseTimings.measure("cli_parse") do
+    require "cli/parser"
+    Homebrew::CLI::Parser.new(Homebrew::Cmd::Brew).parse(ARGV.dup.freeze, ignore_invalid_options: true)
+  end
   Context.current = args.context
 
   path = PATH.new(ENV.fetch("PATH"))
@@ -66,20 +84,24 @@ begin
   external_ruby_cmd_path = T.let(nil, T.nilable(Pathname))
   external_cmd_path = T.let(nil, T.nilable(Pathname))
 
-  if cmd
-    cmd = Commands::HOMEBREW_INTERNAL_COMMAND_ALIASES.fetch(cmd, cmd)
-    internal_cmd = Commands.valid_internal_cmd?(cmd) || Commands.valid_internal_dev_cmd?(cmd)
+  # `valid_internal_cmd?` requires the command's file, so this covers the
+  # command's entire `require` graph: usually the largest phase of all.
+  Homebrew::PhaseTimings.measure("command_load") do
+    if cmd
+      cmd = Commands::HOMEBREW_INTERNAL_COMMAND_ALIASES.fetch(cmd, cmd)
+      internal_cmd = Commands.valid_internal_cmd?(cmd) || Commands.valid_internal_dev_cmd?(cmd)
 
-    unless internal_cmd
-      # Add contributed commands to PATH before checking.
-      homebrew_path.append(Commands.tap_cmd_directories)
+      unless internal_cmd
+        # Add contributed commands to PATH before checking.
+        homebrew_path.append(Commands.tap_cmd_directories)
 
-      # External commands expect a normal PATH
-      ENV["PATH"] = homebrew_path.to_s
+        # External commands expect a normal PATH
+        ENV["PATH"] = homebrew_path.to_s
 
-      external_ruby_v2_cmd = !Commands.external_ruby_v2_cmd_path(cmd).nil?
-      external_ruby_cmd_path = Commands.external_ruby_cmd_path(cmd) unless external_ruby_v2_cmd
-      external_cmd_path = Commands.external_cmd_path(cmd) if !external_ruby_v2_cmd && external_ruby_cmd_path.nil?
+        external_ruby_v2_cmd = !Commands.external_ruby_v2_cmd_path(cmd).nil?
+        external_ruby_cmd_path = Commands.external_ruby_cmd_path(cmd) unless external_ruby_v2_cmd
+        external_cmd_path = Commands.external_cmd_path(cmd) if !external_ruby_v2_cmd && external_ruby_cmd_path.nil?
+      end
     end
   end
 
@@ -100,6 +122,10 @@ begin
     # `Homebrew::Help.help` never returns, except for unknown and deferred commands.
   end
 
+  if !help_flag && (internal_cmd || external_ruby_v2_cmd || external_ruby_cmd_path || external_cmd_path)
+    Homebrew::EnvConfig.check_deprecated_bash_variables
+  end
+
   if cmd.nil?
     raise UsageError, "Unknown command: brew #{ARGV.join(" ")}"
   elsif internal_cmd || external_ruby_v2_cmd
@@ -109,41 +135,29 @@ begin
     end
     Homebrew.running_command = cmd
     if cmd_class
-      unless Homebrew::EnvConfig.no_install_from_api?
-        require "api"
-        Homebrew::API.fetch_api_files!
-      end
+      install_from_api = !Homebrew::EnvConfig.no_install_from_api?
+      require "api" if install_from_api
+      Homebrew::PhaseTimings.install! if phase_timings_output
+      Homebrew::API.fetch_api_files! if install_from_api
 
-      command_instance = cmd_class.new
+      command_instance = Homebrew::PhaseTimings.measure("cli_parse") { cmd_class.new }
 
       require "utils/analytics"
       Utils::Analytics.report_command_run(command_instance)
       command_instance.run
     else
-      Utils::Output.odisabled "Calling `brew #{cmd}` without subclassing `AbstractCommand`",
-                              "subclassing of `Homebrew::AbstractCommand` " \
-                              "(see https://docs.brew.sh/External-Commands)"
-      begin
-        Homebrew.public_send Commands.method_name(cmd)
-      rescue NoMethodError => e
-        converted_cmd = cmd.downcase.tr("-", "_")
-        case_error = "undefined method `#{converted_cmd}' for module Homebrew"
-        private_method_error = "private method `#{converted_cmd}' called for module Homebrew"
-        Utils::Output.odie "Unknown command: brew #{cmd}" if [case_error, private_method_error].include?(e.message)
-
-        raise
-      end
+      Utils::Output.odie "Unknown command: brew #{cmd}"
     end
   elsif external_ruby_cmd_path
     Homebrew.running_command = cmd
-    Homebrew.require?(external_ruby_cmd_path)
+    Utils::Ruby.require?(external_ruby_cmd_path)
     exit Homebrew.failed? ? 1 : 0
   elsif external_cmd_path
     ENV["HOMEBREW_CACHE"] = HOMEBREW_CACHE.to_s
     ENV["HOMEBREW_LIBRARY_PATH"] = HOMEBREW_LIBRARY_PATH.to_s
     exec external_cmd_path.to_s, *ARGV
   else
-    raise UsageError, "Unknown command: brew #{cmd}"
+    raise UsageError, "Unknown command: brew #{cmd}#{Commands.suggestion_message(cmd)}"
   end
 rescue UsageError => e
   require "help"
@@ -232,4 +246,5 @@ ensure
     StackProf.stop
     StackProf.results("prof/stackprof.dump")
   end
+  Homebrew::PhaseTimings.write! if phase_timings_output
 end

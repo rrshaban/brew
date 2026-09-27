@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/text"
+
 require "cask/audit"
 require "utils/output"
 
@@ -14,18 +16,18 @@ module Cask
       params(
         cask: ::Cask::Cask, audit_download: T::Boolean, audit_online: T.nilable(T::Boolean),
         audit_strict: T.nilable(T::Boolean), audit_signing: T.nilable(T::Boolean),
-        audit_new_cask: T.nilable(T::Boolean), quarantine: T::Boolean,
+        audit_new_cask: T.nilable(T::Boolean), audit_fix: T.nilable(T::Boolean),
         any_named_args: T::Boolean, language: T.nilable(String), only: T::Array[String], except: T::Array[String]
       ).returns(T::Set[Audit::Error])
     }
     def self.audit(
       cask, audit_download: false, audit_online: nil, audit_strict: nil, audit_signing: nil,
-      audit_new_cask: nil, quarantine: false, any_named_args: false, language: nil,
+      audit_new_cask: nil, audit_fix: nil, any_named_args: false, language: nil,
       only: [], except: []
     )
       new(
         cask, audit_download:, audit_online:, audit_strict:, audit_signing:,
-        audit_new_cask:, quarantine:, any_named_args:, language:, only:, except:
+        audit_new_cask:, audit_fix:, any_named_args:, language:, only:, except:
       ).audit
     end
 
@@ -39,7 +41,7 @@ module Cask
       params(
         cask: ::Cask::Cask, audit_download: T::Boolean, audit_online: T.nilable(T::Boolean),
         audit_strict: T.nilable(T::Boolean), audit_signing: T.nilable(T::Boolean),
-        audit_new_cask: T.nilable(T::Boolean), quarantine: T::Boolean,
+        audit_new_cask: T.nilable(T::Boolean), audit_fix: T.nilable(T::Boolean),
         any_named_args: T::Boolean, language: T.nilable(String), only: T::Array[String], except: T::Array[String]
       ).void
     }
@@ -50,7 +52,7 @@ module Cask
       audit_strict: nil,
       audit_signing: nil,
       audit_new_cask: nil,
-      quarantine: false,
+      audit_fix: nil,
       any_named_args: false,
       language: nil,
       only: [],
@@ -60,9 +62,9 @@ module Cask
       @audit_download = audit_download
       @audit_online = audit_online
       @audit_new_cask = audit_new_cask
+      @audit_fix = audit_fix
       @audit_strict = audit_strict
       @audit_signing = audit_signing
-      @quarantine = quarantine
       @any_named_args = any_named_args
       @language = language
       @only = only
@@ -77,9 +79,9 @@ module Cask
 
       if !language && !(blocks = language_blocks).empty?
         sample_languages = if blocks.length > LANGUAGE_BLOCK_LIMIT && !@audit_new_cask
-          sample_keys = T.must(blocks.keys.sample(LANGUAGE_BLOCK_LIMIT))
+          sample_keys = blocks.keys.shuffle.take(LANGUAGE_BLOCK_LIMIT)
           ohai "Auditing a sample of available languages for #{cask}: " \
-               "#{sample_keys.map { |lang| lang[0].to_s }.to_sentence}"
+               "#{::Utils::Text.to_sentence(sample_keys.map { |lang| lang[0].to_s })}"
           blocks.select { |k| sample_keys.include?(k) }
         else
           blocks
@@ -88,7 +90,7 @@ module Cask
         sample_languages.each_key do |l|
           audit = audit_languages(l)
           if audit.summary.present? && output_summary?(audit)
-            ohai "Auditing language: #{l.map { |lang| "'#{lang}'" }.to_sentence}" if output_summary?
+            ohai "Auditing language: #{::Utils::Text.to_sentence(l.map { |lang| "'#{lang}'" })}" if output_summary?
             puts audit.summary
           end
           errors += audit.errors
@@ -102,8 +104,6 @@ module Cask
       errors
     end
 
-    private
-
     sig { params(audit: T.nilable(Audit)).returns(T::Boolean) }
     def output_summary?(audit = nil)
       return true if @any_named_args
@@ -112,6 +112,8 @@ module Cask
 
       audit.errors?
     end
+
+    private
 
     sig { params(languages: T::Array[String]).returns(::Cask::Audit) }
     def audit_languages(languages)
@@ -130,14 +132,14 @@ module Cask
     def audit_cask_instance(cask)
       audit = Audit.new(
         cask,
-        online:     @audit_online,
-        strict:     @audit_strict,
-        signing:    @audit_signing,
-        new_cask:   @audit_new_cask,
-        download:   @audit_download,
-        quarantine: @quarantine,
-        only:       @only,
-        except:     @except,
+        online:   @audit_online,
+        strict:   @audit_strict,
+        signing:  @audit_signing,
+        new_cask: @audit_new_cask,
+        fix:      @audit_fix,
+        download: @audit_download,
+        only:     @only,
+        except:   @except,
       )
       audit.run!
     end

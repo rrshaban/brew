@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 require "exceptions"
@@ -102,15 +102,15 @@ RSpec.describe "Exception" do
     subject(:error) { described_class.new("foo", "foo.rb", "Foo", list) }
 
     let(:mod) do
-      Module.new do
-        const_set :Bar, Class.new(Requirement)
-        const_set :Baz, Class.new(Formula)
-      end
+      mod = Module.new
+      mod.const_set :Bar, Class.new(Requirement)
+      mod.const_set :Baz, Class.new(Formula)
+      mod
     end
 
-    context "when there are no classes" do
-      let(:list) { [] }
+    let(:list) { [] }
 
+    context "when there are no classes" do
       it(:to_s) do
         expect(error.to_s).to include("Expected to find class Foo, but found no classes.")
       end
@@ -225,6 +225,7 @@ RSpec.describe "Exception" do
     let(:actual_checksum) { instance_double(Checksum, to_s: "deadcafe") }
 
     it(:to_s) { expect(error.to_s).to include("SHA-256 mismatch") }
+    it(:actual) { expect(error.actual).to eq(actual_checksum) }
 
     it "does not add an HTML hint for non-HTML downloads" do
       Tempfile.create("brew-checksum-test") do |file|

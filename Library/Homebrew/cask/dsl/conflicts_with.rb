@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/data"
+
 require "delegate"
 require "extend/hash/keys"
 require "utils/output"
@@ -13,12 +15,18 @@ module Cask
 
       sig { params(options: T.anything).void }
       def initialize(**options)
-        options.assert_valid_keys(*VALID_KEYS)
+        ::Utils::Data.assert_valid_keys(options, *VALID_KEYS)
 
         conflicts = options.transform_values { |v| Set.new(Kernel.Array(v)) }
         conflicts.default = Set.new
 
         super(conflicts)
+      end
+
+      sig { params(other: ConflictsWith).returns(T.self_type) }
+      def merge!(other)
+        other.to_h.each { |key, values| __getobj__[key] |= Set.new(values) }
+        self
       end
 
       sig { returns(T::Hash[Symbol, T::Array[String]]) }

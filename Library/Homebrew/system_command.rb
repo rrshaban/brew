@@ -1,6 +1,7 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "English"
 require "shellwords"
 require "stringio"
 
@@ -17,34 +18,42 @@ class SystemCommand
   #
   # @api internal
   module Mixin
+    sig { overridable.returns(T.nilable(Sandbox)) }
+    def command_sandbox = nil
+
     # Run a fallible system command.
     #
     # @api internal
     sig {
       params(
-        executable:      T.any(String, Pathname),
-        args:            T::Array[T.any(String, Integer, Float, Pathname)],
-        sudo:            T::Boolean,
-        sudo_as_root:    T::Boolean,
-        env:             T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
-        input:           T.any(String, T::Array[String]),
-        must_succeed:    T::Boolean,
-        print_stdout:    T.any(T::Boolean, Symbol),
-        print_stderr:    T.any(T::Boolean, Symbol),
-        debug:           T.nilable(T::Boolean),
-        verbose:         T.nilable(T::Boolean),
-        secrets:         T.any(String, T::Array[String]),
-        chdir:           T.any(String, Pathname),
-        reset_uid:       T::Boolean,
-        run_as_real_uid: T::Boolean,
-        timeout:         T.nilable(T.any(Integer, Float)),
+        executable:   T.any(String, Pathname),
+        args:         T::Array[T.any(String, Integer, Float, Pathname)],
+        sudo:         T.nilable(T::Boolean),
+        sudo_as_root: T::Boolean,
+        env:          T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
+        input:        T.any(String, T::Array[String]),
+        must_succeed: T::Boolean,
+        print_stdout: T.any(T::Boolean, Symbol),
+        print_stderr: T.any(T::Boolean, Symbol),
+        debug:        T.nilable(T::Boolean),
+        verbose:      T.nilable(T::Boolean),
+        secrets:      T.any(String, T::Array[String]),
+        chdir:        T.nilable(T.any(String, Pathname)),
+        timeout:      T.nilable(T.any(Integer, Float)),
       ).returns(SystemCommand::Result)
     }
     def system_command(executable, args: [], sudo: false, sudo_as_root: false, env: {}, input: [],
                        must_succeed: false, print_stdout: false, print_stderr: true, debug: nil, verbose: nil,
-                       secrets: [], chdir: T.unsafe(nil), reset_uid: false, run_as_real_uid: false, timeout: nil)
+                       secrets: [], chdir: nil, timeout: nil)
+      if (sandbox = command_sandbox)
+        Kernel.raise ArgumentError, "Sandboxed commands cannot use sudo" if sudo || sudo_as_root
+
+        return sandbox.capture(executable, args:, env:, input:, must_succeed:, print_stdout:, print_stderr:,
+                               debug:, verbose:, secrets:, chdir:, timeout:)
+      end
+
       SystemCommand.run(executable, args:, sudo:, sudo_as_root:, env:, input:, must_succeed:, print_stdout:,
-                        print_stderr:, debug:, verbose:, secrets:, chdir:, reset_uid:, run_as_real_uid:, timeout:)
+                        print_stderr:, debug:, verbose:, secrets:, chdir:, timeout:)
     end
 
     # Run an infallible system command.
@@ -52,95 +61,198 @@ class SystemCommand
     # @api internal
     sig {
       params(
-        executable:      T.any(String, Pathname),
-        args:            T::Array[T.any(String, Integer, Float, Pathname)],
-        sudo:            T::Boolean,
-        sudo_as_root:    T::Boolean,
-        env:             T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
-        input:           T.any(String, T::Array[String]),
-        print_stdout:    T.any(T::Boolean, Symbol),
-        print_stderr:    T.any(T::Boolean, Symbol),
-        debug:           T.nilable(T::Boolean),
-        verbose:         T.nilable(T::Boolean),
-        secrets:         T.any(String, T::Array[String]),
-        chdir:           T.any(String, Pathname),
-        reset_uid:       T::Boolean,
-        run_as_real_uid: T::Boolean,
-        timeout:         T.nilable(T.any(Integer, Float)),
+        executable:   T.any(String, Pathname),
+        args:         T::Array[T.any(String, Integer, Float, Pathname)],
+        sudo:         T.nilable(T::Boolean),
+        sudo_as_root: T::Boolean,
+        env:          T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
+        input:        T.any(String, T::Array[String]),
+        print_stdout: T.any(T::Boolean, Symbol),
+        print_stderr: T.any(T::Boolean, Symbol),
+        debug:        T.nilable(T::Boolean),
+        verbose:      T.nilable(T::Boolean),
+        secrets:      T.any(String, T::Array[String]),
+        chdir:        T.nilable(T.any(String, Pathname)),
+        timeout:      T.nilable(T.any(Integer, Float)),
       ).returns(SystemCommand::Result)
     }
     def system_command!(executable, args: [], sudo: false, sudo_as_root: false, env: {}, input: [],
                         print_stdout: false, print_stderr: true, debug: nil, verbose: nil, secrets: [],
-                        chdir: T.unsafe(nil), reset_uid: false, run_as_real_uid: false, timeout: nil)
-      SystemCommand.run!(executable, args:, sudo:, sudo_as_root:, env:, input:, print_stdout:,
-                         print_stderr:, debug:, verbose:, secrets:, chdir:, reset_uid:, run_as_real_uid:, timeout:)
+                        chdir: nil, timeout: nil)
+      system_command(executable, args:, sudo:, sudo_as_root:, env:, input:, must_succeed: true, print_stdout:,
+                     print_stderr:, debug:, verbose:, secrets:, chdir:, timeout:)
+    end
+  end
+
+  # Positional command helpers used by the Formula DSL.
+  module Helpers
+    sig { params(executable: T.any(String, Pathname), args: T.any(String, Pathname)).void }
+    def safe_system(executable, *args)
+      SystemCommand.safe_system(executable, *args)
+    end
+
+    sig { params(executable: T.any(String, Pathname), args: T.any(String, Pathname)).returns(T::Boolean) }
+    def quiet_system(executable, *args)
+      SystemCommand.quiet_system(executable, *args)
     end
   end
 
   include Context
 
+  sig { params(sandbox: T.nilable(Sandbox)).void }
+  attr_writer :sandbox
+
+  sig { params(sandbox_inheritance: IO).returns(IO) }
+  attr_writer :sandbox_inheritance
+
   sig {
     params(
-      executable:      T.any(String, Pathname),
-      args:            T::Array[T.any(String, Integer, Float, Pathname)],
-      sudo:            T::Boolean,
-      sudo_as_root:    T::Boolean,
-      env:             T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
-      input:           T.any(String, T::Array[String]),
-      must_succeed:    T::Boolean,
-      print_stdout:    T.any(T::Boolean, Symbol),
-      print_stderr:    T.any(T::Boolean, Symbol),
-      debug:           T.nilable(T::Boolean),
-      verbose:         T.nilable(T::Boolean),
-      secrets:         T.any(String, T::Array[String]),
-      chdir:           T.nilable(T.any(String, Pathname)),
-      reset_uid:       T::Boolean,
-      run_as_real_uid: T::Boolean,
-      timeout:         T.nilable(T.any(Integer, Float)),
+      executable:   T.any(String, Pathname),
+      args:         T::Array[T.any(String, Integer, Float, Pathname)],
+      sudo:         T.nilable(T::Boolean),
+      sudo_as_root: T::Boolean,
+      env:          T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
+      input:        T.any(String, T::Array[String]),
+      must_succeed: T::Boolean,
+      print_stdout: T.any(T::Boolean, Symbol),
+      print_stderr: T.any(T::Boolean, Symbol),
+      debug:        T.nilable(T::Boolean),
+      verbose:      T.nilable(T::Boolean),
+      secrets:      T.any(String, T::Array[String]),
+      chdir:        T.nilable(T.any(String, Pathname)),
+      timeout:      T.nilable(T.any(Integer, Float)),
     ).returns(SystemCommand::Result)
   }
   def self.run(executable, args: [], sudo: false, sudo_as_root: false, env: {}, input: [], must_succeed: false,
                print_stdout: false, print_stderr: true, debug: nil, verbose: nil, secrets: [], chdir: nil,
-               reset_uid: false, run_as_real_uid: false, timeout: nil)
+               timeout: nil)
+    # Only use sudo: nil for operations that can safely be retried.
+    if sudo.nil?
+      result = new(executable, args:, sudo: false, sudo_as_root: false, env:, input:, must_succeed: false,
+                   print_stdout:, print_stderr: Homebrew::EnvConfig.no_sudo? ? print_stderr : false,
+                   debug:, verbose:, secrets:, chdir:, timeout:).run!
+      if result.success? || Homebrew::EnvConfig.no_sudo?
+        result.assert_success! if must_succeed
+        return result
+      end
+      sudo = true
+    end
+
     new(executable, args:, sudo:, sudo_as_root:, env:, input:, must_succeed:, print_stdout:, print_stderr:, debug:,
-        verbose:, secrets:, chdir:, reset_uid:, run_as_real_uid:, timeout:).run!
+        verbose:, secrets:, chdir:, timeout:).run!
   end
 
   sig {
     params(
-      executable:      T.any(String, Pathname),
-      args:            T::Array[T.any(String, Integer, Float, Pathname)],
-      sudo:            T::Boolean,
-      sudo_as_root:    T::Boolean,
-      env:             T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
-      input:           T.any(String, T::Array[String]),
-      must_succeed:    T::Boolean,
-      print_stdout:    T.any(T::Boolean, Symbol),
-      print_stderr:    T.any(T::Boolean, Symbol),
-      debug:           T.nilable(T::Boolean),
-      verbose:         T.nilable(T::Boolean),
-      secrets:         T.any(String, T::Array[String]),
-      chdir:           T.nilable(T.any(String, Pathname)),
-      reset_uid:       T::Boolean,
-      run_as_real_uid: T::Boolean,
-      timeout:         T.nilable(T.any(Integer, Float)),
+      executable:   T.any(String, Pathname),
+      args:         T::Array[T.any(String, Integer, Float, Pathname)],
+      sudo:         T.nilable(T::Boolean),
+      sudo_as_root: T::Boolean,
+      env:          T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
+      input:        T.any(String, T::Array[String]),
+      must_succeed: T::Boolean,
+      print_stdout: T.any(T::Boolean, Symbol),
+      print_stderr: T.any(T::Boolean, Symbol),
+      debug:        T.nilable(T::Boolean),
+      verbose:      T.nilable(T::Boolean),
+      secrets:      T.any(String, T::Array[String]),
+      chdir:        T.nilable(T.any(String, Pathname)),
+      timeout:      T.nilable(T.any(Integer, Float)),
     ).returns(SystemCommand::Result)
   }
   def self.run!(executable, args: [], sudo: false, sudo_as_root: false, env: {}, input: [], must_succeed: true,
                 print_stdout: false, print_stderr: true, debug: nil, verbose: nil, secrets: [], chdir: nil,
-                reset_uid: false, run_as_real_uid: false, timeout: nil)
+                timeout: nil)
     run(executable, args:, sudo:, sudo_as_root:, env:, input:, must_succeed:, print_stdout:, print_stderr:,
-        debug:, verbose:, secrets:, chdir:, reset_uid:, run_as_real_uid:, timeout:)
+        debug:, verbose:, secrets:, chdir:, timeout:)
+  end
+
+  # Run a command attached to the caller's standard streams and terminal,
+  # raising if it fails. Unlike {SystemCommand.run!} nothing is captured, so
+  # interactive programs such as editors and pagers work.
+  sig {
+    params(
+      executable: T.nilable(T.any(String, Pathname)),
+      args:       T.nilable(T.any(String, Pathname)),
+      env:        T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
+      out:        T.nilable(Symbol),
+    ).void
+  }
+  def self.safe_system(executable, *args, env: {}, out: nil)
+    raise ArgumentError, "Missing executable" if executable.nil?
+    raise ArgumentError, "Invalid nil command argument" if args.any?(&:nil?)
+
+    args = args.compact
+    if Context.current.verbose?
+      command = "#{executable} #{args * " "}".gsub(RUBY_PATH.to_s, "ruby")
+                                             .gsub($LOAD_PATH.join(File::PATH_SEPARATOR), "$LOAD_PATH")
+      ((out == :err) ? $stderr : $stdout).puts Formatter.redact_secrets(command, secrets)
+    end
+    return if attached_success?(executable, args, env:, out:)
+
+    raise ErrorDuringExecution.new([executable, *args], status: $CHILD_STATUS, secrets:)
+  end
+
+  # Run a command attached to the caller's standard input with its output
+  # discarded, returning whether it succeeded.
+  # Preserve the existing Formula DSL method name.
+  # rubocop:disable Naming/PredicateMethod
+  sig {
+    params(
+      executable: T.nilable(T.any(String, Pathname)),
+      args:       T.nilable(T.any(String, Pathname)),
+      env:        T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
+    ).returns(T::Boolean)
+  }
+  def self.quiet_system(executable, *args, env: {})
+    return false if executable.nil? || args.any?(&:nil?)
+
+    # Redirect output streams to `/dev/null` instead of closing as some programs
+    # will fail to execute if they can't write to an open stream.
+    attached_success?(executable, args.compact, env:, out: File::NULL, err: File::NULL)
+  end
+  # rubocop:enable Naming/PredicateMethod
+
+  sig { returns(T::Array[String]) }
+  private_class_method def self.secrets
+    require "extend/ENV"
+    ENV.sensitive_environment.values
+  end
+
+  sig {
+    params(
+      executable: T.any(String, Pathname),
+      args:       T::Array[T.any(String, Pathname)],
+      env:        T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
+      out:        T.nilable(T.any(String, Symbol)),
+      err:        T.nilable(String),
+    ).returns(T::Boolean)
+  }
+  private_class_method def self.attached_success?(executable, args, env:, out: nil, err: nil)
+    # Like `system(3)`, keep the terminal's interrupt from raising in the parent
+    # so a command that handles it, such as an editor, keeps running. Trapping
+    # with a block rather than `IGNORE` leaves the child its default handler.
+    old_sigint_handler = Signal.trap(:INT) { nil }
+    old_sigquit_handler = Signal.trap(:QUIT) { nil }
+    begin
+      Kernel.system(env.transform_values { |value| value&.to_s }, executable.to_s, *args.map(&:to_s),
+                    **{ out:, err: }.compact)
+    ensure
+      Signal.trap(:INT, old_sigint_handler)
+      Signal.trap(:QUIT, old_sigquit_handler)
+    end
+    raise Interrupt if $CHILD_STATUS.termsig == Signal.list.fetch("INT") || $CHILD_STATUS.exitstatus == 130
+
+    $CHILD_STATUS.success? || false
   end
 
   sig { returns(SystemCommand::Result) }
   def run!
     $stderr.puts Formatter.redact_secrets(command.shelljoin.gsub('\=', "="), @secrets) if verbose? && debug?
 
-    @output = T.let([], T.nilable(T::Array[[Symbol, String]]))
-    @output = T.must(@output)
+    output = T.let([], T::Array[[Symbol, String]])
 
-    each_output_line do |type, line|
+    status = each_output_line do |type, line|
       case type
       when :stdout
         case @print_stdout
@@ -149,7 +261,7 @@ class SystemCommand
         when :debug
           $stderr << Formatter.redact_secrets(line, @secrets) if debug?
         end
-        @output << [:stdout, line]
+        output << [:stdout, line]
       when :stderr
         case @print_stderr
         when true
@@ -157,44 +269,41 @@ class SystemCommand
         when :debug
           $stderr << Formatter.redact_secrets(line, @secrets) if debug?
         end
-        @output << [:stderr, line]
+        output << [:stderr, line]
       end
     end
 
-    result = Result.new(command, @output, T.must(@status), secrets: @secrets)
+    result = Result.new(command, output, status, secrets: @secrets)
     result.assert_success! if must_succeed?
     result
   end
 
   sig {
     params(
-      executable:      T.any(String, Pathname),
-      args:            T::Array[T.any(String, Integer, Float, Pathname)],
-      sudo:            T::Boolean,
-      sudo_as_root:    T::Boolean,
-      env:             T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
-      input:           T.any(String, T::Array[String]),
-      must_succeed:    T::Boolean,
-      print_stdout:    T.any(T::Boolean, Symbol),
-      print_stderr:    T.any(T::Boolean, Symbol),
-      debug:           T.nilable(T::Boolean),
-      verbose:         T.nilable(T::Boolean),
-      secrets:         T.any(String, T::Array[String]),
-      chdir:           T.nilable(T.any(String, Pathname)),
-      reset_uid:       T::Boolean,
-      run_as_real_uid: T::Boolean,
-      timeout:         T.nilable(T.any(Integer, Float)),
+      executable:   T.any(String, Pathname),
+      args:         T::Array[T.any(String, Integer, Float, Pathname)],
+      sudo:         T::Boolean,
+      sudo_as_root: T::Boolean,
+      env:          T::Hash[String, T.nilable(T.any(String, T::Boolean, PATH))],
+      input:        T.any(String, T::Array[String]),
+      must_succeed: T::Boolean,
+      print_stdout: T.any(T::Boolean, Symbol),
+      print_stderr: T.any(T::Boolean, Symbol),
+      debug:        T.nilable(T::Boolean),
+      verbose:      T.nilable(T::Boolean),
+      secrets:      T.any(String, T::Array[String]),
+      chdir:        T.nilable(T.any(String, Pathname)),
+      timeout:      T.nilable(T.any(Integer, Float)),
     ).void
   }
   def initialize(executable, args: [], sudo: false, sudo_as_root: false, env: {}, input: [], must_succeed: false,
                  print_stdout: false, print_stderr: true, debug: nil, verbose: nil, secrets: [], chdir: nil,
-                 reset_uid: false, run_as_real_uid: false, timeout: nil)
+                 timeout: nil)
     require "extend/ENV"
     @executable = executable
     @args = args
 
     raise ArgumentError, "`sudo_as_root` cannot be set if sudo is false" if !sudo && sudo_as_root
-    raise ArgumentError, "`reset_uid` and `run_as_real_uid` cannot both be true" if reset_uid && run_as_real_uid
 
     if print_stdout.is_a?(Symbol) && print_stdout != :debug
       raise ArgumentError, "`print_stdout` is not a valid symbol"
@@ -219,9 +328,9 @@ class SystemCommand
     @verbose = verbose
     @secrets = T.let((Array(secrets) + ENV.sensitive_environment.values).uniq, T::Array[String])
     @chdir = chdir
-    @reset_uid = reset_uid
-    @run_as_real_uid = run_as_real_uid
     @timeout = timeout
+    @sandbox = T.let(nil, T.nilable(Sandbox))
+    @sandbox_inheritance = T.let(nil, T.nilable(IO))
   end
 
   sig { returns(T::Array[String]) }
@@ -248,12 +357,6 @@ class SystemCommand
 
   sig { returns(T::Boolean) }
   def must_succeed? = @must_succeed
-
-  sig { returns(T::Boolean) }
-  def reset_uid? = @reset_uid
-
-  sig { returns(T::Boolean) }
-  def run_as_real_uid? = @run_as_real_uid
 
   sig { returns(T::Boolean) }
   def sudo? = @sudo
@@ -295,6 +398,12 @@ class SystemCommand
 
   sig { returns(T::Array[String]) }
   def sudo_prefix
+    # Availability is detected in brew.sh.
+    if Homebrew::EnvConfig.no_sudo?
+      raise ErrorDuringExecution.new([executable.to_s, *expanded_args], status: 1, secrets: @secrets,
+                                     output: [[:stderr, "sudo is disabled by HOMEBREW_NO_SUDO.\n"]])
+    end
+
     askpass_flags = ENV.key?("SUDO_ASKPASS") ? ["-A"] : []
     user_flags = []
     if Homebrew::EnvConfig.sudo_through_sudo_user?
@@ -335,7 +444,7 @@ class SystemCommand
   class ProcessTerminatedInterrupt < StandardError; end
   private_constant :ProcessTerminatedInterrupt
 
-  sig { params(block: T.proc.params(type: Symbol, line: String).void).void }
+  sig { params(block: T.proc.params(type: Symbol, line: String).void).returns(Process::Status) }
   def each_output_line(&block)
     executable, *args = command
     options = {
@@ -346,9 +455,6 @@ class SystemCommand
     options[:chdir] = chdir if chdir
 
     raw_stdin, raw_stdout, raw_stderr, raw_wait_thr = exec3(env, executable, *args, **options)
-
-    write_input_to(raw_stdin)
-    raw_stdin.close_write
 
     thread_context = Context.current
     thread_ready_queue = Queue.new
@@ -366,21 +472,49 @@ class SystemCommand
       nil
     end
 
-    end_time = Time.now + @timeout if @timeout
-    raise Timeout::Error if raw_wait_thr.join(Utils::Timer.remaining(end_time)).nil?
+    write_input_to(raw_stdin)
+    raw_stdin.close_write
 
-    @status = T.let(raw_wait_thr.value, T.nilable(Process::Status))
+    end_time = Time.now + @timeout if @timeout
+    if raw_wait_thr.join(Utils::Timer.remaining(end_time)).nil?
+      # Signal the whole process group so a timed-out command and its descendants
+      # cannot outlive brew. `sudo` children share our group, so signal them directly.
+      target = sudo? ? raw_wait_thr.pid : -raw_wait_thr.pid
+      begin
+        Process.kill("TERM", target)
+        # `kill(0)` raises `ESRCH` once every process in the group has exited
+        # (`EPERM` on macOS while only unreaped zombies remain).
+        50.times do
+          Process.kill(0, target)
+          sleep 0.1
+        end
+        Process.kill("KILL", target)
+      rescue Errno::ESRCH, Errno::EPERM
+        nil
+      end
+      raise Timeout::Error
+    end
+
+    raw_wait_thr.value
   rescue Interrupt
-    Process.kill("INT", raw_wait_thr.pid) if raw_wait_thr && !sudo?
+    if raw_wait_thr && !sudo?
+      # The forked child may not have created its process group before sandbox setup.
+      [-raw_wait_thr.pid, raw_wait_thr.pid].each do |target|
+        Process.kill("INT", target)
+        break
+      rescue Errno::ESRCH
+        next
+      end
+    end
     raise Interrupt
   ensure
+    raw_stdin&.close
     if line_thread
       thread_ready_queue.pop
       line_thread.raise ProcessTerminatedInterrupt.new
       thread_done_queue << true
       line_thread.join
     end
-    raw_stdin&.close
     raw_stdout&.close
     raw_stderr&.close
   end
@@ -405,30 +539,25 @@ class SystemCommand
     options[:err] = err_w
 
     exec_env = env.merge({ "COLUMNS" => Tty.width.to_s })
+    if (inheritance = @sandbox_inheritance)
+      options = options.merge(Sandbox::INHERITANCE_FD => inheritance)
+    end
 
     # `Process.spawn` avoids running `malloc` in a `fork`ed child, which is not
-    # fork-safe on macOS and can abort it. `fork` is kept for privilege changes
-    # and as a fallback.
-    pid = if (run_as_real_uid? || reset_uid?) && Process.euid != Process.uid
+    # fork-safe on macOS and can abort it. `fork` is kept as a fallback.
+    pid = begin
+      Process.spawn(exec_env, [executable, executable], *args, **options) unless @sandbox
+    rescue SystemCallError
       nil
-    else
-      begin
-        Process.spawn(exec_env, [executable, executable], *args, **options)
-      rescue SystemCallError
-        nil
-      end
     end
 
     pid ||= fork do
-      if run_as_real_uid? && Process.euid != Process.uid
-        Process::UID.change_privilege(Process.uid)
-      elsif reset_uid? && Process.euid != Process.uid
-        Process::UID.change_privilege(Process.euid)
-      end
-
+      $stderr = err_w if @sandbox
+      @sandbox&.apply!
       exec(exec_env, [executable, executable], *args, **options)
-    rescue SystemCallError => e
-      $stderr.puts(e.message)
+    # Never unwind into the parent's Ruby control flow after fork.
+    rescue Exception => e # rubocop:disable Lint/RescueException
+      err_w.puts(e.message)
       exit!(127)
     end
     wait_thr = Process.detach(pid)
@@ -456,6 +585,7 @@ class SystemCommand
       sources[0] => :stdout,
       sources[1] => :stderr,
     }
+    readers = T.let({}, T::Hash[IO, ReadlineNonblock])
 
     pending_interrupt = T.let(false, T::Boolean)
 
@@ -463,7 +593,10 @@ class SystemCommand
       readable_sources = T.let([], T::Array[IO])
       begin
         Thread.handle_interrupt(ProcessTerminatedInterrupt => :on_blocking) do
-          readable_sources = T.must(IO.select(sources.keys)).fetch(0)
+          selected = IO.select(sources.keys)
+          raise IOError, "No readable output streams for #{command.first}" if selected.nil?
+
+          readable_sources = selected.fetch(0)
         end
       rescue ProcessTerminatedInterrupt
         readable_sources = sources.keys
@@ -471,8 +604,9 @@ class SystemCommand
       end
 
       readable_sources.each do |source|
+        reader = readers[source] ||= ReadlineNonblock.new(source)
         loop do
-          line = ReadlineNonblock.read(source)
+          line = reader.read
           yield(sources.fetch(source), line)
         end
       rescue EOFError
@@ -562,12 +696,12 @@ class SystemCommand
         output = stdout
 
         output = output.sub(/\A(.*?)(\s*<\?\s*xml)/m) do
-          warn_plist_garbage(T.must(Regexp.last_match(1)))
+          warn_plist_garbage(Regexp.last_match(1))
           Regexp.last_match(2)
         end
 
         output = output.sub(%r{(<\s*/\s*plist\s*>\s*)(.*?)\Z}m) do
-          warn_plist_garbage(T.must(Regexp.last_match(2)))
+          warn_plist_garbage(Regexp.last_match(2))
           Regexp.last_match(1)
         end
 
@@ -575,10 +709,10 @@ class SystemCommand
       end, T.untyped)
     end
 
-    sig { params(garbage: String).void }
+    sig { params(garbage: T.nilable(String)).void }
     def warn_plist_garbage(garbage)
       return unless verbose?
-      return unless garbage.match?(/\S/)
+      return unless garbage&.match?(/\S/)
 
       opoo "Received non-XML output from #{Formatter.identifier(command.first)}:"
       $stderr.puts garbage.strip

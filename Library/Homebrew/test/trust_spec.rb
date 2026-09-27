@@ -6,6 +6,7 @@ require "trust"
 
 RSpec.describe Homebrew::Trust, :trust_store do
   it "lets HOMEBREW_NO_REQUIRE_TAP_TRUST override HOMEBREW_REQUIRE_TAP_TRUST" do
+    allow(Homebrew::EnvConfig).to receive(:odeprecated)
     with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1", HOMEBREW_NO_REQUIRE_TAP_TRUST: "1") do
       expect(Homebrew::EnvConfig.require_tap_trust?).to be(false)
     end
@@ -213,6 +214,15 @@ RSpec.describe Homebrew::Trust, :trust_store do
     end
   end
 
+  it "falls back to the current home when USER cannot be looked up" do
+    home = Pathname(TEST_TMPDIR)/"home"
+
+    with_env(USER: "nonexistent_user_zzz", HOME: home, HOMEBREW_USER_CONFIG_HOME: home/".homebrew") do
+      expect { expect(described_class.trust_file).to eq(home/".homebrew/trust.json") }
+        .to output(/Could not determine home directory for `\$USER` \(nonexistent_user_zzz\)/).to_stderr
+    end
+  end
+
   it "trusts a GitHub SSH-remote tap by its name" do
     tap = Tap.fetch("thirdparty", "foo")
     tap.path.mkpath
@@ -411,6 +421,67 @@ RSpec.describe Homebrew::Trust, :trust_store do
     FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
   end
 
+  it "requires trust for a symlink outside the tap directory that resolves into an untrusted tap" do
+    tap = Tap.fetch("thirdparty", "linked-source")
+    formula_path = tap.formula_dir/"linked-formula.rb"
+    formula_path.dirname.mkpath
+    formula_path.write("class LinkedFormula < Formula; end\n")
+    linked_path = Pathname(TEST_TMPDIR)/"linked-formula.rb"
+    FileUtils.ln_s formula_path, linked_path
+
+    expect { described_class.require_trusted_formula!("linked-formula", linked_path) }
+      .to raise_error(Homebrew::UntrustedTapError)
+  ensure
+    FileUtils.rm_f linked_path if linked_path
+    FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
+  end
+
+  it "uses the canonical tap identity when a symlink crosses between taps" do
+    trusted_tap = Tap.fetch("thirdparty", "trusted-links")
+    untrusted_tap = Tap.fetch("thirdparty", "untrusted-targets")
+    target_path = untrusted_tap.formula_dir/"linked-formula.rb"
+    target_path.dirname.mkpath
+    target_path.write("class LinkedFormula < Formula; end\n")
+    linked_path = trusted_tap.formula_dir/"linked-formula.rb"
+    linked_path.dirname.mkpath
+    FileUtils.ln_s target_path, linked_path
+    described_class.trust!(:tap, trusted_tap)
+
+    expect { described_class.require_trusted_formula!("linked-formula", linked_path) }
+      .to raise_error(Homebrew::UntrustedTapError)
+  ensure
+    described_class.clear!(:tap)
+    FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
+  end
+
+  it "preserves the nominal tap identity for a symlinked whole-tap root" do
+    tap = Tap.fetch("thirdparty", "linked-root")
+    real_tap_path = mktmpdir/"linked-root"
+    (real_tap_path/"Formula").mkpath
+    tap.path.parent.mkpath
+    FileUtils.ln_s real_tap_path, tap.path
+    formula_path = tap.formula_dir/"linked-formula.rb"
+    formula_path.write("class LinkedFormula < Formula; end\n")
+    described_class.trust!(:tap, tap)
+
+    expect { described_class.require_trusted_formula!("linked-formula", formula_path) }.not_to raise_error
+  ensure
+    described_class.clear!(:tap)
+    FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
+  end
+
+  it "falls back to the nominal tap identity for a symlink loop" do
+    tap = Tap.fetch("thirdparty", "looping-link")
+    formula_path = tap.formula_dir/"looping-formula.rb"
+    formula_path.dirname.mkpath
+    FileUtils.ln_s formula_path.basename, formula_path
+
+    expect { described_class.require_trusted_formula!("looping-formula", formula_path) }
+      .to raise_error(Homebrew::UntrustedTapError)
+  ensure
+    FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
+  end
+
   it "reads the invoking user's trust store for sudoed services" do
     root_home = Pathname(TEST_TMPDIR)/"root-home"
     sudo_home = Pathname(TEST_TMPDIR)/"sudo-home"
@@ -513,9 +584,7 @@ RSpec.describe Homebrew::Trust, :trust_store do
     formula_path = tap.formula_dir/"default-trust.rb"
     formula_path.dirname.mkpath
 
-    with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-      expect(described_class.trusted_formula_file?(formula_path)).to be(false)
-    end
+    expect(described_class.trusted_formula_file?(formula_path)).to be(false)
   ensure
     described_class.clear!(:tap)
     FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
@@ -527,10 +596,8 @@ RSpec.describe Homebrew::Trust, :trust_store do
     formula_path = tap.formula_dir/"default-trust.rb"
     formula_path.dirname.mkpath
 
-    with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-      ARGV.replace(["thirdparty/foo/default-trust"])
-      expect(described_class.trusted_formula_file?(formula_path)).to be(true)
-    end
+    ARGV.replace(["thirdparty/foo/default-trust"])
+    expect(described_class.trusted_formula_file?(formula_path)).to be(true)
 
     expect(described_class.trusted?(:formula, "thirdparty/foo/default-trust")).to be(false)
   ensure
@@ -546,10 +613,8 @@ RSpec.describe Homebrew::Trust, :trust_store do
     cask_path = tap.cask_dir/"default-trust.rb"
     cask_path.dirname.mkpath
 
-    with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-      ARGV.replace(["--tap", "thirdparty/foo"])
-      expect(described_class.trusted_cask_file?(cask_path)).to be(true)
-    end
+    ARGV.replace(["--tap", "thirdparty/foo"])
+    expect(described_class.trusted_cask_file?(cask_path)).to be(true)
 
     expect(described_class.trusted?(:tap, "thirdparty/foo")).to be(false)
     expect(described_class.trusted?(:cask, "thirdparty/foo/default-trust")).to be(false)
@@ -560,16 +625,29 @@ RSpec.describe Homebrew::Trust, :trust_store do
     FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
   end
 
+  it "does not allow files from a tap named as a bare argument when trust checks are enabled" do
+    old_argv = ARGV.dup
+    tap = Tap.fetch("thirdparty", "foo")
+    formula_path = tap.formula_dir/"default-trust.rb"
+    formula_path.dirname.mkpath
+
+    ARGV.replace(["info", "thirdparty/foo"])
+    expect(described_class.trusted_formula_file?(formula_path)).to be(false)
+  ensure
+    ARGV.replace(old_argv) if old_argv
+    described_class.clear!(:tap)
+    described_class.clear!(:formula)
+    FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
+  end
+
   it "does not allow explicitly named command files when trust checks are enabled" do
     old_argv = ARGV.dup
     tap = Tap.fetch("thirdparty", "foo")
     command_path = tap.path/"cmd/brew-default-trust.rb"
     command_path.dirname.mkpath
 
-    with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-      ARGV.replace(["thirdparty/foo/default-trust"])
-      expect(described_class.trusted_command_files([command_path])).to eq([])
-    end
+    ARGV.replace(["thirdparty/foo/default-trust"])
+    expect(described_class.trusted_command_files([command_path])).to eq([])
   ensure
     ARGV.replace(old_argv) if old_argv
     described_class.clear!(:command)
@@ -581,10 +659,8 @@ RSpec.describe Homebrew::Trust, :trust_store do
     command_path = tap.path/"cmd/brew-default-trust.rb"
     command_path.dirname.mkpath
 
-    with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-      expect { expect(described_class.trusted_command_files([command_path])).to eq([]) }
-        .to output(%r{Skipping thirdparty/foo because it is not trusted}).to_stderr
-    end
+    expect { expect(described_class.trusted_command_files([command_path])).to eq([]) }
+      .to output(%r{Skipping thirdparty/foo because it is not trusted}).to_stderr
   ensure
     described_class.clear!(:tap)
     FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
@@ -598,10 +674,8 @@ RSpec.describe Homebrew::Trust, :trust_store do
     FileUtils.touch [trusted_path, untrusted_path]
     described_class.trust!(:formula, "thirdparty/foo/trusted")
 
-    with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-      expect { expect(described_class.trusted_formula_files([trusted_path, untrusted_path])).to eq([trusted_path]) }
-        .not_to output.to_stderr
-    end
+    expect { expect(described_class.trusted_formula_files([trusted_path, untrusted_path])).to eq([trusted_path]) }
+      .not_to output.to_stderr
   ensure
     described_class.clear!(:tap)
     described_class.clear!(:formula)
@@ -612,11 +686,10 @@ RSpec.describe Homebrew::Trust, :trust_store do
     tap = Tap.fetch("thirdparty", "foo")
     formula_path = tap.formula_dir/"default-trust.rb"
     formula_path.dirname.mkpath
+    allow(Homebrew::EnvConfig).to receive(:no_require_tap_trust?).and_return(true)
 
-    with_env(HOMEBREW_NO_REQUIRE_TAP_TRUST: "1") do
-      expect { described_class.require_trusted_formula!("default-trust", formula_path) }
-        .not_to output.to_stderr
-    end
+    expect { described_class.require_trusted_formula!("default-trust", formula_path) }
+      .not_to output.to_stderr
 
     expect(described_class.trusted?(:tap, "thirdparty/foo")).to be(false)
   ensure

@@ -1,7 +1,12 @@
-# typed: false
+# typed: strict
 # frozen_string_literal: true
 
 RSpec.describe Cask::Artifact::PostflightBlock, :cask do
+  before do
+    ENV["HOMEBREW_DEVELOPER"] = nil
+    Homebrew.raise_deprecation_exceptions = false
+  end
+
   describe "install_phase" do
     it "calls the specified block after installing, passing a Cask mini-dsl" do
       called = T.let(false, T::Boolean)
@@ -24,6 +29,13 @@ RSpec.describe Cask::Artifact::PostflightBlock, :cask do
   end
 
   describe "uninstall_phase" do
+    it "accepts an empty block loaded from the API" do
+      cask = Cask::Cask.new("with-uninstall-postflight")
+      artifact = described_class.new(cask, uninstall_postflight: Homebrew::API::CaskStruct::EMPTY_BLOCK)
+
+      expect { artifact.uninstall_phase(command: NeverSudoSystemCommand, force: false) }.not_to raise_error
+    end
+
     it "calls the specified block after uninstalling, passing a Cask mini-dsl" do
       called = T.let(false, T::Boolean)
       yielded_arg = T.let(nil, T.nilable(Cask::DSL::UninstallPostflight))

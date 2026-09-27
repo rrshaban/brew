@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "completions"
+require "open3"
 
 RSpec.describe Homebrew::Completions do
   let(:completions_dir) { HOMEBREW_REPOSITORY/"completions" }
@@ -16,6 +17,8 @@ RSpec.describe Homebrew::Completions do
       (completions_dir/shell).mkpath
     end
     internal_path.mkpath
+    allow(Tap.fetch("homebrew/bar").git_repository).to receive(:origin_url)
+      .and_return("https://github.com/Homebrew/homebrew-bar")
     external_path.mkpath
   end
 
@@ -381,6 +384,62 @@ RSpec.describe Homebrew::Completions do
     end
 
     describe ".generate_bash_completion_file" do
+      it "completes unique service formula names" do
+        cellar = mktmpdir/"Cellar"
+        %w[
+          redis/1.0/homebrew.redis.service
+          redis/2.0/sh.brew.redis.service
+          memcached/1.0/homebrew.memcached.service
+          postgresql@18/18.0/sh.brew.postgresql@18.service
+          unbound/1.0/custom.dns.service
+          no-service/1.0/bin/no-service
+          nested/1.0/lib/nested.service
+        ].each do |file|
+          (cellar/file).dirname.mkpath
+          (cellar/file).write ""
+        end
+
+        script = described_class.generate_bash_completion_file(%w[services]) + <<~'BASH'
+          brew() { printf '%s\n' "$TEST_CELLAR"; }
+          COMP_WORDS=(brew services start '')
+          COMP_CWORD=3
+          COMPREPLY=()
+          __brew_complete_services
+          printf '%s\n' "${COMPREPLY[@]}"
+        BASH
+
+        stdout, stderr, status = Open3.capture3({ "TEST_CELLAR" => cellar.to_s }, "/bin/bash", "-c", script)
+        expect([stdout, stderr, status.exitstatus]).to eq(["memcached\npostgresql@18\nredis\nunbound\n", "", 0])
+      end
+
+      it "completes literal package names without invoking an expanding wordlist" do
+        script = described_class.generate_bash_completion_file(%w[install]) + <<~'BASH'
+          compgen() { return 99; }
+          brew() { printf '%s\n' 'alpha' 'alpine' 'beta'; }
+          COMP_WORDS=(brew install al)
+          COMP_CWORD=2
+          COMPREPLY=()
+          __brew_complete_formulae
+          printf '%s\n' "${COMPREPLY[@]}"
+        BASH
+
+        expect(Open3.capture3("/bin/bash", "-c", script).first).to eq("alpha\nalpine\n")
+      end
+
+      it "preserves literal characters and spaces in package completion records" do
+        script = described_class.generate_bash_completion_file(%w[install]) + <<~'BASH'
+          compgen() { return 99; }
+          brew() { printf '%s\n' 'alpha*' 'alpha space' 'alpha\path' 'beta'; }
+          COMP_WORDS=(brew install alpha)
+          COMP_CWORD=2
+          COMPREPLY=()
+          __brew_complete_formulae
+          printf '%s\n' "${COMPREPLY[@]}"
+        BASH
+
+        expect(Open3.capture3("/bin/bash", "-c", script).first).to eq("alpha*\nalpha space\nalpha\\path\n")
+      end
+
       it "returns the correct completion file" do
         file = described_class.generate_bash_completion_file(%w[install missing update])
         expect(file).to match(/^__brewcomp\(\) {$/)
@@ -406,7 +465,7 @@ RSpec.describe Homebrew::Completions do
         expect(file).not_to match(/^ {4}up\) _brew_up ;;/)
         expect(file).to include('[[ $(__brew_internal_command_alias "${line}") == "${line}" ]] || continue')
         expect(file).to include('cmd="$(__brew_internal_command_alias "${cmd}")"')
-        expect(file).to include('compgen -W "${cmds} ${maintainer_cmds} ${user_aliases}" -- "${cur}"')
+        expect(file).to include('__brewcomp_words "${cmds} ${maintainer_cmds} ${user_aliases}"')
         expect(file).to match(/^ {4}up\) echo "update" ;;$/)
         expect(file).to match(/^ {4}update\) _brew_update ;;$/)
       end

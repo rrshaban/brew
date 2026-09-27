@@ -3,9 +3,9 @@
 
 RSpec.describe Test::Helper::Subcommand::Args do
   specify "unknown predicates raise" do
-    unknown_predicate = :formuale?
     expect do
-      described_class.new(named: []).public_send(unknown_predicate)
+      # Intentionally calling an undefined method to check the runtime `NoMethodError`.
+      T.unsafe(described_class.new(named: [])).formuale? # rubocop:disable Sorbet/ForbidTUnsafe
     end.to raise_error(NoMethodError)
   end
 end

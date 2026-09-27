@@ -66,7 +66,7 @@ module Homebrew
     sig { params(path: Pathname).returns(String) }
     def self.sort_key_for_path(path)
       # Options after regular commands (`~` comes after `z` in ASCII table).
-      path.basename.to_s.sub(/\.(rb|sh)$/, "").sub(/^--/, "~~")
+      path.basename.to_s.sub(/\.(?:rb|sh)$/, "").sub(/^--/, "~~")
     end
 
     sig { params(cmd_paths: T::Array[Pathname]).returns(String) }
@@ -106,6 +106,8 @@ module Homebrew
         lines += option_manpage_lines(root_options)
 
         cmd_parser.subcommands.each do |subcommand|
+          next if subcommand.hidden
+
           usage_banner = subcommand.usage_banner
           next if usage_banner.blank?
 
@@ -196,8 +198,7 @@ module Homebrew
         next if Homebrew::EnvConfig.hidden?(hash)
 
         entry = "`#{env}`\n\n: #{hash[:description]}\n"
-        default = hash[:default_text]
-        default ||= "`#{hash[:default]}`." if hash[:default]
+        default = Homebrew::EnvConfig.default_description(env)
         entry += "\n\n    *Default:* #{default}\n" if default
 
         entry
@@ -233,7 +234,7 @@ module Homebrew
 
     sig { params(usage_banner: String).returns(String) }
     def self.format_usage_banner(usage_banner)
-      format_usage_text(usage_banner).sub(/^(#: *\* )?/, "### ")
+      format_usage_text(usage_banner).sub(/^(?:#: *\* )?/, "### ")
     end
 
     sig { params(usage_banner: String).returns(String) }

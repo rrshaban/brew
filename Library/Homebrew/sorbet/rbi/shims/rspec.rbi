@@ -2,6 +2,7 @@
 
 class RSpec::Core::ExampleGroup
   extend RSpec::Matchers::DSL
+  extend Test::Helper::TestEach
 
   include CopHelper
   include RSpec::SharedContext
@@ -22,5 +23,5 @@ end
 # Override it to match the rspec-expectations signature.
 module RSpec::Mocks::ExampleMethods::ExpectHost
   sig { params(value: T.untyped, block: T.nilable(T.proc.void)).returns(T.untyped) }
-  def expect(value = T.unsafe(nil), &block); end
+  def expect(value = nil, &block); end
 end

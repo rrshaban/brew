@@ -78,6 +78,9 @@ class Homebrew::Cmd::TestBotCmd::Args < Homebrew::CLI::Args
   def only_tap_syntax?; end
 
   sig { returns(T::Boolean) }
+  def print_padded_prefix?; end
+
+  sig { returns(T::Boolean) }
   def publish?; end
 
   sig { returns(T.nilable(String)) }
@@ -101,7 +104,7 @@ class Homebrew::Cmd::TestBotCmd::Args < Homebrew::CLI::Args
   sig { returns(T::Boolean) }
   def skip_online_checks?; end
 
-  sig { returns(T::Boolean) }
+  sig { returns(T.nilable(T::Boolean)) }
   def skip_recursive_dependents?; end
 
   sig { returns(T::Boolean) }

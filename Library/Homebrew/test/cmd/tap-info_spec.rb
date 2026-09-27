@@ -7,10 +7,18 @@ require "cmd/tap-info"
 RSpec.describe Homebrew::Cmd::TapInfo do
   it_behaves_like "parseable arguments"
 
-  it "gets information for a given Tap", :integration_test, :needs_network do
+  it "gets information for a given Tap", :integration_test do
     setup_test_tap
 
-    expect { brew "tap-info", "--json=v1", "--installed" }
+    # Run without the Sorbet runtime so this exercises the same `require` graph as
+    # a real `brew tap-info`, which loads fewer files.
+    brew_env = {
+      "HOMEBREW_SORBET_RUNTIME"   => nil,
+      "HOMEBREW_SORBET_RECURSIVE" => nil,
+      "HOMEBREW_NO_GITHUB_API"    => "1",
+    }
+
+    expect { brew "tap-info", "--json=v1", "--installed", brew_env }
       .to output(%r{https://github\.com/Homebrew/homebrew-foo}).to_stdout
       .and not_to_output.to_stderr
       .and be_a_success
@@ -47,10 +55,8 @@ RSpec.describe Homebrew::Cmd::TapInfo do
     allow(tap_info).to receive(:print_tap_listings).with(tap)
     allow(Homebrew::Trust).to receive(:trusted_tap?).with(tap).and_return(true)
 
-    with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-      expect { tap_info.send(:print_tap_info, [tap]) }
-        .to output(%r{thirdparty/foo: Installed\nTrusted\nNo commands/casks/formulae}).to_stdout
-    end
+    expect { tap_info.print_tap_info([tap]) }
+      .to output(%r{thirdparty/foo: Installed\nTrusted\nNo commands/casks/formulae}).to_stdout
   end
 
   it "prints untrusted tap status when tap trust is required" do
@@ -75,10 +81,8 @@ RSpec.describe Homebrew::Cmd::TapInfo do
     allow(tap_info).to receive(:print_tap_listings).with(tap)
     allow(Homebrew::Trust).to receive(:trusted_tap?).with(tap).and_return(false)
 
-    with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-      expect { tap_info.send(:print_tap_info, [tap]) }
-        .to output(%r{thirdparty/foo: Installed\nUntrusted\nNo commands/casks/formulae}).to_stdout
-    end
+    expect { tap_info.print_tap_info([tap]) }
+      .to output(%r{thirdparty/foo: Installed\nUntrusted\nNo commands/casks/formulae}).to_stdout
   end
 
   describe "#print_tap_json" do
@@ -88,7 +92,7 @@ RSpec.describe Homebrew::Cmd::TapInfo do
         instance_double(Tap, to_hash: { "name" => "user/b" }),
       ]
 
-      expect { described_class.new([]).send(:print_tap_json, taps) }
+      expect { described_class.new([]).print_tap_json(taps) }
         .to output(%r{"name":\s*"user/a".*"name":\s*"user/b"}m).to_stdout
     end
   end
@@ -103,35 +107,72 @@ RSpec.describe Homebrew::Cmd::TapInfo do
     end
 
     it "does not mark an uninstalled formula" do
-      expect(tap_info.send(:decorate_formula, tap, "missing", installed: false)).not_to include("✘")
+      expect(tap_info.decorate_formula(tap, "missing", installed: false)).not_to include("✘")
     end
 
     it "marks an installed formula as satisfied" do
-      formula = instance_double(Formula, outdated?: false, deprecated?: false, disabled?: false)
+      formula = instance_double(
+        Formula,
+        outdated?:       false,
+        deprecated?:     false,
+        disabled?:       false,
+        valid_platform?: true,
+      )
       allow(Formulary).to receive(:factory).with("homebrew/foo/installed").and_return(formula)
 
-      expect(tap_info.send(:decorate_formula, tap, "installed", installed: true)).to match(/installed.*✔/)
+      expect(tap_info.decorate_formula(tap, "installed", installed: true)).to match(/installed.*✔/)
     end
 
     it "marks an outdated installed formula as upgradable" do
-      formula = instance_double(Formula, outdated?: true, deprecated?: false, disabled?: false)
+      formula = instance_double(
+        Formula,
+        outdated?:       true,
+        deprecated?:     false,
+        disabled?:       false,
+        valid_platform?: true,
+      )
       allow(Formulary).to receive(:factory).with("homebrew/foo/outdated").and_return(formula)
 
-      expect(tap_info.send(:decorate_formula, tap, "outdated", installed: true)).to match(/outdated.*↑/)
+      expect(tap_info.decorate_formula(tap, "outdated", installed: true)).to match(/outdated.*↑/)
     end
 
     it "marks a deprecated formula with `(deprecated)`" do
-      formula = instance_double(Formula, outdated?: false, deprecated?: true, disabled?: false)
+      formula = instance_double(
+        Formula,
+        outdated?:       false,
+        deprecated?:     true,
+        disabled?:       false,
+        valid_platform?: true,
+      )
       allow(Formulary).to receive(:factory).with("homebrew/foo/old").and_return(formula)
 
-      expect(tap_info.send(:decorate_formula, tap, "old", installed: false)).to match(/old.*\(deprecated\)/)
+      expect(tap_info.decorate_formula(tap, "old", installed: false)).to match(/old.*\(deprecated\)/)
     end
 
-    it "marks a disabled formula with `(disabled)`" do
-      formula = instance_double(Formula, outdated?: false, deprecated?: false, disabled?: true)
+    it "marks a disabled formula with `(disabled)` and ⊘" do
+      formula = instance_double(
+        Formula,
+        outdated?:       false,
+        deprecated?:     false,
+        disabled?:       true,
+        valid_platform?: true,
+      )
       allow(Formulary).to receive(:factory).with("homebrew/foo/gone").and_return(formula)
 
-      expect(tap_info.send(:decorate_formula, tap, "gone", installed: false)).to match(/gone.*\(disabled\)/)
+      expect(tap_info.decorate_formula(tap, "gone", installed: false)).to match(/gone.*⊘.*\(disabled\)/)
+    end
+
+    it "marks a formula that cannot be installed on this platform with ⊘" do
+      formula = instance_double(
+        Formula,
+        outdated?:       false,
+        deprecated?:     false,
+        disabled?:       false,
+        valid_platform?: false,
+      )
+      allow(Formulary).to receive(:factory).with("homebrew/foo/incompatible").and_return(formula)
+
+      expect(tap_info.decorate_formula(tap, "incompatible", installed: false)).to match(/incompatible.*⊘/)
     end
   end
 
@@ -145,35 +186,72 @@ RSpec.describe Homebrew::Cmd::TapInfo do
     end
 
     it "does not mark an uninstalled cask" do
-      expect(tap_info.send(:decorate_cask, tap, "missing", installed: false)).not_to include("✘")
+      expect(tap_info.decorate_cask(tap, "missing", installed: false)).not_to include("✘")
     end
 
     it "marks an installed cask as satisfied" do
-      cask = instance_double(Cask::Cask, outdated?: false, deprecated?: false, disabled?: false)
+      cask = instance_double(
+        Cask::Cask,
+        outdated?:       false,
+        deprecated?:     false,
+        disabled?:       false,
+        valid_platform?: true,
+      )
       allow(Cask::CaskLoader).to receive(:load).with("homebrew/foo/installed").and_return(cask)
 
-      expect(tap_info.send(:decorate_cask, tap, "installed", installed: true)).to match(/installed.*✔/)
+      expect(tap_info.decorate_cask(tap, "installed", installed: true)).to match(/installed.*✔/)
     end
 
     it "marks an outdated installed cask as upgradable" do
-      cask = instance_double(Cask::Cask, outdated?: true, deprecated?: false, disabled?: false)
+      cask = instance_double(
+        Cask::Cask,
+        outdated?:       true,
+        deprecated?:     false,
+        disabled?:       false,
+        valid_platform?: true,
+      )
       allow(Cask::CaskLoader).to receive(:load).with("homebrew/foo/outdated").and_return(cask)
 
-      expect(tap_info.send(:decorate_cask, tap, "outdated", installed: true)).to match(/outdated.*↑/)
+      expect(tap_info.decorate_cask(tap, "outdated", installed: true)).to match(/outdated.*↑/)
     end
 
     it "marks a deprecated cask with `(deprecated)`" do
-      cask = instance_double(Cask::Cask, outdated?: false, deprecated?: true, disabled?: false)
+      cask = instance_double(
+        Cask::Cask,
+        outdated?:       false,
+        deprecated?:     true,
+        disabled?:       false,
+        valid_platform?: true,
+      )
       allow(Cask::CaskLoader).to receive(:load).with("homebrew/foo/old").and_return(cask)
 
-      expect(tap_info.send(:decorate_cask, tap, "old", installed: false)).to match(/old.*\(deprecated\)/)
+      expect(tap_info.decorate_cask(tap, "old", installed: false)).to match(/old.*\(deprecated\)/)
     end
 
-    it "marks a disabled cask with `(disabled)`" do
-      cask = instance_double(Cask::Cask, outdated?: false, deprecated?: false, disabled?: true)
+    it "marks a disabled cask with `(disabled)` and ⊘" do
+      cask = instance_double(
+        Cask::Cask,
+        outdated?:       false,
+        deprecated?:     false,
+        disabled?:       true,
+        valid_platform?: true,
+      )
       allow(Cask::CaskLoader).to receive(:load).with("homebrew/foo/gone").and_return(cask)
 
-      expect(tap_info.send(:decorate_cask, tap, "gone", installed: false)).to match(/gone.*\(disabled\)/)
+      expect(tap_info.decorate_cask(tap, "gone", installed: false)).to match(/gone.*⊘.*\(disabled\)/)
+    end
+
+    it "marks a cask that cannot be installed on this platform with ⊘" do
+      cask = instance_double(
+        Cask::Cask,
+        outdated?:       false,
+        deprecated?:     false,
+        disabled?:       false,
+        valid_platform?: false,
+      )
+      allow(Cask::CaskLoader).to receive(:load).with("homebrew/foo/incompatible").and_return(cask)
+
+      expect(tap_info.decorate_cask(tap, "incompatible", installed: false)).to match(/incompatible.*⊘/)
     end
   end
 
@@ -199,30 +277,32 @@ RSpec.describe Homebrew::Cmd::TapInfo do
       before do
         allow(Formula).to receive(:installed_formula_names).and_return(["foo"])
         allow(Cask::Caskroom).to receive(:tokens).and_return(["bar"])
-        allow(Formulary).to receive(:factory).with("homebrew/foo/foo")
-                                             .and_return(instance_double(Formula, outdated?:   false,
-                                                                                  deprecated?: false,
-                                                                                  disabled?:   false))
-        allow(Formulary).to receive(:factory).with("homebrew/foo/uninstalled-formula")
-                                             .and_return(instance_double(Formula, outdated?:   false,
-                                                                                  deprecated?: false,
-                                                                                  disabled?:   false))
-        allow(Cask::CaskLoader).to receive(:load).with("homebrew/foo/bar")
-                                                 .and_return(instance_double(Cask::Cask, outdated?:   false,
-                                                                                         deprecated?: false,
-                                                                                         disabled?:   false))
-        allow(Cask::CaskLoader).to receive(:load).with("homebrew/foo/uninstalled-cask")
-                                                 .and_return(instance_double(Cask::Cask, outdated?:   false,
-                                                                                         deprecated?: false,
-                                                                                         disabled?:   false))
+        formula = instance_double(
+          Formula,
+          outdated?:       false,
+          deprecated?:     false,
+          disabled?:       false,
+          valid_platform?: true,
+        )
+        cask = instance_double(
+          Cask::Cask,
+          outdated?:       false,
+          deprecated?:     false,
+          disabled?:       false,
+          valid_platform?: true,
+        )
+        allow(Formulary).to receive(:factory).with("homebrew/foo/foo").and_return(formula)
+        allow(Formulary).to receive(:factory).with("homebrew/foo/uninstalled-formula").and_return(formula)
+        allow(Cask::CaskLoader).to receive(:load).with("homebrew/foo/bar").and_return(cask)
+        allow(Cask::CaskLoader).to receive(:load).with("homebrew/foo/uninstalled-cask").and_return(cask)
       end
 
       it "lists every formula and cask, marking only the installed ones" do
-        expect { tap_info.send(:print_tap_listings, tap) }
+        expect { tap_info.print_tap_listings(tap) }
           .to output(
             /Commands.*mycmd.*==> Formulae.*foo.*✔.*uninstalled-formula.*==> Casks.*bar.*✔.*uninstalled-cask/m,
           ).to_stdout
-        expect { tap_info.send(:print_tap_listings, tap) }.not_to output(/✘/).to_stdout
+        expect { tap_info.print_tap_listings(tap) }.not_to output(/✘/).to_stdout
       end
     end
 
@@ -242,14 +322,18 @@ RSpec.describe Homebrew::Cmd::TapInfo do
       before do
         allow(Formula).to receive(:installed_formula_names).and_return(["formula7"])
         allow(Cask::Caskroom).to receive(:tokens).and_return([])
-        allow(Formulary).to receive(:factory).with("homebrew/foo/formula7")
-                                             .and_return(instance_double(Formula, outdated?:   false,
-                                                                                  deprecated?: false,
-                                                                                  disabled?:   false))
+        formula7 = instance_double(
+          Formula,
+          outdated?:       false,
+          deprecated?:     false,
+          disabled?:       false,
+          valid_platform?: true,
+        )
+        allow(Formulary).to receive(:factory).with("homebrew/foo/formula7").and_return(formula7)
       end
 
       it "warns about truncation and shows only installed entries under the standard header" do
-        expect { tap_info.send(:print_tap_listings, tap) }
+        expect { tap_info.print_tap_listings(tap) }
           .to output(/==> Formulae.*formula7.*✔/m).to_stdout
           .and output(/Tap has more than 30 formulae; showing only installed entries\./).to_stderr
       end
@@ -273,9 +357,9 @@ RSpec.describe Homebrew::Cmd::TapInfo do
       end
 
       it "lists every formula and cask without uninstalled markers" do
-        expect { tap_info.send(:print_tap_listings, tap) }
+        expect { tap_info.print_tap_listings(tap) }
           .to output(/==> Formulae.*baz.*foo.*==> Casks.*bar/m).to_stdout
-        expect { tap_info.send(:print_tap_listings, tap) }.not_to output(/✘/).to_stdout
+        expect { tap_info.print_tap_listings(tap) }.not_to output(/✘/).to_stdout
       end
     end
 
@@ -298,13 +382,13 @@ RSpec.describe Homebrew::Cmd::TapInfo do
       end
 
       it "shows a link to the tap remote and warns when nothing is installed" do
-        expect { tap_info.send(:print_tap_listings, tap) }
+        expect { tap_info.print_tap_listings(tap) }
           .to output(%r{See: https://github.com/homebrew/homebrew-foo}).to_stdout
           .and output(/Tap has more than 30 formulae and none are installed\./).to_stderr
       end
 
       it "does not list individual formula names" do
-        expect { tap_info.send(:print_tap_listings, tap) }
+        expect { tap_info.print_tap_listings(tap) }
           .not_to output(/formula1\b/).to_stdout
       end
     end

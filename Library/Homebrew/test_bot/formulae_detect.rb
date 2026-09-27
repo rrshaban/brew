@@ -1,12 +1,14 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "api/env"
+
 module Homebrew
   module TestBot
     class FormulaeDetect < Test
-      # Formulae must have GitHub homepages and stable URLs, no stable dependencies,
+      # Formulae must have GitHub homepages and stable URLs, no dependencies,
       # one executable and one library between them.
-      DEFAULT_TEST_FORMULAE = %w[libdeflate bats-core].freeze
+      DEFAULT_TEST_FORMULAE = %w[termbox bats-core].freeze
 
       sig { returns(T::Array[String]) }
       attr_reader :testing_formulae, :added_formulae, :deleted_formulae
@@ -164,6 +166,8 @@ module Homebrew
         modified_formulae += added_and_deleted_formulae
 
         if args.test_default_formula?
+          @added_formulae.reject! { |formula| formula.start_with?("portable-") }
+          modified_formulae.reject! { |formula| formula.start_with?("portable-") }
           # Build the default test formulae.
           modified_formulae += DEFAULT_TEST_FORMULAE
         elsif @added_formulae.present? &&
@@ -226,7 +230,7 @@ module Homebrew
 
       sig { params(formula_name: String, args: Homebrew::Cmd::TestBotCmd::Args).returns(T.nilable(String)) }
       def safe_formula_canonical_name(formula_name, args:)
-        Homebrew.with_no_api_env do
+        Homebrew::API.with_no_api_env do
           Formulary.factory(formula_name).full_name
         end
       rescue FormulaUnavailableError, TapFormulaUnavailableError, TapFormulaAmbiguityError => e

@@ -2,14 +2,14 @@
 # frozen_string_literal: true
 
 require "services/system"
+require "test/support/helper/services"
 
 RSpec.describe Homebrew::Services::System do
+  include Test::Helper::Services
+
   let(:bindir) { mktmpdir }
 
-  before do
-    described_class.reset_launchctl!
-    Homebrew::Services::System::Systemctl.reset_executable!
-  end
+  before { reset_services_memoization! }
 
   describe "#launchctl" do
     it "returns the launchctl command location when available and nil when unavailable" do
@@ -24,7 +24,7 @@ RSpec.describe Homebrew::Services::System do
         expect(described_class.launchctl).to eq(launchctl)
       end
 
-      described_class.reset_launchctl!
+      reset_services_memoization!
       launchctl.unlink
 
       with_env(PATH: bindir.to_s) do
@@ -46,7 +46,7 @@ RSpec.describe Homebrew::Services::System do
         expect(described_class.launchctl?).to be(true)
       end
 
-      described_class.reset_launchctl!
+      reset_services_memoization!
       launchctl.unlink
 
       with_env(PATH: bindir.to_s) do
@@ -68,7 +68,7 @@ RSpec.describe Homebrew::Services::System do
         expect(described_class.systemctl?).to be(true)
       end
 
-      Homebrew::Services::System::Systemctl.reset_executable!
+      reset_services_memoization!
       systemctl.unlink
 
       with_env(PATH: bindir.to_s) do
@@ -89,27 +89,6 @@ RSpec.describe Homebrew::Services::System do
     end
   end
 
-  describe "#user_of_process" do
-    it "returns the username for empty PID" do
-      expect(described_class.user_of_process(nil)).to eq(ENV.fetch("USER"))
-    end
-
-    it "returns the PID username" do
-      allow(Utils).to receive(:safe_popen_read).and_return <<~EOS
-        USER
-        user
-      EOS
-      expect(described_class.user_of_process(50)).to eq("user")
-    end
-
-    it "returns nil if unavailable" do
-      allow(Utils).to receive(:safe_popen_read).and_return <<~EOS
-        USER
-      EOS
-      expect(described_class.user_of_process(50)).to be_nil
-    end
-  end
-
   describe "#user_exists?" do
     it "returns true when a specified user exists" do
       expect(described_class.user_exists?(ENV.fetch("USER"))).to be(true)
@@ -123,12 +102,23 @@ RSpec.describe Homebrew::Services::System do
   describe "#domain_target" do
     it "returns the current domain target" do
       allow(described_class).to receive(:root?).and_return(false)
-      expect(described_class.domain_target).to match(%r{gui/(\d+)})
+      expect(described_class.domain_target).to match(%r{gui/\d+})
     end
 
     it "returns the root domain target" do
       allow(described_class).to receive(:root?).and_return(true)
       expect(described_class.domain_target).to match("system")
+    end
+  end
+
+  describe "#candidate_domain_targets" do
+    it "tries the user domain first when running through sudo" do
+      ENV.delete("HOMEBREW_SSH_TTY")
+      ENV["HOMEBREW_SUDO_USER"] = "test"
+      ENV["HOMEBREW_SERVICES_NO_DOMAIN_WARNING"] = "1"
+      allow(described_class).to receive(:root?).and_return(false)
+
+      expect(described_class.candidate_domain_targets).to eq(["user/#{Process.uid}", "gui/#{Process.uid}"])
     end
   end
 
@@ -172,6 +162,27 @@ RSpec.describe Homebrew::Services::System do
         described_class.user_path.to_s
       end.to raise_error(UsageError,
                          "Invalid usage: `brew services` is supported only on macOS or Linux (with systemd)!")
+    end
+  end
+
+  describe "#launchctl_find_service" do
+    let(:label) { "homebrew.mxcl.foo" }
+
+    it "returns failure when launchctl is not available" do
+      allow(described_class).to receive(:launchctl).and_return(nil)
+      _, success, type = described_class.launchctl_find_service(label)
+      expect(success).to be false
+      expect(type).to eq(:launchctl_list)
+    end
+  end
+
+  describe "#launchctl_service_running?" do
+    let(:label) { "homebrew.mxcl.foo" }
+
+    it "delegates to launchctl_find_service" do
+      allow(described_class).to receive(:launchctl_find_service)
+        .with(label, sudo: false).and_return(["output", true, :launchctl_print])
+      expect(described_class.launchctl_service_running?(label)).to be true
     end
   end
 

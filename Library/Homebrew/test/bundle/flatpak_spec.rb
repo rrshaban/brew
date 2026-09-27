@@ -123,8 +123,9 @@ RSpec.describe Homebrew::Bundle::Flatpak do
       end
 
       it "returns remote URLs" do
-        allow(described_class).to receive(:`).with("flatpak remote-list --system --columns=name,url 2>/dev/null")
-                                             .and_return("flathub\thttps://dl.flathub.org/repo/\nfedora\thttps://registry.fedoraproject.org/\n")
+        allow(Utils).to receive(:popen_read_text)
+          .with(Pathname("flatpak"), "remote-list", "--system", "--columns=name,url", err: File::NULL)
+          .and_return("flathub\thttps://dl.flathub.org/repo/\nfedora\thttps://registry.fedoraproject.org/\n")
         expect(dumper.remote_urls).to eql({
           "flathub" => "https://dl.flathub.org/repo/",
           "fedora"  => "https://registry.fedoraproject.org/",
@@ -132,11 +133,11 @@ RSpec.describe Homebrew::Bundle::Flatpak do
       end
 
       it "returns package list with remotes and URLs" do
-        allow(described_class).to receive(:`)
-          .with("flatpak list --app --columns=application,origin 2>/dev/null")
+        allow(Utils).to receive(:popen_read_text)
+          .with(Pathname("flatpak"), "list", "--app", "--columns=application,origin", err: File::NULL)
           .and_return("org.gnome.Calculator\tflathub\ncom.spotify.Client\tflathub\n")
-        allow(described_class).to receive(:`)
-          .with("flatpak remote-list --system --columns=name,url 2>/dev/null")
+        allow(Utils).to receive(:popen_read_text)
+          .with(Pathname("flatpak"), "remote-list", "--system", "--columns=name,url", err: File::NULL)
           .and_return("flathub\thttps://dl.flathub.org/repo/\n")
         expect(dumper.packages_with_remotes).to eql([
           { name: "com.spotify.Client", remote: "flathub", remote_url: "https://dl.flathub.org/repo/" },
@@ -145,11 +146,11 @@ RSpec.describe Homebrew::Bundle::Flatpak do
       end
 
       it "returns package names only" do
-        allow(described_class).to receive(:`)
-          .with("flatpak list --app --columns=application,origin 2>/dev/null")
+        allow(Utils).to receive(:popen_read_text)
+          .with(Pathname("flatpak"), "list", "--app", "--columns=application,origin", err: File::NULL)
           .and_return("org.gnome.Calculator\tflathub\ncom.spotify.Client\tflathub\n")
-        allow(described_class).to receive(:`)
-          .with("flatpak remote-list --system --columns=name,url 2>/dev/null")
+        allow(Utils).to receive(:popen_read_text)
+          .with(Pathname("flatpak"), "remote-list", "--system", "--columns=name,url", err: File::NULL)
           .and_return("flathub\thttps://dl.flathub.org/repo/\n")
         expect(dumper.packages).to eql(["com.spotify.Client", "org.gnome.Calculator"])
       end
@@ -218,10 +219,12 @@ RSpec.describe Homebrew::Bundle::Flatpak do
       end
 
       it "handles packages without origin" do
-        allow(described_class).to receive(:`).with("flatpak list --app --columns=application,origin 2>/dev/null")
-                                             .and_return("org.gnome.Calculator\n")
-        allow(described_class).to receive(:`).with("flatpak remote-list --system --columns=name,url 2>/dev/null")
-                                             .and_return("flathub\thttps://dl.flathub.org/repo/\n")
+        allow(Utils).to receive(:popen_read_text)
+          .with(Pathname("flatpak"), "list", "--app", "--columns=application,origin", err: File::NULL)
+          .and_return("org.gnome.Calculator\n")
+        allow(Utils).to receive(:popen_read_text)
+          .with(Pathname("flatpak"), "remote-list", "--system", "--columns=name,url", err: File::NULL)
+          .and_return("flathub\thttps://dl.flathub.org/repo/\n")
         expect(dumper.packages_with_remotes).to eql([
           { name: "org.gnome.Calculator", remote: "flathub", remote_url: "https://dl.flathub.org/repo/" },
         ])
@@ -230,16 +233,44 @@ RSpec.describe Homebrew::Bundle::Flatpak do
   end
 
   describe "installing" do
-    context "when Flatpak is not installed", :needs_linux do
+    context "when Flatpak is not installed" do
       before do
         described_class.reset!
         allow(described_class).to receive(:package_manager_executable).and_return(nil)
       end
 
-      it "returns false without attempting installation" do
+      it "fails with installation guidance without attempting installation" do
         expect(Homebrew::Bundle).not_to receive(:system)
-        expect(described_class.preinstall!("org.gnome.Calculator")).to be(false)
-        expect(described_class.install!("org.gnome.Calculator")).to be(true)
+        expect(described_class.preinstall!("org.gnome.Calculator")).to be(true)
+        expect { expect(described_class.install!("org.gnome.Calculator")).to be(false) }
+          .to output(/flatpak is not installed.*distribution's package manager/).to_stderr
+      end
+    end
+
+    describe "native batches" do
+      before do
+        allow(described_class).to receive(:package_manager_executable).and_return(Pathname.new("flatpak"))
+      end
+
+      it "installs refs sharing a remote in one batch" do
+        entries = [
+          Homebrew::Bundle::Dsl::Entry.new(:flatpak, "org.gnome.Calculator", remote: "flathub"),
+          Homebrew::Bundle::Dsl::Entry.new(:flatpak, "org.gnome.Characters", remote: "flathub"),
+        ]
+        expect(described_class.batch_installable?("org.gnome.Calculator", remote: "flathub")).to be(true)
+        expect(Homebrew::Bundle).to receive(:system)
+          .with("flatpak", "install", "-y", "--system", "flathub",
+                "org.gnome.Calculator", "org.gnome.Characters", verbose: false)
+          .and_return(true)
+
+        expect(described_class.install_batch!(entries, verbose: false)).to be(true)
+      end
+
+      it "does not batch entries that need their own remote" do
+        expect(described_class.batch_installable?(
+                 "org.godotengine.Godot",
+                 remote: "https://dl.flathub.org/beta-repo/",
+               )).to be(false)
       end
     end
 
@@ -329,8 +360,9 @@ RSpec.describe Homebrew::Bundle::Flatpak do
           end
 
           it "installs from .flatpakref directly" do
-            allow(described_class).to receive(:`).with("flatpak list --app --columns=application,origin 2>/dev/null")
-                                                 .and_return("org.example.App\texample-origin\n")
+            allow(Utils).to receive(:popen_read_text)
+              .with("flatpak", "list", "--app", "--columns=application,origin", err: File::NULL)
+              .and_return("org.example.App\texample-origin\n")
 
             expect(Homebrew::Bundle).to \
               receive(:system).with("flatpak", "install", "-y", "--system",

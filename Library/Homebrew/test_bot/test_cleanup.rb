@@ -29,6 +29,7 @@ module Homebrew
       def delete_or_move(paths, sudo: false)
         return if paths.blank?
 
+        sudo &&= !Homebrew::EnvConfig.no_sudo?
         symlinks, paths = paths.partition(&:symlink?)
 
         FileUtils.rm_f symlinks
@@ -85,7 +86,7 @@ module Homebrew
             next if path_string.start_with?(Dir.pwd.to_s)
 
             # allow deleting non-existent osxfuse symlinks.
-            if (!path.symlink? || path.resolved_path_exists?) &&
+            if (!path.symlink? || Utils::Path.resolved_path_exists?(path)) &&
                # don't try to delete other osxfuse files
                path_string.match?("(include|lib)/(lib|osxfuse/|pkgconfig/)?(osx|mac)?fuse(.*.(dylib|h|la|pc))?$")
               next

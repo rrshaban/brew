@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/text"
+
 require "reinstall"
 require "formula_installer"
 require "download_queue"
@@ -22,6 +24,27 @@ module Homebrew
     end
 
     class << self
+      # The installed version used in upgrade summaries, preferring the active opt link.
+      sig { params(formula: Formula).returns(T.nilable(PkgVersion)) }
+      def installed_version(formula)
+        if formula.optlinked? && (formula.opt_prefix/AbstractTab::FILENAME).file?
+          Keg.new(formula.opt_prefix).version
+        else
+          formula.installed_kegs.filter_map { |keg| keg.version if (keg/AbstractTab::FILENAME).file? }.max
+        end
+      end
+
+      # Describe a formula's version change for an upgrade summary.
+      sig { params(formula: Formula).returns(String) }
+      def formula_upgrade_description(formula)
+        current_version = installed_version(formula)
+        if current_version && current_version != formula.pkg_version
+          "#{formula.full_specified_name} #{current_version} -> #{formula.pkg_version}"
+        else
+          "#{formula.full_specified_name} #{formula.pkg_version}"
+        end
+      end
+
       sig { params(upgrades: T::Array[String]).returns(T::Array[String]) }
       def format_upgrade_summary(upgrades)
         return upgrades if upgrades.size < 2
@@ -82,21 +105,13 @@ module Homebrew
 
         # Sort keg-only before non-keg-only formulae to avoid any needless conflicts
         # with outdated, non-keg-only versions of formulae being upgraded.
-        formulae_to_install.sort! do |a, b|
-          if !a.keg_only? && b.keg_only?
-            1
-          elsif a.keg_only? && !b.keg_only?
-            -1
-          else
-            0
-          end
-        end
+        formulae_to_install.replace(formulae_to_install.partition(&:keg_only?).flatten(1))
 
         dependency_graph = Utils::TopologicalHash.graph_package_dependencies(formulae_to_install)
         sorted = dependency_graph.tsort_with_cycles do |cycles|
           raise CyclicDependencyError, cycles if Homebrew::EnvConfig.developer?
 
-          odebug "Ignoring cyclic dependencies: #{cycles.map(&:to_sentence).join(", ")}"
+          odebug "Ignoring cyclic dependencies: #{cycles.map { |cycle| Utils::Text.to_sentence(cycle) }.join(", ")}"
         end
         formulae_to_install = sorted & formulae_to_install
 
@@ -111,6 +126,7 @@ module Homebrew
               fi = create_formula_installer(
                 formula,
                 flags:,
+                download_queue:,
                 force_bottle:,
                 build_from_source_formulae:,
                 interactive:,
@@ -122,7 +138,6 @@ module Homebrew
                 quiet:,
                 verbose:,
               )
-              fi.download_queue = download_queue
               fi.fetch_bottle_tab(quiet: !debug, enqueue: true)
               fi
             rescue CannotInstallFormulaError => e
@@ -134,28 +149,14 @@ module Homebrew
             end
           end
 
-          download_queue.fetch
+          download_queue.fetch(only: Resource::BottleManifest, heading: "Downloading bottle manifests",
+                               allow_failures: true)
         ensure
           download_queue.shutdown
         end
 
-        installers.filter_map do |fi|
+        installers = installers.filter_map do |fi|
           fi.determine_bottle_tab_attributes
-
-          if !dry_run && dependents
-            all_runtime_deps_installed = fi.bottle_tab_runtime_dependencies.presence&.all? do |dependency, hash|
-              minimum_version = if (version = hash["version"])
-                Version.new(version)
-              end
-              Dependency.new(dependency).installed?(minimum_version:, minimum_revision: hash["revision"].to_i)
-            end
-
-            if all_runtime_deps_installed
-              # Don't need to install this bottle if all of the runtime
-              # dependencies have the same or newer version already installed.
-              next
-            end
-          end
 
           if dry_run
             begin
@@ -168,26 +169,93 @@ module Homebrew
 
           fi
         end
+        return installers if dry_run || !dependents
+
+        filter_dependent_formula_installers(installers)
+      end
+
+      sig { params(formula_installers: T::Array[FormulaInstaller]).returns(T::Array[FormulaInstaller]) }
+      def filter_dependent_formula_installers(formula_installers)
+        formula_installers.reject do |fi|
+          all_runtime_deps_installed = fi.bottle_tab_runtime_dependencies.presence&.all? do |dependency, hash|
+            minimum_version = if (version = hash["version"])
+              Version.new(version)
+            end
+            Dependency.new(dependency).installed?(minimum_version:, minimum_revision: hash["revision"].to_i)
+          end
+
+          next false unless all_runtime_deps_installed
+
+          ohai "Not upgrading #{fi.formula.full_specified_name}: " \
+               "installed runtime dependencies satisfy bottle metadata"
+          true
+        end
+      end
+
+      sig {
+        params(
+          deps: Dependents, formulae: T::Array[Formula], flags: T::Array[String],
+          force_bottle: T::Boolean, build_from_source_formulae: T::Array[String],
+          interactive: T::Boolean, keep_tmp: T::Boolean, debug_symbols: T::Boolean,
+          force: T::Boolean, debug: T::Boolean, quiet: T::Boolean, verbose: T::Boolean
+        ).returns(T::Array[FormulaInstaller])
+      }
+      def dependent_formula_installers(
+        deps,
+        formulae,
+        flags:,
+        force_bottle: false,
+        build_from_source_formulae: [],
+        interactive: false,
+        keep_tmp: false,
+        debug_symbols: false,
+        force: false,
+        debug: false,
+        quiet: false,
+        verbose: false
+      )
+        formula_names = formulae.map(&:full_name)
+        formula_installers(
+          deps.upgradeable.reject { |formula| formula_names.include?(formula.full_name) },
+          flags:,
+          force_bottle:,
+          build_from_source_formulae:,
+          dependents:                 true,
+          interactive:,
+          keep_tmp:,
+          debug_symbols:,
+          force:,
+          debug:,
+          quiet:,
+          verbose:,
+        )
       end
 
       sig {
         params(formula_installers: T::Array[FormulaInstaller], dry_run: T::Boolean, verbose: T::Boolean,
-               fetch: T::Boolean, skip_formula_names: T::Array[String]).returns(T::Array[FormulaInstaller])
+               fetch: T::Boolean, cleanup: T::Boolean,
+               skip_formula_names: T::Array[String]).returns(T::Array[FormulaInstaller])
       }
-      def upgrade_formulae(formula_installers, dry_run: false, verbose: false, fetch: true, skip_formula_names: [])
+      def upgrade_formulae(formula_installers, dry_run: false, verbose: false, fetch: true, cleanup: true,
+                           skip_formula_names: [])
         valid_formula_installers = if dry_run || !fetch
           formula_installers
         else
           Install.fetch_formulae(formula_installers)
         end
+        dependency_summary = T.let(
+          dry_run ? { install: [], upgrade: [] } : nil,
+          T.nilable(Install::DependencySummary),
+        )
 
         upgraded_formula_installers = valid_formula_installers.select do |fi|
-          upgraded = upgrade_formula(fi, dry_run:, verbose:, skip_formula_names:)
-          Cleanup.install_formula_clean!(fi.formula) if upgraded && !dry_run
+          upgraded = upgrade_formula(fi, dry_run:, verbose:, skip_formula_names:, dependency_summary:)
+          Cleanup.install_formula_clean!(fi.formula) if upgraded && !dry_run && cleanup
           upgraded
         end
         return upgraded_formula_installers unless dry_run
 
+        Install.print_dry_run_dependency_summary(dependency_summary) if dependency_summary
         formulae_to_clean = Cleanup.install_cleanup_formulae(upgraded_formula_installers.map(&:formula))
         if formulae_to_clean.present? &&
            Cleanup.printed_dry_run_output?(Cleanup.dry_run_output(formulae: formulae_to_clean), ohai: true)
@@ -200,7 +268,7 @@ module Homebrew
       def outdated_kegs(formula)
         [formula, *formula.old_installed_formulae].map(&:linked_keg)
                                                   .select(&:directory?)
-                                                  .map { |k| Keg.new(k.resolved_path) }
+                                                  .map { |k| Keg.new(Utils::Path.resolved_path(k)) }
       end
 
       sig { params(formula: Formula, fi_options: Options).void }
@@ -277,7 +345,8 @@ module Homebrew
                dry_run: T::Boolean, installed_on_request: T::Boolean, force_bottle: T::Boolean,
                build_from_source_formulae: T::Array[String], interactive: T::Boolean, keep_tmp: T::Boolean,
                debug_symbols: T::Boolean, force: T::Boolean, debug: T::Boolean, quiet: T::Boolean,
-               verbose: T::Boolean, skip_formula_names: T::Array[String]).void
+               verbose: T::Boolean, skip_formula_names: T::Array[String], cleanup: T::Boolean,
+               prefetched_formula_installers: T.nilable(T::Array[FormulaInstaller])).returns(T::Array[Formula])
       }
       def upgrade_dependents(deps, formulae,
                              flags:,
@@ -292,10 +361,12 @@ module Homebrew
                              debug: false,
                              quiet: false,
                              verbose: false,
-                             skip_formula_names: [])
-        return if deps.blank?
+                             skip_formula_names: [],
+                             cleanup: true,
+                             prefetched_formula_installers: nil)
+        return [] if deps.blank?
 
-        upgradeable = deps.upgradeable
+        upgradeable = deps.upgradeable.dup
         pinned      = deps.pinned
         skipped     = deps.skipped
         if pinned.present?
@@ -313,8 +384,45 @@ module Homebrew
           EOS
         end
 
+        installed_formulae = FormulaInstaller.installed
+        upgraded_formulae = T.let([], T::Array[Formula])
+        unless dry_run
+          primary_formula_names = formulae.map(&:full_name)
+          upgraded_formulae.concat(upgradeable.select do |f|
+            installed_formulae.include?(f) && primary_formula_names.exclude?(f.full_name)
+          end)
+        end
+
         upgradeable.reject! do |f|
-          FormulaInstaller.installed.include?(f) || (dry_run && skip_formula_names.include?(f.full_name))
+          installed_formulae.include?(f) || (dry_run && skip_formula_names.include?(f.full_name))
+        end
+
+        return upgraded_formulae if upgradeable.blank?
+
+        dependent_installers = T.let([], T::Array[FormulaInstaller])
+        unless dry_run
+          dependent_installers = if prefetched_formula_installers
+            upgradeable_names = upgradeable.map(&:full_name)
+            filter_dependent_formula_installers(
+              prefetched_formula_installers.select { |fi| upgradeable_names.include?(fi.formula.full_name) },
+            )
+          else
+            formula_installers(
+              upgradeable.dup,
+              flags:,
+              force_bottle:,
+              build_from_source_formulae:,
+              dependents:                 true,
+              interactive:,
+              keep_tmp:,
+              debug_symbols:,
+              force:,
+              debug:,
+              quiet:,
+              verbose:,
+            )
+          end
+          upgradeable = dependent_installers.map(&:formula)
         end
 
         # Print the upgradable dependents.
@@ -336,30 +444,21 @@ module Homebrew
           puts format_upgrade_summary(formulae_upgrades).join("\n")
         end
 
-        return if upgradeable.blank?
-
-        unless dry_run
-          dependent_installers = formula_installers(
-            upgradeable,
-            flags:,
-            force_bottle:,
-            build_from_source_formulae:,
-            dependents:                 true,
-            interactive:,
-            keep_tmp:,
-            debug_symbols:,
-            force:,
-            debug:,
-            quiet:,
-            verbose:,
+        if !dry_run && dependent_installers.present?
+          upgraded_formulae.concat(
+            upgrade_formulae(
+              dependent_installers,
+              verbose:,
+              cleanup:,
+              fetch:   prefetched_formula_installers.nil?,
+            ).map(&:formula),
           )
-          upgrade_formulae(dependent_installers, dry_run:, verbose:)
         end
 
         # Update non-core installed formulae for linkage checks after upgrading
         # Don't need to check core formulae because we do so at CI time.
         installed_non_core_formulae = FormulaInstaller.installed.to_a.reject(&:core_formula?)
-        return if installed_non_core_formulae.blank?
+        return upgraded_formulae if installed_non_core_formulae.blank?
 
         # Assess the dependents tree again now we've upgraded.
         unless dry_run
@@ -375,7 +474,7 @@ module Homebrew
           else
             ohai "No broken dependents found!"
           end
-          return
+          return upgraded_formulae
         end
 
         reinstallable_broken_dependents =
@@ -408,7 +507,7 @@ module Homebrew
                                               .join(", ")
         end
 
-        return if dry_run
+        return upgraded_formulae if dry_run
 
         reinstall_contexts = reinstallable_broken_dependents.map do |formula|
           Reinstall.build_install_context(
@@ -436,38 +535,29 @@ module Homebrew
           # We already attempted to reinstall f as part of the dependency tree of
           # another formula. In that case, don't generate an error, just move on.
           nil
-        rescue CannotInstallFormulaError, DownloadError => e
-          ofail e
         rescue BuildError => e
           e.dump(verbose:)
           puts
           Homebrew.failed = true
+        rescue => e
+          ofail e
         end
+        upgraded_formulae
       end
-
-      private
 
       sig {
         params(formula_installer: FormulaInstaller, dry_run: T::Boolean, verbose: T::Boolean,
-               skip_formula_names: T::Array[String]).returns(T::Boolean)
+               skip_formula_names: T::Array[String],
+               dependency_summary: T.nilable(Install::DependencySummary)).returns(T::Boolean)
       }
-      def upgrade_formula(formula_installer, dry_run: false, verbose: false, skip_formula_names: [])
+      def upgrade_formula(formula_installer, dry_run: false, verbose: false, skip_formula_names: [],
+                          dependency_summary: nil)
         formula = formula_installer.formula
 
         if dry_run
           Install.print_dry_run_dependencies(formula, formula_installer.compute_dependencies,
-                                             skip_formula_names:) do |f|
-            name = f.full_specified_name
-            current_version = if f.optlinked?
-              Keg.new(f.opt_prefix).version
-            else
-              f.installed_kegs.map(&:version).max
-            end
-            if current_version && current_version != f.pkg_version
-              "#{name} #{current_version} -> #{f.pkg_version}"
-            else
-              "#{name} #{f.pkg_version}"
-            end
+                                             skip_formula_names:, dependency_summary:) do |f|
+            formula_upgrade_description(f)
           end
           return true
         end
@@ -479,7 +569,14 @@ module Homebrew
         puts
         Homebrew.failed = true
         false
+      rescue => e
+        # Keep a single failed upgrade (e.g. a bottle that fails to extract)
+        # from aborting the rest of the batch while still failing the run.
+        ofail "#{formula_installer.formula.full_specified_name}: #{e}"
+        false
       end
+
+      private
 
       sig { params(installed_formulae: T::Array[Formula]).returns(T::Array[Formula]) }
       def check_broken_dependents(installed_formulae)
@@ -511,14 +608,17 @@ module Homebrew
       end
 
       sig {
-        params(formula: Formula, flags: T::Array[String], force_bottle: T::Boolean,
+        params(formula: Formula, flags: T::Array[String], download_queue: Homebrew::DownloadQueue,
+               force_bottle: T::Boolean,
                build_from_source_formulae: T::Array[String], interactive: T::Boolean,
                keep_tmp: T::Boolean, debug_symbols: T::Boolean, force: T::Boolean,
-               overwrite: T::Boolean, debug: T::Boolean, quiet: T::Boolean, verbose: T::Boolean).returns(FormulaInstaller)
+               overwrite: T::Boolean, debug: T::Boolean, quiet: T::Boolean,
+               verbose: T::Boolean).returns(FormulaInstaller)
       }
       def create_formula_installer(
         formula,
         flags:,
+        download_queue:,
         force_bottle: false,
         build_from_source_formulae: [],
         interactive: false,
@@ -531,7 +631,7 @@ module Homebrew
         verbose: false
       )
         keg = if formula.optlinked?
-          Keg.new(formula.opt_prefix.resolved_path)
+          Keg.new(Utils::Path.resolved_path(formula.opt_prefix))
         else
           formula.installed_kegs.find(&:optlinked?)
         end
@@ -555,6 +655,7 @@ module Homebrew
         FormulaInstaller.new(
           formula,
           **{
+            download_queue:,
             options:,
             link_keg:,
             installed_on_request:,
@@ -578,10 +679,13 @@ module Homebrew
         if one.any_installed_keg
               &.runtime_dependencies
               &.any? { |dependency| dependency["full_name"] == two.full_name }
-          1
-        else
-          T.must(one <=> two)
+          return 1
         end
+
+        comparison = one <=> two
+        raise ArgumentError, "Cannot compare #{one.full_name} with #{two.full_name}" if comparison.nil?
+
+        comparison
       end
     end
   end

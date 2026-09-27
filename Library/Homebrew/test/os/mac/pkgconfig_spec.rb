@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 # These tests assume the needed SDKs are correctly installed, i.e. `brew doctor` passes.
@@ -9,9 +9,6 @@
 #
 # - libedit (incorrect LIBEDIT_MAJOR/MINOR in histedit.h)
 # - uuid (not a standalone library)
-#
-# Additionally, libffi version detection cannot be performed on systems running Mojave or earlier.
-# TODO: we no longer support Mojave or earlier, so we can fix this now.
 #
 # For indeterminable cases, consult https://opensource.apple.com for the version used.
 RSpec.describe "pkg-config", :needs_ci, type: :system do
@@ -82,8 +79,6 @@ RSpec.describe "pkg-config", :needs_ci, type: :system do
                   .grep(/^\s*libffi (\S+)\s+(?:- Copyright |$)/) { Regexp.last_match(1) }
                   .first
 
-    skip "Cannot detect system libffi version." if version == "PyOBJC"
-
     expect(pc_version("libffi")).to eq(version)
   end
 
@@ -109,7 +104,7 @@ RSpec.describe "pkg-config", :needs_ci, type: :system do
     version = File.foreach("#{sdk}/usr/include/ncurses.h")
                   .lazy
                   .grep(/^#define NCURSES_VERSION_(MAJOR|MINOR|PATCH) (\d+)$/) do
-                    { Regexp.last_match(1).downcase => Regexp.last_match(2) }
+                    { Regexp.last_match(1).to_s.downcase => Regexp.last_match(2) }
                   end
                   .reduce(:merge!)
     version = "#{version["major"]}.#{version["minor"]}.#{version["patch"]}"

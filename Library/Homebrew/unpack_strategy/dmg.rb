@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "tempfile"
+require "cask/macos"
 require "system_command"
 require "utils/output"
 
@@ -60,7 +61,7 @@ module UnpackStrategy
         result = loop do
           # We need to use `find` here instead of Ruby in order to properly handle
           # file names containing special characters, such as “e” + “´” vs. “é”.
-          r = system_command("find", args: [".", "-print0"], chdir: pathname, print_stderr: false, reset_uid: true)
+          r = system_command("find", args: [".", "-print0"], chdir: pathname, print_stderr: false)
           tries += 1
 
           # Spurious bug on CI, which in most cases can be worked around by retrying.
@@ -130,7 +131,7 @@ module UnpackStrategy
       sig { override.returns(T::Array[String]) }
       def self.extensions = []
 
-      sig { override.params(_path: Pathname).returns(T::Boolean) }
+      sig { override.params(_path: Path).returns(T::Boolean) }
       def self.can_extract?(_path) = false
 
       private
@@ -147,53 +148,36 @@ module UnpackStrategy
           retry
         end
 
-        Tempfile.open(["", ".bom"]) do |bomfile|
+        Tempfile.create(["", ".bom"]) do |bomfile|
           bomfile.close
 
-          Tempfile.open(["", ".list"]) do |filelist|
+          Tempfile.create(["", ".list"]) do |filelist|
             filelist.puts(bom)
             filelist.close
 
             system_command! "mkbom",
-                            args:    ["-s", "-i", T.must(filelist.path), "--", T.must(bomfile.path)],
+                            args:    ["-s", "-i", filelist.path, "--", bomfile.path],
                             verbose:
           end
 
-          bomfile_path = T.must(bomfile.path)
-
           system_command!("ditto",
-                          args:      ["--bom", bomfile_path, "--", path, unpack_dir],
-                          verbose:,
-                          reset_uid: true)
+                          args:    ["--bom", bomfile.path, "--", path, unpack_dir],
+                          verbose:)
 
           FileUtils.chmod "u+w", Pathname.glob(unpack_dir/"**/*", File::FNM_DOTMATCH).reject(&:symlink?)
         end
       end
     end
-    private_constant :Mount
 
     sig { override.returns(T::Array[String]) }
     def self.extensions
       [".dmg"]
     end
 
-    sig { override.params(path: Pathname).returns(T::Boolean) }
+    sig { override.params(path: Path).returns(T::Boolean) }
     def self.can_extract?(path)
       stdout, _, status = system_command("hdiutil", args: ["imageinfo", "-format", path], print_stderr: false).to_a
       (status.success? && !stdout.empty?) || false
-    end
-
-    private
-
-    sig { override.params(unpack_dir: Pathname, basename: Pathname, verbose: T::Boolean).void }
-    def extract_to_dir(unpack_dir, basename:, verbose:)
-      mount(verbose:) do |mounts|
-        raise "No mounts found in '#{path}'; perhaps this is a bad disk image?" if mounts.empty?
-
-        mounts.each do |mount|
-          mount.extract(to: unpack_dir, verbose:)
-        end
-      end
     end
 
     sig { params(verbose: T::Boolean, _block: T.proc.params(arg0: T::Array[Mount]).void).void }
@@ -216,6 +200,8 @@ module UnpackStrategy
         plist = if without_eula.success?
           without_eula.plist
         else
+          without_eula.assert_success! if without_eula.stdout.empty?
+
           cdr_path = mount_dir/path.basename.sub_ext(".cdr")
 
           quiet_flag = "-quiet" unless verbose
@@ -258,6 +244,19 @@ module UnpackStrategy
           mounts.each do |mount|
             mount.eject(verbose:)
           end
+        end
+      end
+    end
+
+    private
+
+    sig { override.params(unpack_dir: Pathname, basename: Pathname, verbose: T::Boolean).void }
+    def extract_to_dir(unpack_dir, basename:, verbose:)
+      mount(verbose:) do |mounts|
+        raise "No mounts found in '#{path}'; perhaps this is a bad disk image?" if mounts.empty?
+
+        mounts.each do |mount|
+          mount.extract(to: unpack_dir, verbose:)
         end
       end
     end

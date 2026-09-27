@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "reinstall"
+require "install"
 require "extend/os/mac/pkgconf"
 
 RSpec.describe Homebrew::Reinstall do
@@ -14,7 +15,8 @@ RSpec.describe Homebrew::Reinstall do
 
     before do
       allow(Formula).to receive(:[]).with("pkgconf").and_return(formula)
-      allow(Homebrew::Install).to receive(:fetch_formulae).with([formula_installer])
+      allow(Homebrew::Install).to receive(:fetch_formulae).with([formula_installer]).and_return([formula_installer])
+      allow(formula).to receive(:full_name).and_return("pkgconf")
       allow(described_class).to receive(:build_install_context).and_return(context)
     end
 
@@ -62,6 +64,15 @@ RSpec.describe Homebrew::Reinstall do
 
         described_class.reinstall_pkgconf_if_needed!
       end
+    end
+
+    it "does not reinstall or report success when fetching fails" do
+      allow(Homebrew::Pkgconf).to receive(:macos_sdk_mismatch).and_return(["26", "27"])
+      allow(Homebrew::Install).to receive(:fetch_formulae).with([formula_installer]).and_return([])
+      expect(described_class).not_to receive(:reinstall_formula)
+      expect(described_class).not_to receive(:ohai)
+
+      described_class.reinstall_pkgconf_if_needed!
     end
   end
 end

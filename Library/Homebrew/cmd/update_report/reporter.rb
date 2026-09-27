@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/output"
+
 require "trust"
 
 class Reporter
@@ -64,6 +66,8 @@ class Reporter
 
     diff.each_line do |line|
       status, *paths = line.split
+      next if status.nil?
+
       src = Pathname.new paths.first
       dst = Pathname.new paths.last
 
@@ -103,7 +107,7 @@ class Reporter
         name = Utils.name_from_full_name(full_name)
         new_tap = tap.tap_migrations[name]
         if new_tap.blank?
-          @report[T.must(status).to_sym] << full_name
+          @report[status.to_sym] << full_name
         elsif status == "D"
           # Retain deleted formulae for tap migrations separately to avoid reporting as deleted
           @report[:T] << full_name
@@ -244,6 +248,7 @@ class Reporter
 
         new_tap = Tap.fetch(new_tap_name)
         next unless ensure_trusted_tap_installed!(name, new_name, new_tap)
+        next unless ensure_trusted_migration_target!(:formula, new_full_name)
 
         ohai "#{name} has been moved to Homebrew.", <<~EOS
           To uninstall the cask, run:
@@ -273,6 +278,8 @@ class Reporter
       # For formulae migrated to cask: Auto-install cask or provide install instructions.
       # Check if the migration target is a cask (either in homebrew/cask or any other tap)
       if new_tap.core_cask_tap? || new_tap.cask_tokens.intersect?([new_full_name, new_name])
+        next unless ensure_trusted_migration_target!(:cask, new_full_name)
+
         migration_message = if new_tap == tap
           "#{full_name} has been migrated from a formula to a cask."
         else
@@ -309,13 +316,6 @@ class Reporter
     end
   end
 
-  sig { void }
-  def migrate_cask_rename
-    Cask::Caskroom.casks.each do |cask|
-      Cask::Migrator.migrate_if_needed(cask)
-    end
-  end
-
   sig { params(force: T::Boolean, verbose: T::Boolean).void }
   def migrate_formula_rename(force:, verbose:)
     Formula.installed.each do |formula|
@@ -326,7 +326,7 @@ class Reporter
         next false unless oldname_rack.exist?
 
         if oldname_rack.subdirs.empty?
-          oldname_rack.rmdir_if_possible
+          Utils::Path.rmdir_if_possible(oldname_rack)
           next false
         end
 
@@ -337,8 +337,6 @@ class Reporter
       Migrator.migrate_if_needed(formula, force:)
     end
   end
-
-  private
 
   sig { params(name: String, new_name: String, new_tap: Tap).returns(T::Boolean) }
   def ensure_trusted_tap_installed!(name, new_name, new_tap)
@@ -368,31 +366,18 @@ class Reporter
     true
   end
 
-  sig { returns(Tap) }
-  attr_reader :tap
+  sig { params(type: Symbol, full_name: String).returns(T::Boolean) }
+  def ensure_trusted_migration_target!(type, full_name)
+    return true if Homebrew::Trust.trusted?(type, full_name)
 
-  sig { returns(String) }
-  attr_reader :initial_revision
-
-  sig { returns(String) }
-  attr_reader :current_revision
-
-  sig { returns(T.nilable(Pathname)) }
-  attr_reader :api_names_txt
-
-  sig { returns(T.nilable(Pathname)) }
-  attr_reader :api_names_before_txt
-
-  sig { returns(T.nilable(Pathname)) }
-  attr_reader :api_dir_prefix
-
-  sig {
-    params(api_names_txt: T.nilable(Pathname), api_names_before_txt: T.nilable(Pathname),
-           api_dir_prefix: T.nilable(Pathname)).returns(T::Boolean)
-  }
-  def installed_from_api?(api_names_txt = @api_names_txt, api_names_before_txt = @api_names_before_txt,
-                          api_dir_prefix = @api_dir_prefix)
-    !api_names_txt.nil? && !api_names_before_txt.nil? && !api_dir_prefix.nil?
+    opoo <<~EOS
+      Not automatically installing #{full_name} because the migration target is
+      not trusted.
+      To complete the migration yourself, run:
+        brew trust --#{type} #{full_name}
+        brew install --#{type} #{full_name}
+    EOS
+    false
   end
 
   sig { returns(String) }
@@ -405,7 +390,10 @@ class Reporter
       header_regex = /^(---|\+\+\+) /
       add_delete_characters = ["+", "-"].freeze
 
-      api_dir_prefix_basename = T.must(api_dir_prefix).basename
+      api_dir_prefix = self.api_dir_prefix
+      raise ArgumentError, "#{tap} needs an API directory prefix to diff" if api_dir_prefix.nil?
+
+      api_dir_prefix_basename = api_dir_prefix.basename
 
       diff_hash = diff_output.lines.each_with_object({}) do |line, hash|
         next if line.match?(header_regex)
@@ -435,5 +423,34 @@ class Reporter
         "-M85%", initial_revision, current_revision
       )
     end
+  end
+
+  private
+
+  sig { returns(Tap) }
+  attr_reader :tap
+
+  sig { returns(String) }
+  attr_reader :initial_revision
+
+  sig { returns(String) }
+  attr_reader :current_revision
+
+  sig { returns(T.nilable(Pathname)) }
+  attr_reader :api_names_txt
+
+  sig { returns(T.nilable(Pathname)) }
+  attr_reader :api_names_before_txt
+
+  sig { returns(T.nilable(Pathname)) }
+  attr_reader :api_dir_prefix
+
+  sig {
+    params(api_names_txt: T.nilable(Pathname), api_names_before_txt: T.nilable(Pathname),
+           api_dir_prefix: T.nilable(Pathname)).returns(T::Boolean)
+  }
+  def installed_from_api?(api_names_txt = @api_names_txt, api_names_before_txt = @api_names_before_txt,
+                          api_dir_prefix = @api_dir_prefix)
+    !api_names_txt.nil? && !api_names_before_txt.nil? && !api_dir_prefix.nil?
   end
 end

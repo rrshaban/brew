@@ -65,33 +65,17 @@ RSpec.describe Utils::Bottles::Tag do
     end
   end
 
-  describe "#valid_combination?" do
-    it "returns true for Intel" do
-      tag = described_class.new(system: :big_sur, arch: :intel)
-      expect(tag.valid_combination?).to be true
-      tag = described_class.new(system: :linux, arch: :x86_64)
-      expect(tag.valid_combination?).to be true
+  describe "#padded_prefix" do
+    it "returns distinct 64-byte prefixes for supported bottle platforms" do
+      prefixes = [:arm64_tahoe, :arm64_linux, :x86_64_linux].map do |tag|
+        described_class.from_symbol(tag).padded_prefix
+      end
+
+      expect([prefixes.uniq.length, *prefixes.map { |prefix| prefix&.bytesize }]).to eq([3, 64, 64, 64])
     end
 
-    it "returns false for ARM on macOS Catalina" do
-      tag = described_class.new(system: :catalina, arch: :arm64)
-      expect(tag.valid_combination?).to be false
-    end
-
-    it "returns true for ARM on macOS Big Sur or newer" do
-      tag = described_class.new(system: :big_sur, arch: :arm64)
-      expect(tag.valid_combination?).to be true
-      tag = described_class.new(system: :monterey, arch: :arm)
-      expect(tag.valid_combination?).to be true
-      tag = described_class.new(system: :ventura, arch: :arm)
-      expect(tag.valid_combination?).to be true
-    end
-
-    it "returns true for ARM on Linux" do
-      tag = described_class.new(system: :linux, arch: :arm64)
-      expect(tag.valid_combination?).to be true
-      tag = described_class.new(system: :linux, arch: :arm)
-      expect(tag.valid_combination?).to be true
+    it "returns nil for Intel macOS" do
+      expect(described_class.from_symbol(:tahoe).padded_prefix).to be_nil
     end
   end
 end

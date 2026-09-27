@@ -7,11 +7,11 @@ require "cmd/shared_examples/args_parse"
 RSpec.describe Homebrew::Cmd::Desc do
   it_behaves_like "parseable arguments"
 
-  it "shows a given Formula's description", :integration_test do
+  it "shows a given Formula and Cask description", :cask, :integration_test do
     setup_test_formula "testball"
 
-    expect { brew "desc", "testball" }
-      .to output("testball: Some test\n").to_stdout
+    expect { brew "desc", "testball", "local-transmission" }
+      .to output("local-transmission: (Transmission) BitTorrent client\ntestball: Some test\n").to_stdout
       .and not_to_output.to_stderr
       .and be_a_success
   end
@@ -65,22 +65,6 @@ RSpec.describe Homebrew::Cmd::Desc do
       expect { described_class.new(["--search", "testball"]).run }
         .to not_to_output.to_stderr
     end
-  end
-
-  it "successfully searches with --search and HOMEBREW_NO_REQUIRE_TAP_TRUST" do
-    expect(Homebrew::Search).to receive(:search_descriptions)
-      .with("ball", anything, search_type: Descriptions::SearchField::Either)
-
-    expect { with_env(HOMEBREW_NO_REQUIRE_TAP_TRUST: "1") { described_class.new(["--search", "ball"]).run } }
-      .to not_to_output.to_stderr
-  end
-
-  it "successfully searches with --search and HOMEBREW_REQUIRE_TAP_TRUST" do
-    expect(Homebrew::Search).to receive(:search_descriptions)
-      .with("ball", anything, search_type: Descriptions::SearchField::Either)
-
-    expect { with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") { described_class.new(["--search", "ball"]).run } }
-      .to not_to_output.to_stderr
   end
 
   it "successfully searches with API" do

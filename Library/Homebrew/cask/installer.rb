@@ -1,11 +1,14 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/text"
+
 require "formula_installer"
 require "unpack_strategy"
 require "utils/topological_hash"
 require "utils/analytics"
 require "utils/output"
+require "utils/path"
 
 require "api/cask_download"
 require "cask/config"
@@ -21,6 +24,7 @@ module Cask
   class Installer
     extend ::Utils::Output::Mixin
     include ::Utils::Output::Mixin
+    include ::Utils::Path
 
     sig { returns(::Cask::Cask) }
     attr_reader :cask
@@ -30,16 +34,18 @@ module Cask
         cask: ::Cask::Cask, command: T.class_of(SystemCommand), force: T::Boolean, adopt: T::Boolean,
         skip_cask_deps: T::Boolean, binaries: T::Boolean, verbose: T::Boolean, zap: T::Boolean,
         require_sha: T::Boolean, upgrade: T::Boolean, reinstall: T::Boolean,
-        installed_on_request: T::Boolean, quarantine: T::Boolean, verify_download_integrity: T::Boolean,
-        quiet: T::Boolean, download_queue: Homebrew::DownloadQueue, defer_fetch: T::Boolean
+        installed_on_request: T::Boolean, verify_download_integrity: T::Boolean,
+        quiet: T::Boolean, download_queue: Homebrew::DownloadQueue, defer_fetch: T::Boolean,
+        default_uninstall_artifacts: T.nilable(ArtifactSet)
       ).void
     }
     def initialize(cask, command: SystemCommand, force: false, adopt: false,
                    skip_cask_deps: false, binaries: true, verbose: false,
                    zap: false, require_sha: false, upgrade: false, reinstall: false,
                    installed_on_request: true,
-                   quarantine: true, verify_download_integrity: true, quiet: false,
-                   download_queue: Homebrew.default_download_queue, defer_fetch: false)
+                   verify_download_integrity: true, quiet: false,
+                   download_queue: Homebrew::DownloadQueue.default, defer_fetch: false,
+                   default_uninstall_artifacts: nil)
       @cask = cask
       @command = command
       @force = force
@@ -52,16 +58,20 @@ module Cask
       @reinstall = reinstall
       @upgrade = upgrade
       @installed_on_request = installed_on_request
-      @quarantine = quarantine
       @verify_download_integrity = verify_download_integrity
       @quiet = quiet
       @download_queue = download_queue
       @defer_fetch = defer_fetch
-      @source_download = T.let(nil, T.nilable(Homebrew::API::SourceDownload))
-      @default_uninstall_artifacts = T.let(nil, T.nilable(ArtifactSet))
-      @ran_prelude_fetch = T.let(false, T::Boolean)
+      # Restricts what `#uninstall` removes, for artifacts that are shared with a cask
+      # which must be kept installed.
+      @default_uninstall_artifacts = default_uninstall_artifacts
       @ran_prelude = T.let(false, T::Boolean)
       @cask_and_formula_dependencies = T.let(nil, T.nilable(T::Array[T.any(Formula, ::Cask::Cask)]))
+      @dependency_cask_installers = T.let(nil, T.nilable(T::Array[Installer]))
+      @dependency_formula_installers = T.let(nil, T.nilable(T::Array[FormulaInstaller]))
+      @dependencies_enqueued = T.let(false, T::Boolean)
+      @download_failed = T.let(false, T::Boolean)
+      @installed_uninstall_artifacts_missing = T.let(false, T::Boolean)
     end
 
     sig { returns(T::Boolean) }
@@ -74,10 +84,16 @@ module Cask
     def force? = @force
 
     sig { returns(T::Boolean) }
-    def installed_on_request? = @installed_on_request
+    def download_failed? = @download_failed
+
+    sig { void }
+    def download_failed! = @download_failed = true
+
+    sig { returns(T::Array[Installer]) }
+    def dependency_cask_installers = @dependency_cask_installers || []
 
     sig { returns(T::Boolean) }
-    def quarantine? = @quarantine
+    def installed_on_request? = @installed_on_request
 
     sig { returns(T::Boolean) }
     def quiet? = @quiet
@@ -104,15 +120,22 @@ module Cask
     def self.caveats(cask)
       odebug "Printing caveats"
 
-      caveats = cask.caveats
-      return if caveats.empty?
-
-      Homebrew.messages.record_caveats(cask.token, caveats)
+      caveats = record_caveats(cask)
+      return unless caveats
 
       <<~EOS
         #{ohai_title "Caveats"}
         #{caveats}
       EOS
+    end
+
+    sig { params(cask: ::Cask::Cask).returns(T.nilable(String)) }
+    def self.record_caveats(cask)
+      caveats = cask.caveats
+      return if caveats.empty?
+
+      Homebrew.messages.record_caveats(cask.token, caveats)
+      caveats
     end
 
     sig { params(quiet: T.nilable(T::Boolean), timeout: T.nilable(T.any(Integer, Float))).void }
@@ -152,6 +175,8 @@ module Cask
 
     sig { void }
     def install
+      raise CaskError, "Download failed for #{@cask}." if download_failed?
+
       start_time = Time.now
       odebug "Cask::Installer#install"
 
@@ -162,18 +187,13 @@ module Cask
 
       prelude
 
-      print caveats
+      record_caveats
       fetch
       uninstall_existing_cask if reinstall?
 
       backup if force? && @cask.staged_path.exist? && @cask.metadata_versioned_path.exist?
 
       oh1 "Installing Cask #{Formatter.identifier(@cask)}"
-      # GitHub Actions globally disables Gatekeeper.
-      unless quarantine?
-        opoo_outside_github_actions "--no-quarantine bypasses macOS’s Gatekeeper, reducing system security. " \
-                                    "Do not use this flag unless you understand the risks."
-      end
       stage
 
       @cask.config = @cask.default_config.merge(old_config)
@@ -229,7 +249,7 @@ on_request: true)
         if (installed_caskfile = Caskroom.cask_installed_caskfile(conflicting_cask))
           raise CaskConflictError.new(
             @cask,
-            ::Cask::Cask.new(installed_caskfile.basename(installed_caskfile.extname).basename(".internal").to_s),
+            ::Cask::Cask.new(CaskLoader.token_from_path(installed_caskfile)),
           )
         end
 
@@ -260,14 +280,14 @@ on_request: true)
     sig { returns(Download) }
     def downloader
       @downloader ||= T.let(
-        (if @cask.loaded_from_internal_api? && !@cask.caskfile_only?
+        (if @cask.loaded_from_internal_api?
            Homebrew::API::CaskDownload.download(
              token:       @cask.token,
              cask_struct: Homebrew::API::Internal.cask_struct(@cask.token),
-             quarantine:  quarantine?,
+             languages:   @cask.config.languages,
              require_sha: require_sha? && !force?,
            )
-        end) || Download.new(@cask, quarantine: quarantine?, require_sha: require_sha? && !force?),
+        end) || Download.new(@cask, require_sha: require_sha? && !force?),
         T.nilable(Download),
       )
     end
@@ -293,6 +313,8 @@ on_request: true)
 
     sig { params(to: Pathname).void }
     def extract_primary_container(to: @cask.staged_path)
+      download(quiet: true) if @cask.download.nil?
+
       downloader.extract_primary_container(to:, verbose: verbose?)
     end
 
@@ -319,6 +341,7 @@ on_request: true)
           T.any(
             Artifact::AbstractFlightBlock,
             Artifact::GeneratedCompletion,
+            Artifact::GeneratedScript,
             Artifact::Installer,
             Artifact::KeyboardLayout,
             Artifact::Mdimporter,
@@ -361,7 +384,13 @@ on_request: true)
 
     sig { void }
     def check_requirements
+      if Homebrew::EnvConfig.no_sudo? && (artifact = @cask.artifacts.find(&:requires_sudo?))
+        raise CaskError,
+              "#{@cask}: The #{artifact.class.dsl_key} artifact requires sudo, but HOMEBREW_NO_SUDO is set."
+      end
+
       check_stanza_os_requirements
+      check_supported_system
       check_macos_requirements
       check_arch_requirements
     end
@@ -371,6 +400,17 @@ on_request: true)
       return if @cask.supports_macos?
 
       raise CaskError, "#{@cask}: This cask requires Linux."
+    end
+
+    sig { void }
+    def check_supported_system
+      # API data without an installable artifact means this system is unsupported.
+      # Source loads keep working for unaudited casks, e.g. naked containers.
+      return unless @cask.loaded_from_api?
+      return if @cask.installable_artifact?
+
+      os_name = Homebrew::SimulateSystem.simulating_or_running_on_macos? ? "macOS" : "Linux"
+      raise CaskError, "#{@cask}: This cask is not available on #{os_name}."
     end
 
     sig { void }
@@ -385,7 +425,7 @@ on_request: true)
     def check_arch_requirements
       return if @cask.depends_on.arch.nil?
 
-      @current_arch = T.let(@current_arch, T.nilable(T::Hash[Symbol, T.untyped]))
+      @current_arch = T.let(@current_arch, T.nilable(T::Hash[Symbol, T.nilable(T.any(Symbol, Integer))]))
       @current_arch ||= { type: Hardware::CPU.type, bits: Hardware::CPU.bits }
       return if @cask.depends_on.arch.any? do |arch|
         arch[:type] == @current_arch[:type] &&
@@ -413,7 +453,7 @@ on_request: true)
 
       @cask_and_formula_dependencies = graph.tsort_with_cycles do |cycles|
         cyclic_dependencies = cycles.sort_by(&:count).fetch(-1) - [@cask]
-        raise CaskCyclicDependencyError.new(@cask.token, cyclic_dependencies.to_sentence)
+        raise CaskCyclicDependencyError.new(@cask.token, ::Utils::Text.to_sentence(cyclic_dependencies))
       end - [@cask]
     end
 
@@ -427,6 +467,21 @@ on_request: true)
           cask_or_formula.installed?
         end
       end
+    end
+
+    sig { void }
+    def enqueue_dependency_downloads
+      return if download_failed? || !installed_on_request?
+
+      cask_installers, formula_installers = dependency_installers(defer_fetch: true)
+      if cask_installers.any?
+        Homebrew::Install.enqueue_cask_installers(cask_installers)
+      end
+      if formula_installers.any?
+        @dependency_formula_installers = Homebrew::Install.enqueue_formulae(formula_installers,
+                                                                            download_queue: @download_queue)
+      end
+      @dependencies_enqueued = true
     end
 
     sig { void }
@@ -445,15 +500,48 @@ on_request: true)
       end
 
       ohai "Installing dependencies: #{missing_formulae_and_casks.join(", ")}"
+      if skip_cask_deps?
+        missing_formulae_and_casks.grep(Cask).each do |dependency|
+          opoo "`--skip-cask-deps` is set; skipping installation of #{dependency}."
+        end
+      end
+
+      cask_installers, formula_installers = dependency_installers
+      if (failed_installer = cask_installers.find(&:download_failed?))
+        raise CaskError, "Dependency download failed for #{failed_installer.cask}."
+      end
+
+      cask_installers.reject { |installer| installer.cask.installed? }.each(&:install)
+      return if formula_installers.blank?
+
+      Homebrew::Install.perform_preinstall_checks_once
+      valid_formula_installers = if @dependencies_enqueued
+        Homebrew::Install.reject_failed_downloads(formula_installers, download_queue: @download_queue)
+      else
+        Homebrew::Install.fetch_formulae(formula_installers)
+      end
+      valid_formula_installers.each do |formula_installer|
+        next if formula_installer.formula.any_version_installed? && formula_installer.formula.optlinked?
+
+        formula_installer.install
+        formula_installer.finish
+      end
+    end
+
+    sig {
+      params(defer_fetch: T::Boolean)
+        .returns([T::Array[Installer], T::Array[FormulaInstaller]])
+    }
+    def dependency_installers(defer_fetch: false)
+      if @dependency_cask_installers && @dependency_formula_installers
+        return [@dependency_cask_installers, @dependency_formula_installers]
+      end
+
       cask_installers = T.let([], T::Array[Installer])
       formula_installers = T.let([], T::Array[FormulaInstaller])
-
-      missing_formulae_and_casks.each do |cask_or_formula|
+      missing_cask_and_formula_dependencies.each do |cask_or_formula|
         if cask_or_formula.is_a?(Cask)
-          if skip_cask_deps?
-            opoo "`--skip-cask-deps` is set; skipping installation of #{cask_or_formula}."
-            next
-          end
+          next if skip_cask_deps?
 
           cask_installers << Installer.new(
             cask_or_formula,
@@ -461,10 +549,11 @@ on_request: true)
             binaries:             binaries?,
             force:                false,
             installed_on_request: false,
-            quarantine:           quarantine?,
             quiet:                quiet?,
             require_sha:          require_sha?,
             verbose:              verbose?,
+            download_queue:       @download_queue,
+            defer_fetch:,
           )
         else
           formula_installers << FormulaInstaller.new(
@@ -478,20 +567,14 @@ on_request: true)
         end
       end
 
-      cask_installers.each(&:install)
-      return if formula_installers.blank?
-
-      Homebrew::Install.perform_preinstall_checks_once
-      valid_formula_installers = Homebrew::Install.fetch_formulae(formula_installers)
-      valid_formula_installers.each do |formula_installer|
-        formula_installer.install
-        formula_installer.finish
-      end
+      @dependency_cask_installers = cask_installers
+      @dependency_formula_installers = formula_installers
+      [cask_installers, formula_installers]
     end
 
-    sig { returns(T.nilable(String)) }
-    def caveats
-      self.class.caveats(@cask)
+    sig { void }
+    def record_caveats
+      self.class.record_caveats(@cask)
     end
 
     sig { returns(Pathname) }
@@ -516,7 +599,9 @@ on_request: true)
       if @cask.uninstall_flight_blocks?
         (metadata_subdir/"#{@cask.token}.rb").write @cask.source.to_s
       else
-        (metadata_subdir/"#{@cask.token}.json").write JSON.pretty_generate(@cask.to_installed_json_hash)
+        installed_json = @cask.to_installed_json_hash
+        installed_json["artifacts"] = [] if @cask.artifacts_list(uninstall_only: true).empty?
+        (metadata_subdir/"#{@cask.token}.json").write JSON.pretty_generate(installed_json)
       end
 
       FileUtils.rm_r(old_savedir) if old_savedir
@@ -538,6 +623,12 @@ on_request: true)
     def uninstall(successor: nil)
       load_installed_caskfile!
       oh1 "Uninstalling Cask #{Formatter.identifier(@cask)}"
+      if !reinstall? && !upgrade? && @installed_uninstall_artifacts_missing && artifacts.empty?
+        opoo <<~EOS
+          No uninstall artifact metadata is available for Cask '#{@cask}'.
+          Homebrew will remove its records, but files installed by the Cask may remain.
+        EOS
+      end
       uninstall_artifacts(clear: true, successor:)
       if !reinstall? && !upgrade?
         remove_tabfile
@@ -552,19 +643,19 @@ on_request: true)
     def remove_tabfile
       tabfile = @cask.tab.tabfile
       FileUtils.rm_f tabfile if tabfile
-      @cask.config_path.parent.rmdir_if_possible
+      rmdir_if_possible(@cask.config_path.parent)
     end
 
     sig { void }
     def remove_config_file
       FileUtils.rm_f @cask.config_path
-      @cask.config_path.parent.rmdir_if_possible
+      rmdir_if_possible(@cask.config_path.parent)
     end
 
     sig { void }
     def remove_download_sha
       FileUtils.rm_f @cask.download_sha_path
-      @cask.download_sha_path.parent.rmdir_if_possible
+      rmdir_if_possible(@cask.download_sha_path.parent)
     end
 
     sig { params(successor: T.nilable(Cask), quit: T::Boolean).void }
@@ -645,17 +736,13 @@ on_request: true)
           )
 
           odebug "Uninstalling artifact of class #{artifact.class}"
-          uninstall_options = {
-            command:   @command,
-            verbose:   verbose?,
-            skip:      clear,
-            force:     force?,
-            successor:,
-            upgrade:   upgrade?,
-            reinstall: reinstall?,
-          }
-          uninstall_options[:quit] = quit if artifact.is_a?(Artifact::Uninstall)
-          artifact.uninstall_phase(**uninstall_options)
+          if artifact.is_a?(Artifact::Uninstall)
+            artifact.uninstall_phase(command: @command, verbose: verbose?, skip: clear, force: force?, successor:,
+                                     upgrade: upgrade?, reinstall: reinstall?, quit:)
+          else
+            artifact.uninstall_phase(command: @command, verbose: verbose?, skip: clear, force: force?, successor:,
+                                     upgrade: upgrade?, reinstall: reinstall?)
+          end
         end
 
         next unless artifact.respond_to?(:post_uninstall_phase)
@@ -711,16 +798,17 @@ on_request: true)
     sig { void }
     def purge_backed_up_versioned_files
       # versioned staged distribution
-      gain_permissions_remove(T.must(backup_path)) if backup_path&.exist?
+      backup = backup_path
+      gain_permissions_remove(backup) if backup&.exist?
 
-      # Homebrew Cask metadata
+      # Cask metadata
       bmp = backup_metadata_path
       return unless bmp&.directory?
 
       bmp.children.each do |subdir|
         gain_permissions_remove(subdir)
       end
-      bmp.rmdir_if_possible
+      rmdir_if_possible(bmp)
     end
 
     sig { void }
@@ -730,34 +818,31 @@ on_request: true)
       # versioned staged distribution
       gain_permissions_remove(@cask.staged_path) if @cask.staged_path&.exist?
 
-      # Homebrew Cask metadata
+      # Cask metadata
       if @cask.metadata_versioned_path.directory?
         @cask.metadata_versioned_path.children.each do |subdir|
           gain_permissions_remove(subdir)
         end
 
-        @cask.metadata_versioned_path.rmdir_if_possible
+        rmdir_if_possible(@cask.metadata_versioned_path)
       end
-      @cask.metadata_main_container_path.rmdir_if_possible unless upgrade?
+      rmdir_if_possible(@cask.metadata_main_container_path) unless upgrade?
 
       # toplevel staged distribution
-      @cask.caskroom_path.rmdir_if_possible unless upgrade?
+      rmdir_if_possible(@cask.caskroom_path) unless upgrade?
 
-      # Remove symlinks for renamed casks if they are now broken.
-      @cask.old_tokens.each do |old_token|
-        old_caskroom_path = Caskroom.path/old_token
-        FileUtils.rm old_caskroom_path if old_caskroom_path.symlink? && !old_caskroom_path.exist?
-      end
+      remove_broken_caskroom_symlinks
     end
 
     sig { void }
     def purge_caskroom_path
       odebug "Purging all staged versions of Cask #{@cask}"
       gain_permissions_remove(@cask.caskroom_path)
+      remove_broken_caskroom_symlinks
     end
 
-    sig { params(cask_only: T::Boolean).void }
-    def forbidden_tap_check(cask_only: false)
+    sig { void }
+    def forbidden_tap_check
       return if Tap.allowed_taps.blank? && Tap.forbidden_taps.blank?
 
       owner = Homebrew::EnvConfig.forbidden_owner
@@ -779,7 +864,6 @@ on_request: true)
         raise CaskCannotBeInstalledError.new(@cask, cask_error_message)
       end
 
-      return if cask_only
       return if skip_cask_deps?
 
       cask_and_formula_dependencies.each do |cask_or_formula|
@@ -798,8 +882,8 @@ on_request: true)
       end
     end
 
-    sig { params(cask_only: T::Boolean).void }
-    def forbidden_cask_and_formula_check(cask_only: false)
+    sig { void }
+    def forbidden_cask_and_formula_check
       forbid_casks = Homebrew::EnvConfig.forbid_casks?
       forbidden_formulae = Set.new(Homebrew::EnvConfig.forbidden_formulae.to_s.split)
       forbidden_casks = Set.new(Homebrew::EnvConfig.forbidden_casks.to_s.split)
@@ -823,7 +907,6 @@ on_request: true)
         )
       end
 
-      return if cask_only
       return if skip_cask_deps?
 
       cask_and_formula_dependencies.each do |dep_cask_or_formula|
@@ -867,11 +950,7 @@ on_request: true)
       end
 
       artifacts.each do |artifact|
-        # Get the artifact class name (e.g., "Pkg", "Installer", "App")
-        artifact_name = artifact.class.name
-        next if artifact_name.nil?
-
-        artifact_type = artifact_name.split("::").last&.downcase
+        artifact_type = artifact.class.name.to_s.split("::").last&.downcase
         next if artifact_type.nil?
 
         next unless forbidden_artifacts.include?(artifact_type)
@@ -887,8 +966,9 @@ on_request: true)
     def prelude
       return if @ran_prelude
 
-      check_prelude_requirements unless @ran_prelude_fetch
-      load_cask_from_source_api! if cask_from_source_api?
+      check_deprecate_disable
+      check_conflicts
+      check_requirements
       forbidden_tap_check
       forbidden_cask_and_formula_check
       forbidden_cask_artifacts_check
@@ -896,71 +976,10 @@ on_request: true)
       @ran_prelude = true
     end
 
-    sig { returns(T::Boolean) }
-    def source_download_requires_pre_fetch?
-      cask_from_source_api? && @cask.languages.any?
-    end
-
-    sig { params(download_queue: Homebrew::DownloadQueue).void }
-    def prelude_fetch(download_queue: @download_queue)
-      return unless (download = prelude_fetch_download)
-
-      download_queue.enqueue(download)
-    end
-
-    sig { returns(T.nilable(Homebrew::API::SourceDownload)) }
-    def prelude_fetch_download
-      return if @ran_prelude_fetch
-
-      check_prelude_requirements
-      @ran_prelude_fetch = true
-      return unless source_download_requires_pre_fetch?
-
-      if source_download.downloaded?
-        source_download.verify_download_integrity(source_download.cached_download)
-        source_download.downloader.create_symlink_to_cached_download(source_download.cached_download)
-        return
-      end
-
-      source_download
-    end
-
     sig { void }
     def enqueue_downloads
-      download_queue = @download_queue
-      prelude_fetch(download_queue:) unless @ran_prelude_fetch
-
-      # FIXME: We need to load Cask source before enqueuing to support
-      # language-specific URLs, but this will block the main process.
-      if source_download_requires_pre_fetch?
-        load_cask_from_source_api!
-      elsif cask_from_source_api?
-        Homebrew::API::Cask.source_download(@cask, download_queue:, enqueue: true)
-      end
-
-      forbidden_tap_check
-      forbidden_cask_and_formula_check
-      forbidden_cask_artifacts_check
-
-      download_queue.enqueue(downloader)
-    end
-
-    private
-
-    sig { void }
-    def check_prelude_requirements
-      check_deprecate_disable
-      check_conflicts
-      check_requirements
-      # Run the cask-self forbidden checks before loading the caskfile from the
-      # Source API so a forbidden cask never triggers a network fetch.
-      forbidden_tap_check(cask_only: true)
-      forbidden_cask_and_formula_check(cask_only: true)
-    end
-
-    sig { returns(Homebrew::API::SourceDownload) }
-    def source_download
-      @source_download ||= Homebrew::API::Cask.source_download_for(@cask)
+      prelude
+      @download_queue.enqueue(downloader)
     end
 
     # load the same cask file that was used for installation, if possible
@@ -969,66 +988,86 @@ on_request: true)
       Migrator.migrate_if_needed(@cask)
 
       installed_caskfile = @cask.installed_caskfile
+      @installed_uninstall_artifacts_missing = installed_caskfile.is_a?(Pathname) &&
+                                               installed_uninstall_artifacts_missing?(installed_caskfile)
 
-      if installed_caskfile&.exist?
-        tab = @cask.tab
-        tap = tab.tap
-        if installed_caskfile.extname == ".rb" &&
-           Homebrew::EnvConfig.require_tap_trust? &&
-           tap &&
-           !Homebrew::Trust.trusted?(:cask, "#{tap.name}/#{@cask.token}")
-          opoo "Skipping loading untrusted Cask #{tap.name}/#{@cask.token}; uninstalling recorded artifacts only."
+      return unless installed_caskfile&.exist?
 
-          dsl = DSL.new(@cask)
-          default_uninstall_artifact_keys = DSL::ACTIVATABLE_ARTIFACT_CLASSES.filter_map do |klass|
-            next if [Artifact::Uninstall, Artifact::Zap].include?(klass)
-            next if !klass.method_defined?(:uninstall_phase) && !klass.method_defined?(:post_uninstall_phase)
+      tab = CaskLoader.load_installed_tab(@cask)
+      tap = tab.tap
+      tap ||= @cask.tap
+      if installed_caskfile.extname == ".rb" &&
+         Homebrew::EnvConfig.require_tap_trust? &&
+         tap &&
+         !Homebrew::Trust.trusted?(:cask, "#{tap.name}/#{@cask.token}")
+        opoo "Skipping loading untrusted Cask #{tap.name}/#{@cask.token}; uninstalling recorded artifacts only."
 
-            klass.dsl_key
-          end.to_set
-          Array(tab.uninstall_artifacts).each do |artifact_entry|
-            next unless artifact_entry.is_a?(Hash)
+        dsl = DSL.new(@cask)
+        default_uninstall_artifact_keys = DSL::ACTIVATABLE_ARTIFACT_CLASSES.filter_map do |klass|
+          next if [Artifact::Uninstall, Artifact::Zap].include?(klass)
+          next if !klass.method_defined?(:uninstall_phase) && !klass.method_defined?(:post_uninstall_phase)
 
-            artifact_entry.each do |raw_key, raw_args|
-              dsl_key = raw_key.to_sym
-              next unless default_uninstall_artifact_keys.include?(dsl_key)
+          klass.dsl_key
+        end.to_set
+        Array(tab.uninstall_artifacts).each do |artifact_entry|
+          next unless artifact_entry.is_a?(Hash)
 
-              args = Array(raw_args)
-              if args.last.is_a?(Hash)
-                dsl.public_send(
-                  dsl_key,
-                  *args[...-1],
-                  **T.cast(args.last, T::Hash[T.any(Symbol, String), T.anything]).transform_keys(&:to_sym),
-                )
-              else
-                dsl.public_send(dsl_key, *args)
-              end
+          artifact_entry.each do |raw_key, raw_args|
+            dsl_key = raw_key.to_sym
+            next unless default_uninstall_artifact_keys.include?(dsl_key)
+
+            args = Array(raw_args)
+            if args.last.is_a?(Hash)
+              dsl.public_send(
+                dsl_key,
+                *args[...-1],
+                **T.cast(args.last, T::Hash[T.any(Symbol, String), T.anything]).transform_keys(&:to_sym),
+              )
+            else
+              dsl.public_send(dsl_key, *args)
             end
           end
-          @default_uninstall_artifacts = dsl.artifacts
-          return
         end
-
-        begin
-          @cask = CaskLoader.load_from_installed_caskfile(installed_caskfile)
-          return
-        rescue CaskInvalidError, CaskUnavailableError, MethodDeprecatedError
-          # could be caused by trying to load outdated or deleted caskfile
-        end
+        @default_uninstall_artifacts ||= dsl.artifacts
+        return
       end
 
-      load_cask_from_source_api! if cask_from_source_api?
+      begin
+        @cask = CaskLoader.load_from_installed_caskfile(installed_caskfile)
+        return
+      rescue CaskInvalidError, CaskUnavailableError, MethodDeprecatedError
+        # could be caused by trying to load outdated or deleted caskfile
+      end
+
+      recovered_cask = CaskLoader.recover_from_installed_caskfile(installed_caskfile, tab:, fallback_cask: @cask)
       # otherwise we default to the current cask
+      @cask = recovered_cask if recovered_cask
     end
 
+    private
+
+    # Remove Caskroom symlinks (e.g. from cask renames) that removing this cask's
+    # directory has broken, whatever the symlink is named.
     sig { void }
-    def load_cask_from_source_api!
-      @cask = Homebrew::API::Cask.source_download_cask(@cask)
+    def remove_broken_caskroom_symlinks
+      return unless Caskroom.path.directory?
+
+      Caskroom.path.children.each do |link|
+        next if !link.symlink? || link.exist?
+        next if link.readlink.basename != @cask.caskroom_path.basename
+
+        FileUtils.rm link
+      end
     end
 
-    sig { returns(T::Boolean) }
-    def cask_from_source_api?
-      @cask.loaded_from_api? && @cask.caskfile_only?
+    sig { params(installed_caskfile: Pathname).returns(T::Boolean) }
+    def installed_uninstall_artifacts_missing?(installed_caskfile)
+      return false unless CaskLoader.installed_json_caskfile?(installed_caskfile)
+
+      installed_json = CaskLoader.load_installed_json(installed_caskfile)
+      return false if installed_json.nil? || installed_json.key?("artifacts")
+
+      CaskLoader.load_installed_tab(@cask).uninstall_artifacts.blank?
     end
   end
 end

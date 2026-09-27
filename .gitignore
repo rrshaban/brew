@@ -15,6 +15,7 @@
 /Library/Homebrew/test/.gem
 /Library/Homebrew/test/.cargo/
 /Library/Homebrew/test/.homebrew/
+/Library/Homebrew/test/.local/share/
 /Library/Homebrew/test/.subversion
 /Library/Homebrew/test/coverage
 /Library/Homebrew/test/junit
@@ -77,6 +78,7 @@
 
 # Ignore dependencies we don't wish to vendor
 **/vendor/bundle/ruby/*/gems/ast-*/
+**/vendor/bundle/ruby/*/gems/base64-*/
 **/vendor/bundle/ruby/*/gems/benchmark-*/
 **/vendor/bundle/ruby/*/gems/bigdecimal-*/
 **/vendor/bundle/ruby/*/gems/bootsnap-*/
@@ -195,8 +197,6 @@
 !/.editorconfig
 !/.gitignore
 !/.irb_config
-!/.licenses
-!/.licenses/**
 !/.ruby-version
 !/.shellcheckrc
 !/.vale.ini

@@ -7,6 +7,25 @@ require "cmd/shared_examples/args_parse"
 RSpec.describe Homebrew::Cmd::FetchCmd do
   it_behaves_like "parseable arguments"
 
+  it "does not run a formula's fetch hook until its dependencies are installed" do
+    cmd = described_class.new(["--build-from-source", "foo"])
+    dependency = formula("bar") do
+      T.bind(self, T.class_of(Formula))
+      url "bar-1.0"
+    end
+    foo = formula("foo") do
+      T.bind(self, T.class_of(Formula))
+      url "foo-1.0"
+
+      sig { void }
+      def fetch; end
+    end
+    allow(foo).to receive(:recursive_dependencies).and_return([instance_double(Dependency, to_formula: dependency)])
+    expect(FormulaInstaller).not_to receive(:new)
+
+    expect { cmd.run_fetch_hook(foo) }.to output(/brew install --only-dependencies foo/).to_stderr
+  end
+
   it "uses API bottle metadata before loading simple core formulae" do
     cmd = described_class.new(["fast-fetch"])
     download_queue = instance_double(Homebrew::DownloadQueue, fetch: nil, shutdown: nil)
@@ -32,10 +51,10 @@ RSpec.describe Homebrew::Cmd::FetchCmd do
     allow(download_queue).to receive(:enqueue) { |download| enqueued_downloads << download }
     allow(Homebrew::API::Internal).to receive_messages(
       formula_aliases: {},
-      formula_hashes:  { "fast-fetch" => {} },
       formula_renames: {},
       formula_struct:  formula_struct,
     )
+    allow(Homebrew::API::Internal).to receive(:formula_name?) { |name| name == "fast-fetch" }
 
     expect(cmd.args.named).not_to receive(:to_formulae_and_casks)
     expect(Formulary).not_to receive(:factory)
@@ -59,10 +78,10 @@ RSpec.describe Homebrew::Cmd::FetchCmd do
     allow(Homebrew::DownloadQueue).to receive(:new).and_return(download_queue)
     allow(download_queue).to receive(:enqueue) { |download| enqueued_downloads << download }
     allow(Homebrew::API::Internal).to receive_messages(
-      cask_hashes:  { "fast-cask" => {} },
       cask_renames: {},
       cask_struct:  cask_struct,
     )
+    allow(Homebrew::API::Internal).to receive(:cask_name?) { |token| token == "fast-cask" }
 
     expect(cmd.args.named).not_to receive(:to_formulae_and_casks)
     expect(Cask::CaskLoader).not_to receive(:load)
@@ -89,15 +108,20 @@ RSpec.describe Homebrew::Cmd::FetchCmd do
   describe "#cask_downloads", :cask do
     it "collects one download per distinct URL across all platforms" do
       cmd = described_class.new(["--cask", "--all-platforms", "sha256-os"])
-      basenames = cmd.send(:cask_downloads, Cask::CaskLoader.load("sha256-os"))
+      basenames = cmd.cask_downloads(Cask::CaskLoader.load("sha256-os"))
                      .map { |download| File.basename(download.url.to_s) }
       expect(basenames).to contain_exactly("caffeine-arm-darwin.zip", "caffeine-intel-darwin.zip",
                                            "caffeine-arm-linux.zip", "caffeine-intel-linux.zip")
     end
 
+    it "skips arches the cask's depends_on arch excludes" do
+      cmd = described_class.new(["--cask", "--os=macos", "--arch=intel", "depends-on-arch-arm64"])
+      expect(cmd.cask_downloads(Cask::CaskLoader.load("depends-on-arch-arm64"))).to be_empty
+    end
+
     it "collapses to a single download for a cask without on_system blocks" do
       cmd = described_class.new(["--cask", "--all-platforms", "local-caffeine"])
-      expect(cmd.send(:cask_downloads, Cask::CaskLoader.load("local-caffeine")).length).to eq(1)
+      expect(cmd.cask_downloads(Cask::CaskLoader.load("local-caffeine")).length).to eq(1)
     end
   end
 end

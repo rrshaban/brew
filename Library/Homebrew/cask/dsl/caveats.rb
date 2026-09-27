@@ -28,10 +28,16 @@ module Cask
         @invoked_caveats = T.let(Set.new, T::Set[Symbol])
       end
 
+      sig { returns(T::Array[Symbol]) }
+      def self.caveat_names
+        @caveat_names ||= T.let([], T.nilable(T::Array[Symbol]))
+      end
+
       sig {
         params(name: Symbol, block: T.proc.bind(Caveats).void).void
       }
       def self.caveat(name, &block)
+        caveat_names << name
         define_method(name) do |*args|
           T.bind(self, Caveats)
           key = [name, *args]
@@ -76,7 +82,7 @@ module Cask
         :built_in_caveat
       end
 
-      sig { params(block: T.proc.returns(T.nilable(T.any(Symbol, String)))).void }
+      sig { params(block: T.proc.bind(Caveats).returns(T.nilable(T.any(Symbol, String)))).void }
       def eval_caveats(&block)
         result = instance_eval(&block)
         return unless result
@@ -86,7 +92,7 @@ module Cask
       end
 
       caveat :kext do
-        next if MacOS.version < :sonoma
+        next unless OnSystem.os_condition_met?(:sonoma, :or_newer)
 
         <<~EOS
           #{cask} requires a kernel extension to work.
@@ -99,6 +105,8 @@ module Cask
       end
 
       caveat :unsigned_accessibility do |access = "Accessibility"|
+        next unless OnSystem.os_condition_met?(:macos)
+
         # access: the category in the privacy settings the app requires.
         access = "Accessibility" if access.nil?
 
@@ -135,7 +143,7 @@ module Cask
         <<~EOS
           Cask #{cask} installs files under /usr/local. The presence of such
           files can cause warnings when running `brew doctor`, which is considered
-          to be a bug in Homebrew Cask.
+          to be a bug in Homebrew's cask handling.
         EOS
       end
 
@@ -159,7 +167,9 @@ module Cask
       end
 
       caveat :requires_rosetta do
+        next unless OnSystem.os_condition_met?(:macos)
         next if Homebrew::SimulateSystem.current_arch != :arm
+        next if Hardware::CPU.rosetta_installed?
 
         <<~EOS
           #{cask} is built for Intel macOS and so requires Rosetta 2 to be installed.

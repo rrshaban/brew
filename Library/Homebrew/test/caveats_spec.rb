@@ -1,6 +1,8 @@
 # typed: true
 # frozen_string_literal: true
 
+require "utils/shell"
+
 require "formula"
 require "caveats"
 
@@ -263,7 +265,7 @@ RSpec.describe Caveats do
         let(:caveats) { described_class.new(f).caveats }
 
         it "adds the correct amount of new lines to the output" do
-          expect(Utils::Service).to receive(:launchctl?).at_least(:once).and_return(true)
+          allow(Utils::Service).to receive_messages(running?: false, systemctl?: true)
           expect(caveats).to include("something else")
           expect(caveats).to include("keg-only")
           expect(caveats).to include("if you don't want/need a background service")
@@ -469,7 +471,7 @@ RSpec.describe Caveats do
         end
       end
       let(:caveats) { described_class.new(f) }
-      let(:path) { f.prefix.resolved_path }
+      let(:path) { Utils::Path.resolved_path(f.prefix) }
 
       let(:bash_completion_dir) { path/"etc/bash_completion.d" }
       let(:fish_vendor_completions) { path/"share/fish/vendor_completions.d" }

@@ -15,7 +15,7 @@ module Utils
   #   `ActiveSupport::Inflector.deconstantize`
   sig { params(path: String).returns(String) }
   def self.deconstantize(path)
-    T.must(path[0, path.rindex("::") || 0]) # implementation based on the one in facets' Module#spacename
+    path.rpartition("::").first
   end
 
   # Removes the module part from the expression in the string.
@@ -33,11 +33,7 @@ module Utils
   def self.demodulize(path)
     raise ArgumentError, "No constant path provided" if path.nil?
 
-    if (i = path.rindex("::"))
-      T.must(path[(i + 2)..])
-    else
-      path
-    end
+    path.rpartition("::").last
   end
 
   sig { params(full_name: String).returns(String) }
@@ -50,6 +46,17 @@ module Utils
   sig { params(formula_or_cask: T.any(Formula, Cask::Cask)).returns(String) }
   def self.name_or_token(formula_or_cask)
     formula_or_cask.is_a?(Cask::Cask) ? formula_or_cask.token : formula_or_cask.name
+  end
+
+  # Returns the package name with its tap, including core taps, or its full name if tapless.
+  sig { params(formula_or_cask: T.any(Formula, Cask::Cask)).returns(String) }
+  def self.fully_qualified_name(formula_or_cask)
+    tap = formula_or_cask.tap
+    if tap && (tap.core_tap? || tap.core_cask_tap?)
+      "#{tap.name}/#{formula_or_cask.full_name}"
+    else
+      formula_or_cask.full_name
+    end
   end
 
   sig { params(full_name: String).returns(T.nilable(String)) }
@@ -112,6 +119,15 @@ module Utils
     "#{prefix}#{stem}#{suffix}"
   end
 
+  # Sleeps for an exponentially increasing wait (`base ** try` seconds), yielding
+  # the wait time first so callers can print a message before sleeping.
+  sig { params(try: Integer, base: Integer, _blk: T.nilable(T.proc.params(wait: Integer).void)).void }
+  def self.exponential_backoff_sleep(try, base: 2, &_blk)
+    wait = base.pow(try)
+    yield wait if block_given?
+    sleep wait
+  end
+
   sig { params(author: String).returns({ email: String, name: String }) }
   def self.parse_author!(author)
     match_data = /^(?<name>[^<]+?)[ \t]*<(?<email>[^>]+?)>$/.match(author)
@@ -119,9 +135,9 @@ module Utils
       name = match_data[:name]
       email = match_data[:email]
     end
-    raise UsageError, "Unable to parse name and email." if name.blank? && email.blank?
+    raise UsageError, "Unable to parse name and email." if name.nil? || email.nil?
 
-    { name: T.must(name), email: T.must(email) }
+    { name:, email: }
   end
 
   # Makes an underscored, lowercase form from the expression in the string.
@@ -138,9 +154,7 @@ module Utils
     return camel_cased_word.to_s unless /[A-Z-]|::/.match?(camel_cased_word)
 
     word = camel_cased_word.to_s.gsub("::", "/")
-    word.gsub!(/([A-Z])(?=[A-Z][a-z])|([a-z\d])(?=[A-Z])/) do
-      T.must(::Regexp.last_match(1) || ::Regexp.last_match(2)) << "_"
-    end
+    word.gsub!(/[A-Z](?=[A-Z][a-z])|[a-z\d](?=[A-Z])/, '\0_')
     word.tr!("-", "_")
     word.downcase!
     word
@@ -166,7 +180,7 @@ module Utils
   #   convert_to_string_or_symbol("example")  # => "example"
   sig { params(string: String).returns(T.any(String, Symbol)) }
   def self.convert_to_string_or_symbol(string)
-    return T.must(string[1..]).to_sym if string.start_with?(":")
+    return string.delete_prefix(":").to_sym if string.start_with?(":")
 
     string
   end
@@ -201,7 +215,7 @@ module Utils
       if obj.start_with?("\\")
         obj[1..]
       elsif obj.start_with?(":")
-        T.must(obj[1..]).to_sym
+        obj.delete_prefix(":").to_sym
       else
         obj
       end
@@ -216,21 +230,25 @@ module Utils
 
   sig {
     type_parameters(:U)
-      .params(obj: T.all(T.type_parameter(:U), Object), compact_zero: T::Boolean)
+      .params(obj: T.all(T.type_parameter(:U), Object), compact_zero: T::Boolean, compact_false: T::Boolean)
       .returns(T.nilable(T.type_parameter(:U)))
   }
-  def self.deep_compact_blank(obj, compact_zero: true)
+  def self.deep_compact_blank(obj, compact_zero: true, compact_false: true)
     obj = case obj
     when Hash
-      obj.transform_values { |v| deep_compact_blank(v, compact_zero:) }
+      obj.transform_values { |v| deep_compact_blank(v, compact_zero:, compact_false:) }
          .compact
     when Array
-      obj.filter_map { |v| deep_compact_blank(v, compact_zero:) }
+      obj.each_with_object([]) do |v, compacted|
+        value = deep_compact_blank(v, compact_zero:, compact_false:)
+        compacted << value unless value.nil?
+      end
     else
       obj
     end
 
-    return if obj.blank? || (compact_zero && obj.is_a?(Numeric) && obj.zero?)
+    return if (compact_false || obj != false) &&
+              (obj.blank? || (compact_zero && obj.is_a?(Numeric) && obj.zero?))
 
     obj
   end

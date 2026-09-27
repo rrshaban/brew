@@ -31,7 +31,7 @@ module Stdenv
 
     # Set the default pkg-config search path, overriding the built-in paths
     # Anything in PKG_CONFIG_PATH is searched before paths in this variable
-    self["PKG_CONFIG_LIBDIR"] = determine_pkg_config_libdir
+    self["PKG_CONFIG_LIBDIR"] = determine_pkg_config_libdir&.to_s
 
     self["MAKEFLAGS"] = "-j#{make_jobs}"
     self["RUSTC_WRAPPER"] = "#{HOMEBREW_SHIMS_PATH}/shared/rustc_wrapper"
@@ -68,6 +68,11 @@ module Stdenv
 
     gcc_formula = gcc_version_formula(cc)
     append_path "PATH", gcc_formula.opt_bin.to_s
+  end
+
+  sig { void }
+  def libxml2
+    odeprecated "ENV.libxml2", "`pkg-config` or explicit include paths"
   end
 
   sig { returns(T.nilable(PATH)) }
@@ -171,10 +176,10 @@ module Stdenv
   def set_cpu_flags(flags, map = Hardware::CPU.optimization_flags)
     cflags =~ /(-Xarch_#{Hardware::CPU.arch_32_bit} )-march=/
     xarch = Regexp.last_match(1).to_s
-    remove flags, /(-Xarch_#{Hardware::CPU.arch_32_bit} )?-march=\S*/
-    remove flags, /( -Xclang \S+)+/
+    remove flags, /(?:-Xarch_#{Hardware::CPU.arch_32_bit} )?-march=\S*/
+    remove flags, /(?: -Xclang \S+)+/
     remove flags, /-mssse3/
-    remove flags, /-msse4(\.\d)?/
+    remove flags, /-msse4(?:\.\d)?/
     append flags, xarch unless xarch.empty?
     append flags, map.fetch(effective_arch)
   end

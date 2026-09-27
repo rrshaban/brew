@@ -7,7 +7,16 @@ require "cmd/shared_examples/args_parse"
 RSpec.describe Homebrew::Cmd::UninstallCmd do
   it_behaves_like "parseable arguments"
 
-  it "uninstalls a given Formula", :integration_test do
+  it "uninstalls a given Formula and Cask path", :cask, :integration_test do
+    tap = CoreCaskTap.instance
+    cask_file = tap.cask_dir/"l/local-caffeine.rb"
+    cask_file.dirname.mkpath
+    FileUtils.cp cask_path("local-caffeine"), cask_file
+    tap.clear_cache
+    cask = Cask::CaskLoader.load(cask_file)
+    InstallHelper.stub_cask_installation(cask)
+    appdir = Pathname(cask.config.appdir)
+
     setup_test_formula "testball", tab_attributes: { installed_on_request: true }
 
     expect(HOMEBREW_CELLAR/"testball").to exist
@@ -16,6 +25,23 @@ RSpec.describe Homebrew::Cmd::UninstallCmd do
       .and not_to_output.to_stderr
       .and be_a_success
     expect(HOMEBREW_CELLAR/"testball").not_to exist
+
+    Dir.chdir(tap.path) do
+      ENV["HOMEBREW_FORBID_PACKAGES_FROM_PATHS"] = "1"
+      ENV["HOMEBREW_NO_INSTALL_FROM_API"] = nil
+      expect do
+        brew "uninstall", "--cask", "./Casks/l/local-caffeine.rb",
+             "HOMEBREW_CASK_OPTS" => "--appdir=#{appdir}"
+      end
+        .to output(/Uninstalling Cask local-caffeine/).to_stdout
+        .and not_to_output.to_stderr
+        .and be_a_success
+    end
+
+    expect(appdir/"Caffeine.app").not_to exist
+    expect(Cask::Caskroom.cask_installed?("local-caffeine")).to be(false)
+  ensure
+    FileUtils.rm_rf tap.path if tap
   end
 
   it "catches cask uninstall errors and sets Homebrew.failed" do
@@ -60,9 +86,9 @@ RSpec.describe Homebrew::Cmd::UninstallCmd do
     FileUtils.cp cask_path("local-caffeine"), cask_file
     tap.clear_cache
 
-    cask = with_env(HOMEBREW_NO_REQUIRE_TAP_TRUST: "1") do
-      Cask::CaskLoader.load(full_name).tap { |cask| Cask::Installer.new(cask).install }
-    end
+    Homebrew::Trust.trust!(:tap, tap)
+    cask = Cask::CaskLoader.load(full_name).tap { |loaded_cask| Cask::Installer.new(loaded_cask).install }
+    Homebrew::Trust.untrust!(:tap, tap.name)
     cask_file.write <<~RUBY
       raise "untrusted tap cask evaluated"
     RUBY
@@ -76,12 +102,10 @@ RSpec.describe Homebrew::Cmd::UninstallCmd do
     original_argv = ARGV.dup
     begin
       ARGV.replace(["--cask", "--force", full_name])
-      with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1", HOMEBREW_NO_REQUIRE_TAP_TRUST: nil) do
-        expect { described_class.new(["--cask", "--force", full_name]).run }
-          .to output(/Uninstalling Cask local-caffeine/).to_stdout
-          .and output(/Skipping loading untrusted Cask #{full_name}; uninstalling recorded artifacts only/).to_stderr
-          .and not_to_output(/untrusted .* cask evaluated/).to_stderr
-      end
+      expect { described_class.new(["--cask", "--force", full_name]).run }
+        .to output(/Uninstalling Cask local-caffeine/).to_stdout
+        .and output(/Skipping loading untrusted Cask #{full_name}; uninstalling recorded artifacts only/).to_stderr
+        .and not_to_output(/untrusted .* cask evaluated/).to_stderr
     ensure
       ARGV.replace(original_argv)
       FileUtils.rm_rf tap.path.parent
@@ -99,9 +123,9 @@ RSpec.describe Homebrew::Cmd::UninstallCmd do
     FileUtils.cp cask_path("local-caffeine"), cask_file
     tap.clear_cache
 
-    cask = with_env(HOMEBREW_NO_REQUIRE_TAP_TRUST: "1") do
-      Cask::CaskLoader.load(full_name).tap { |cask| Cask::Installer.new(cask).install }
-    end
+    Homebrew::Trust.trust!(:tap, tap)
+    cask = Cask::CaskLoader.load(full_name).tap { |loaded_cask| Cask::Installer.new(loaded_cask).install }
+    Homebrew::Trust.untrust!(:tap, tap.name)
     cask_file.write <<~RUBY
       raise "untrusted tap cask evaluated"
     RUBY
@@ -113,12 +137,10 @@ RSpec.describe Homebrew::Cmd::UninstallCmd do
     original_argv = ARGV.dup
     begin
       ARGV.replace(["--cask", "--force", full_name])
-      with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1", HOMEBREW_NO_REQUIRE_TAP_TRUST: nil) do
-        expect { described_class.new(["--cask", "--force", full_name]).run }
-          .to output(/Uninstalling Cask local-caffeine/).to_stdout
-          .and not_to_output(/Skipping loading untrusted Cask/).to_stderr
-          .and not_to_output(/untrusted .* cask evaluated/).to_stderr
-      end
+      expect { described_class.new(["--cask", "--force", full_name]).run }
+        .to output(/Uninstalling Cask local-caffeine/).to_stdout
+        .and not_to_output(/Skipping loading untrusted Cask/).to_stderr
+        .and not_to_output(/untrusted .* cask evaluated/).to_stderr
     ensure
       ARGV.replace(original_argv)
       FileUtils.rm_rf tap.path.parent

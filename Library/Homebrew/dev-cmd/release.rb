@@ -1,6 +1,9 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "system_command"
+require "utils/browser"
+
 require "abstract_command"
 
 module Homebrew
@@ -37,9 +40,23 @@ module Homebrew
 
       sig { override.void }
       def run
-        safe_system "git", "-C", HOMEBREW_REPOSITORY, "fetch", "origin" if Homebrew::EnvConfig.no_auto_update?
+        SystemCommand.safe_system "git", "-C", HOMEBREW_REPOSITORY, "fetch", "origin" if Homebrew::EnvConfig.no_auto_update?
 
         require "utils/github"
+
+        # Keep in sync with the "Check for release blockers" step in
+        # .github/workflows/release.yml.
+        blocking_labels = ["release blocker"]
+        blocking_labels << "major/minor release blocker" if args.major? || args.minor?
+        release_blockers = blocking_labels.flat_map do |label|
+          GitHub.issues(repo: "Homebrew/brew", state: "open", labels: label)
+        rescue *GitHub::API::ERRORS => e
+          odie "Unable to check for release blockers: #{e.message}!"
+        end
+        if release_blockers.present?
+          blocker_urls = release_urls(release_blockers).uniq.join("\n")
+          odie "Open issues or pull requests are blocking this release:\n#{blocker_urls}"
+        end
 
         begin
           latest_release = GitHub.get_latest_release "Homebrew", "brew"
@@ -212,10 +229,8 @@ module Homebrew
           releases_page_url
         end
         puts "  #{Formatter.url(release_url)}"
-        exec_browser release_url
+        Utils::Browser.open release_url
       end
-
-      private
 
       sig { params(name: String).returns(T::Array[T::Hash[String, T.untyped]]) }
       def matching_releases(name)
@@ -239,6 +254,8 @@ module Homebrew
           Time.at(0)
         end
       end
+
+      private
 
       sig { params(releases: T::Array[T::Hash[String, T.untyped]]).returns(T::Array[String]) }
       def release_urls(releases)

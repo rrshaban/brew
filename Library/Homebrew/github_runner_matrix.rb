@@ -3,42 +3,21 @@
 
 require "test_runner_formula"
 require "github_runner"
+require "bottle_transition"
+require "utils/output"
 
 class GitHubRunnerMatrix
+  include Utils::Output::Mixin
+
   # When bumping newest runner, run e.g. `git log -p --reverse -G "sha256 tahoe"`
   # on homebrew/core and tag the first commit with a bottle e.g.
   # `git tag 15-sequoia f42c4a659e4da887fc714f8f41cc26794a4bb320`
   # to allow people to jump to specific commits based on their macOS version.
-  NEWEST_HOMEBREW_CORE_MACOS_RUNNER = :tahoe
-  OLDEST_HOMEBREW_CORE_MACOS_RUNNER = :sonoma
-  NEWEST_HOMEBREW_CORE_INTEL_MACOS_RUNNER = :sonoma
+  NEWEST_HOMEBREW_CORE_MACOS_RUNNER = :golden_gate
+  OLDEST_HOMEBREW_CORE_MACOS_RUNNER = :sequoia
 
   RunnerSpec = T.type_alias { T.any(LinuxRunnerSpec, MacOSRunnerSpec) }
   private_constant :RunnerSpec
-
-  MacOSRunnerSpecHash = T.type_alias do
-    {
-      name:             String,
-      runner:           String,
-      timeout:          Integer,
-      cleanup:          T::Boolean,
-      testing_formulae: String,
-    }
-  end
-  private_constant :MacOSRunnerSpecHash
-
-  LinuxRunnerSpecHash = T.type_alias do
-    {
-      name:             String,
-      runner:           String,
-      container:        T::Hash[Symbol, String],
-      workdir:          String,
-      timeout:          Integer,
-      cleanup:          T::Boolean,
-      testing_formulae: String,
-    }
-  end
-  private_constant :LinuxRunnerSpecHash
 
   RunnerSpecHash = T.type_alias { T::Hash[Symbol, T.untyped] }
   private_constant :RunnerSpecHash
@@ -108,6 +87,75 @@ class GitHubRunnerMatrix
     end
   end
 
+  sig { void }
+  def generate_runners!
+    return if @runners.present?
+
+    if !@all_supported || @linux_self_hosted
+      VALID_ARCHES.each do |arch|
+        @runners << create_runner(:linux, arch, linux_runner_spec(arch, self_hosted: @linux_self_hosted))
+      end
+    end
+
+    # Portable Ruby logic
+    if @testing_formulae.any? { |tf| tf.name.start_with?("portable-") }
+      x86_64_spec = MacOSRunnerSpec.new(
+        name:         "macOS 11-cross x86_64",
+        runner:       "macos-15-intel",
+        timeout:      GITHUB_ACTIONS_RUNNER_TIMEOUT,
+        cleanup:      true,
+        target_macos: "11.7.10",
+      )
+      x86_64_macos_version = MacOSVersion.new("11")
+      @runners << create_runner(:macos, :x86_64, x86_64_spec, x86_64_macos_version)
+
+      # odisabled: remove support for Big Sur September (or later) 2027
+      arm64_spec = MacOSRunnerSpec.new(
+        name:    "macOS 11-cross arm64",
+        runner:  "11-arm64-cross-#{@github_run_id}",
+        timeout: GITHUB_ACTIONS_LONG_TIMEOUT,
+        cleanup: true,
+      )
+      arm64_macos_version = MacOSVersion.new("11")
+      @runners << create_runner(:macos, :arm64, arm64_spec, arm64_macos_version)
+      return
+    end
+
+    # Use GitHub Actions macOS Runner for testing dependents if compatible with timeout.
+    use_github_runner = ENV.fetch("HOMEBREW_MACOS_BUILD_ON_GITHUB_RUNNER", "false") == "true"
+    use_github_runner ||= @dependent_matrix
+    use_github_runner &&= @runner_timeout <= GITHUB_ACTIONS_RUNNER_TIMEOUT
+
+    MacOSVersion::SYMBOLS.each_value do |version|
+      macos_version = MacOSVersion.new(version)
+      next unless runner_enabled?(macos_version)
+
+      github_runner_available = macos_version.between?(OLDEST_GITHUB_ACTIONS_ARM_MACOS_RUNNER,
+                                                       NEWEST_GITHUB_ACTIONS_ARM_MACOS_RUNNER)
+
+      runner, timeout = if use_github_runner && github_runner_available
+        prefix = (macos_version >= "27") ? "xcode" : "macos"
+        ["#{prefix}-#{version}", GITHUB_ACTIONS_RUNNER_TIMEOUT]
+      elsif macos_version >= :monterey
+        ["#{version}-arm64#{ephemeral_suffix}", @runner_timeout]
+      else
+        ["#{version}-arm64", @runner_timeout]
+      end
+
+      # Testing recursive dependents takes longer, so give those jobs two hours.
+      timeout *= 2 if @dependent_matrix && timeout < GITHUB_ACTIONS_RUNNER_TIMEOUT
+      spec = MacOSRunnerSpec.new(
+        name:    "macOS #{version}-arm64",
+        runner:,
+        timeout:,
+        cleanup: !runner.end_with?(ephemeral_suffix),
+      )
+      @runners << create_runner(:macos, :arm64, spec, macos_version)
+    end
+
+    @runners.freeze
+  end
+
   private
 
   # ARM macOS timeout, keep this under 1/2 of GitHub's job execution time limit for self-hosted runners.
@@ -125,11 +173,9 @@ class GitHubRunnerMatrix
     end
 
     unless self_hosted
-      options = %w[--user linuxbrew]
-      options << "--privileged" if Homebrew::EnvConfig.sandbox_linux?
       container = {
         image:   "ghcr.io/homebrew/brew:main",
-        options: options.join(" "),
+        options: "--init --user linuxbrew",
       }
       workdir = "/github/home"
     end
@@ -168,7 +214,77 @@ class GitHubRunnerMatrix
 
   sig { params(macos_version: MacOSVersion).returns(T::Boolean) }
   def runner_enabled?(macos_version)
-    macos_version.between?(OLDEST_HOMEBREW_CORE_MACOS_RUNNER, NEWEST_HOMEBREW_CORE_MACOS_RUNNER)
+    return true if macos_version.between?(OLDEST_HOMEBREW_CORE_MACOS_RUNNER, NEWEST_HOMEBREW_CORE_MACOS_RUNNER)
+    return false if @all_supported || @dependent_matrix
+
+    macos_version.to_sym == BottleTransition::MACOS && transition_formulae.present?
+  end
+
+  sig { returns(T::Array[TestRunnerFormula]) }
+  def transition_formulae
+    @transition_formulae ||= T.let(begin
+      transition = BottleTransition.new
+      covered = @testing_formulae.select { |formula| transition.required?(formula.formula) }
+      needed_names = []
+      testing_names = @testing_formulae.map(&:name)
+
+      Homebrew::SimulateSystem.with(os: BottleTransition::MACOS, arch: :arm) do
+        covered.each do |formula|
+          dependencies = Formulary.factory(formula.name).recursive_dependencies do |dependent, dependency|
+            next Dependable::PRUNE if dependency.optional?
+
+            if dependency.test? && !dependency.build? && testing_names.exclude?(dependency.name) &&
+               transition_test_dependency_bottled?(dependency.to_formula)
+              next Dependable::PRUNE
+            end
+            if dependency.is_a?(UsesFromMacOSDependency) && dependency.use_macos_install?
+              next Dependable::PRUNE
+            end
+            next unless dependent.is_a?(Formula)
+            next unless dependency.build?
+            next if testing_names.include?(dependent.name)
+
+            Dependable::PRUNE unless dependent.bottle_specification.tag?(Utils::Bottles.tag(:all))
+          end
+          missing = dependencies.reject do |dependency|
+            dependency_formula = dependency.to_formula
+            if testing_names.include?(dependency.name)
+              candidate = TestRunnerFormula.new(dependency_formula)
+              candidate.compatible?(platform: :macos, arch: :arm64,
+                                    macos_version: BottleTransition.tag.to_macos_version)
+            else
+              dependency_formula.bottle_specification.tag?(BottleTransition.tag, no_older_versions: true)
+            end
+          end
+          if missing.present?
+            opoo <<~EOS
+              Skipping #{formula.name}'s #{BottleTransition.tag} build: unavailable dependencies: #{missing.map(&:name).join(", ")}.
+              Resolve these dependencies and retry CI before publishing.
+            EOS
+            next
+          end
+
+          needed_names << formula.name
+          needed_names.concat(dependencies.map(&:name) & testing_names)
+        end
+      end
+
+      @testing_formulae.select { |formula| needed_names.include?(formula.name) }
+    end, T.nilable(T::Array[TestRunnerFormula]))
+  end
+
+  sig { params(formula: Formula).returns(T::Boolean) }
+  def transition_test_dependency_bottled?(formula)
+    spec = formula.bottle_specification
+    if spec.tag?(Utils::Bottles.tag(:all))
+      return formula.deps.all? { |dependency| transition_test_dependency_bottled?(dependency.to_formula) }
+    end
+
+    # Runner selection also runs on Linux, without macOS bottle fallback.
+    spec.collector.tags.any? do |tag|
+      tag.macos? && tag.standardized_arch == BottleTransition.tag.standardized_arch &&
+        tag.to_macos_version <= BottleTransition.tag.to_macos_version
+    end
   end
 
   sig { returns(String) }
@@ -181,110 +297,11 @@ class GitHubRunnerMatrix
     end, T.nilable(String))
   end
 
-  NEWEST_GITHUB_ACTIONS_INTEL_MACOS_RUNNER = :ventura
-  OLDEST_GITHUB_ACTIONS_INTEL_MACOS_RUNNER = :ventura
-  NEWEST_GITHUB_ACTIONS_ARM_MACOS_RUNNER = :tahoe
+  NEWEST_GITHUB_ACTIONS_ARM_MACOS_RUNNER = :golden_gate
   OLDEST_GITHUB_ACTIONS_ARM_MACOS_RUNNER = :sonoma
   GITHUB_ACTIONS_RUNNER_TIMEOUT = 360
-  private_constant :NEWEST_GITHUB_ACTIONS_INTEL_MACOS_RUNNER, :OLDEST_GITHUB_ACTIONS_INTEL_MACOS_RUNNER,
-                   :NEWEST_GITHUB_ACTIONS_ARM_MACOS_RUNNER, :OLDEST_GITHUB_ACTIONS_ARM_MACOS_RUNNER,
+  private_constant :NEWEST_GITHUB_ACTIONS_ARM_MACOS_RUNNER, :OLDEST_GITHUB_ACTIONS_ARM_MACOS_RUNNER,
                    :GITHUB_ACTIONS_RUNNER_TIMEOUT
-
-  sig { void }
-  def generate_runners!
-    return if @runners.present?
-
-    if !@all_supported || @linux_self_hosted
-      VALID_ARCHES.each do |arch|
-        @runners << create_runner(:linux, arch, linux_runner_spec(arch, self_hosted: @linux_self_hosted))
-      end
-    end
-
-    # Portable Ruby logic
-    if @testing_formulae.any? { |tf| tf.name.start_with?("portable-") }
-      x86_64_spec = MacOSRunnerSpec.new(
-        name:    "macOS 10.15-cross x86_64",
-        runner:  "10.15-cross-#{@github_run_id}",
-        timeout: GITHUB_ACTIONS_LONG_TIMEOUT,
-        cleanup: true,
-      )
-      x86_64_macos_version = MacOSVersion.new("10.15")
-      @runners << create_runner(:macos, :x86_64, x86_64_spec, x86_64_macos_version)
-
-      # odisabled: remove support for Big Sur September (or later) 2027
-      arm64_spec = MacOSRunnerSpec.new(
-        name:    "macOS 11-cross arm64",
-        runner:  "11-arm64-cross-#{@github_run_id}",
-        timeout: GITHUB_ACTIONS_LONG_TIMEOUT,
-        cleanup: true,
-      )
-      arm64_macos_version = MacOSVersion.new("11")
-      @runners << create_runner(:macos, :arm64, arm64_spec, arm64_macos_version)
-      return
-    end
-
-    # Use GitHub Actions macOS Runner for testing dependents if compatible with timeout.
-    use_github_runner = ENV.fetch("HOMEBREW_MACOS_BUILD_ON_GITHUB_RUNNER", "false") == "true"
-    use_github_runner ||= @dependent_matrix
-    use_github_runner &&= @runner_timeout <= GITHUB_ACTIONS_RUNNER_TIMEOUT
-
-    MacOSVersion::SYMBOLS.each_value do |version|
-      macos_version = MacOSVersion.new(version)
-      next unless runner_enabled?(macos_version)
-
-      github_runner_available = macos_version.between?(OLDEST_GITHUB_ACTIONS_ARM_MACOS_RUNNER,
-                                                       NEWEST_GITHUB_ACTIONS_ARM_MACOS_RUNNER)
-
-      runner, timeout = if use_github_runner && github_runner_available
-        ["macos-#{version}", GITHUB_ACTIONS_RUNNER_TIMEOUT]
-      elsif macos_version >= :monterey
-        ["#{version}-arm64#{ephemeral_suffix}", @runner_timeout]
-      else
-        ["#{version}-arm64", @runner_timeout]
-      end
-
-      # We test recursive dependents on ARM macOS, so they can be slower than our Intel runners.
-      timeout *= 2 if @dependent_matrix && timeout < GITHUB_ACTIONS_RUNNER_TIMEOUT
-      spec = MacOSRunnerSpec.new(
-        name:    "macOS #{version}-arm64",
-        runner:,
-        timeout:,
-        cleanup: !runner.end_with?(ephemeral_suffix),
-      )
-      @runners << create_runner(:macos, :arm64, spec, macos_version)
-
-      skip_intel_runner = !@all_supported && macos_version > NEWEST_HOMEBREW_CORE_INTEL_MACOS_RUNNER
-      skip_intel_runner &&= @dependent_matrix || @testing_formulae.none? do |testing_formula|
-        bottle_spec = testing_formula.formula.bottle_specification
-        bottle_spec.tag?(Utils::Bottles.tag(macos_version.to_sym), no_older_versions: true) &&
-          !bottle_spec.tag?(Utils::Bottles.tag(:all), no_older_versions: true)
-      end
-      next if skip_intel_runner
-
-      github_runner_available = macos_version.between?(OLDEST_GITHUB_ACTIONS_INTEL_MACOS_RUNNER,
-                                                       NEWEST_GITHUB_ACTIONS_INTEL_MACOS_RUNNER)
-
-      runner, timeout = if use_github_runner && github_runner_available
-        ["macos-#{version}", GITHUB_ACTIONS_RUNNER_TIMEOUT]
-      else
-        ["#{version}-x86_64#{ephemeral_suffix}", @runner_timeout]
-      end
-
-      # macOS 12-x86_64 is usually slower.
-      timeout += 30 if macos_version <= :monterey
-      # The ARM runners are typically over twice as fast as the Intel runners.
-      timeout *= 2 if !(use_github_runner && github_runner_available) && timeout < GITHUB_ACTIONS_LONG_TIMEOUT
-      spec = MacOSRunnerSpec.new(
-        name:    "macOS #{version}-x86_64",
-        runner:,
-        timeout:,
-        cleanup: !runner.end_with?(ephemeral_suffix),
-      )
-      @runners << create_runner(:macos, :x86_64, spec, macos_version)
-    end
-
-    @runners.freeze
-  end
 
   sig { params(runner: GitHubRunner).returns(T::Array[String]) }
   def testable_formulae(runner)
@@ -312,13 +329,14 @@ class GitHubRunnerMatrix
       arch = runner.arch
       macos_version = runner.macos_version
 
-      @testing_formulae.select do |formula|
-        Homebrew::SimulateSystem.with(os: platform, arch: Homebrew::SimulateSystem.arch_symbols.fetch(arch)) do
-          simulated_formula = TestRunnerFormula.new(Formulary.factory(formula.name))
-          next false if macos_version && !simulated_formula.compatible_with?(macos_version)
+      transition_runner = BottleTransition.active? && macos_version&.to_sym == BottleTransition::MACOS
+      testing_formulae = transition_runner ? transition_formulae : @testing_formulae
+      os = transition_runner ? BottleTransition::MACOS : platform
 
-          simulated_formula.public_send(:"#{platform}_compatible?") &&
-            simulated_formula.public_send(:"#{arch}_compatible?")
+      testing_formulae.select do |formula|
+        Homebrew::SimulateSystem.with(os:, arch: Homebrew::SimulateSystem.arch_symbols.fetch(arch)) do
+          simulated_formula = TestRunnerFormula.new(Formulary.factory(formula.name))
+          simulated_formula.compatible?(platform:, arch:, macos_version:)
         end
       end
     end
@@ -336,10 +354,7 @@ class GitHubRunnerMatrix
                                        .select do |dependent_f|
           Homebrew::SimulateSystem.with(os: platform, arch: Homebrew::SimulateSystem.arch_symbols.fetch(arch)) do
             simulated_dependent_f = dependent_f
-            next false if macos_version && !simulated_dependent_f.compatible_with?(macos_version)
-
-            simulated_dependent_f.public_send(:"#{platform}_compatible?") &&
-              simulated_dependent_f.public_send(:"#{arch}_compatible?") &&
+            simulated_dependent_f.compatible?(platform:, arch:, macos_version:) &&
               !simulated_dependent_f.formula.disabled? &&
               !simulated_dependent_f.formula.deprecated?
           end

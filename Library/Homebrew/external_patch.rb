@@ -51,6 +51,17 @@ class ExternalPatch
 
   sig { void }
   def apply
+    begin
+      if downloaded?
+        verify_download_integrity(cached_download) if resource.checksum.present?
+      else
+        fetch
+      end
+    rescue ChecksumMismatchError
+      clear_cache
+      raise
+    end
+
     base_dir = Pathname.pwd
     resource.unpack do
       patch_dir = Pathname.pwd
@@ -65,30 +76,23 @@ class ExternalPatch
 
         patch_files << children.fetch(0).basename
       end
-      dir = base_dir
-      dir /= T.must(resource.directory) if resource.directory.present?
-      dir.cd do
-        patch_files.each do |patch_file|
-          ohai "Applying #{patch_file}"
-          patch_file = patch_dir/patch_file
-          Patch.ensure_targets_within!(
-            patch_file.read.gsub("@@HOMEBREW_PREFIX@@", HOMEBREW_PREFIX), strip:, base: dir
-          )
-          Utils.safe_popen_write("patch", "-g", "0", "-f", "-#{strip}") do |p|
-            File.foreach(patch_file) do |line|
-              data = line.gsub("@@HOMEBREW_PREFIX@@", HOMEBREW_PREFIX)
-              p.write(data)
-            end
-          end
-        end
+      resource_directory = resource.directory.presence
+      dir = resource_directory ? base_dir/resource_directory : base_dir
+      Utils::Path.ensure_child_of!(base_dir, dir, message: "Patch directory escapes the staged source tree: #{dir}")
+      patch_files.each do |patch_file|
+        ohai "Applying #{patch_file}"
+        Patch.apply(
+          (patch_dir/patch_file).read.gsub("@@HOMEBREW_PREFIX@@", HOMEBREW_PREFIX), strip:, base: dir
+        )
       end
     end
   rescue ErrorDuringExecution => e
     onoe e
-    spec_owner = T.cast(T.must(resource.owner), SoftwareSpec).owner
-    f = spec_owner.is_a?(::Formula) ? spec_owner : nil
+    resource_owner = resource.owner
+    spec_owner = resource_owner.owner if resource_owner.is_a?(SoftwareSpec)
+    formula = spec_owner if spec_owner.is_a?(::Formula)
     cmd, *args = e.cmd
-    raise BuildError.new(f, cmd, args, ENV.to_hash)
+    raise BuildError.new(formula, cmd, args, ENV.to_hash)
   end
 
   sig { returns(String) }

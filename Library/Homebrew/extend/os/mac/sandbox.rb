@@ -21,6 +21,10 @@ module OS
       SEATBELT_ERB = <<~ERB
         (version 1)
         (debug deny) ; log all denied operations to /var/log/system.log
+        (deny network-outbound (to unix-socket))
+        <% if network_access_allowed %>
+        (allow network-outbound (to unix-socket (path-literal "/private/var/run/mDNSResponder")))
+        <% end %>
         <%= rules.join("\n") %>
         (allow file-write*
             (literal "/dev/ptmx")
@@ -34,6 +38,25 @@ module OS
         (deny file-write*) ; deny non-allowlist file write operations
         (deny file-write-setugid) ; deny non-allowlist file write SUID/SGID operations
         (deny file-write-mode) ; deny non-allowlist file write mode operations
+        (deny mach-lookup)
+        (allow mach-lookup
+            (xpc-service-name "com.apple.MTLCompilerService")
+            (global-name "com.apple.mobileassetd.v2")
+            (global-name "com.apple.sysmond")
+            (global-name "com.apple.lsd.mapdb")
+            (global-name "com.apple.bsd.dirhelper")
+            (global-name "com.apple.system.opendirectoryd.libinfo")
+            (global-name "com.apple.system.opendirectoryd.membership")
+            (global-name "com.apple.PowerManagement.control")
+            (global-name "com.apple.SecurityServer")
+            (global-name "com.apple.networkd")
+            (global-name "com.apple.ocspd")
+            (global-name "com.apple.trustd.agent")
+            (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+            (global-name "com.apple.SystemConfiguration.configd")
+            )
+        (deny lsopen)
+        (deny appleevent-send)
         (allow process-exec
             (literal "/bin/ps")
             (with no-sandbox)
@@ -44,7 +67,7 @@ module OS
       private_constant :SANDBOX_EXEC, :TIOCSCTTY, :SEATBELT_ERB
 
       sig { void }
-      def allow_write_temp_and_cache
+      def allow_write_system_temp
         allow_write_path "/private/tmp"
         allow_write_path "/private/var/tmp"
         allow_write path: "^/private/var/folders/[^/]+/[^/]+/[C,T]/", type: :regex
@@ -55,6 +78,7 @@ module OS
       sig { void }
       def allow_write_xcode
         home_write_paths.each { |path| allow_write_path path }
+        allow_write path: "^/private/var/folders/[^/]+/[^/]+/T/xcrun_db(-[^/]+)?$", type: :regex
       end
 
       module ClassMethods
@@ -97,18 +121,9 @@ module OS
         ["#{home}/Library/Developer", "#{home}/Library/Caches/org.swift.swiftpm"]
       end
 
-      sig { params(args: T::Array[T.any(String, ::Pathname)], tmpdir: String).returns(T::Array[T.any(String, ::Pathname)]) }
-      def sandbox_command(args, tmpdir)
-        seatbelt = File.new(File.join(tmpdir, "homebrew.sb"), "wx")
-        seatbelt.write(seatbelt_profile)
-        seatbelt.close
-
-        [SANDBOX_EXEC, "-f", seatbelt.path, *args]
-      end
-
-      sig { returns(T::Boolean) }
-      def allow_network_for_error_pipe?
-        true
+      sig { params(args: T::Array[T.any(String, ::Pathname)], _tmpdir: String).returns(T::Array[T.any(String, ::Pathname)]) }
+      def sandbox_command(args, _tmpdir)
+        [SANDBOX_EXEC, "-p", seatbelt_profile, *args]
       end
 
       sig { void }
@@ -121,14 +136,18 @@ module OS
 
       sig { void }
       def record_sandbox_log
+        start_time = start
+        raise "Cannot record the sandbox log before the sandbox has started" if start_time.nil?
+
         sleep 0.1 # wait for a bit to let syslog catch up the latest events.
+        since = start_time.to_i.to_s
         syslog_args = [
           "-F", "$((Time)(local)) $(Sender)[$(PID)]: $(Message)",
-          "-k", "Time", "ge", T.must(start).to_i.to_s,
+          "-k", "Time", "ge", since,
           "-k", "Message", "S", "deny",
           "-k", "Sender", "kernel",
           "-o",
-          "-k", "Time", "ge", T.must(start).to_i.to_s,
+          "-k", "Time", "ge", since,
           "-k", "Message", "S", "deny",
           "-k", "Sender", "sandboxd"
         ]
@@ -154,7 +173,12 @@ module OS
 
       sig { returns(String) }
       def seatbelt_profile
-        ERB.new(SEATBELT_ERB).result_with_hash(rules: profile.rules.map { |rule| seatbelt_rule(rule) })
+        ERB.new(SEATBELT_ERB).result_with_hash(
+          rules:                  profile.rules.map { |rule| seatbelt_rule(rule) },
+          network_access_allowed: profile.rules.none? do |rule|
+            !rule.allow && rule.operation == "network*" && rule.filter.nil?
+          end,
+        )
       end
 
       sig { params(rule: T.untyped).returns(String) }
@@ -162,6 +186,7 @@ module OS
         s = +"("
         s << (rule.allow ? "allow" : "deny")
         s << " #{rule.operation}"
+        s << " network-outbound" if rule.allow && rule.operation == "network*"
         s << " (#{seatbelt_path_filter(rule.filter)})" if rule.filter
         s << " (with #{rule.modifier})" if rule.modifier
         s << ")"

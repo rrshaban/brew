@@ -13,24 +13,15 @@ module Homebrew
       MAX_JOBS = 256
 
       # Weight for each arch must add up to 1.0.
-      X86_MACOS_RUNNERS = T.let({
-        { symbol: :sequoia, name: "macos-15-intel", arch: :intel } => 1.0,
-      }.freeze, T::Hash[T::Hash[Symbol, T.any(Symbol, String)], Float])
-      X86_LINUX_RUNNERS = T.let({
-        { symbol: :linux, name: "ubuntu-latest", arch: :intel } => 1.0,
-      }.freeze, T::Hash[T::Hash[Symbol, T.any(Symbol, String)], Float])
-      ARM_MACOS_RUNNERS = T.let({
+      MACOS_RUNNERS = T.let({
         { symbol: :sonoma,  name: "macos-14", arch: :arm } => 0.0,
         { symbol: :sequoia, name: "macos-15", arch: :arm } => 0.0,
         { symbol: :tahoe,   name: "macos-26", arch: :arm } => 1.0,
       }.freeze, T::Hash[T::Hash[Symbol, T.any(Symbol, String)], Float])
-      ARM_LINUX_RUNNERS = T.let({
+      LINUX_RUNNERS = T.let({
+        { symbol: :linux, name: "ubuntu-latest", arch: :intel }       => 1.0,
         { symbol: :linux, name: OS::LINUX_CI_ARM_RUNNER, arch: :arm } => 1.0,
       }.freeze, T::Hash[T::Hash[Symbol, T.any(Symbol, String)], Float])
-      MACOS_RUNNERS = T.let(X86_MACOS_RUNNERS.merge(ARM_MACOS_RUNNERS).freeze,
-                            T::Hash[T::Hash[Symbol, T.any(Symbol, String)], Float])
-      LINUX_RUNNERS = T.let(X86_LINUX_RUNNERS.merge(ARM_LINUX_RUNNERS).freeze,
-                            T::Hash[T::Hash[Symbol, T.any(Symbol, String)], Float])
       RUNNERS = T.let(MACOS_RUNNERS.merge(LINUX_RUNNERS).freeze,
                       T::Hash[T::Hash[Symbol, T.any(Symbol, String)], Float])
 
@@ -87,12 +78,14 @@ module Homebrew
 
         runner = random_runner[:name]
         syntax_job = {
-          name:   "syntax",
+          name:   "tap_syntax",
           tap:    tap.name,
           runner:,
+          stable: false,
         }
+        stable_syntax_job = syntax_job.merge(name: "tap_syntax (stable)", stable: true, skip_audit: true)
 
-        matrix = [syntax_job]
+        matrix = [syntax_job, stable_syntax_job]
 
         if !syntax_only && !labels&.include?("ci-syntax-only")
           cask_jobs = if casks&.any?
@@ -114,7 +107,12 @@ module Homebrew
           matrix += cask_jobs
         end
 
-        syntax_job[:name] += " (#{syntax_job[:runner]})"
+        jobs = matrix.count
+        odie "Maximum job matrix size exceeded: #{jobs}/#{MAX_JOBS}" if jobs > MAX_JOBS
+
+        [syntax_job, stable_syntax_job].each do |job|
+          job[:name] += " (#{job[:runner]})"
+        end
 
         puts JSON.pretty_generate(matrix)
         github_output = ENV.fetch("GITHUB_OUTPUT", nil)
@@ -150,39 +148,36 @@ module Homebrew
           end
         end
 
-        return filtered_runners unless cask.supports_linux?
-
-        linux_archs = architectures(cask:, os: :linux)
-        linux_runners = LINUX_RUNNERS.select do |runner, _|
-          linux_archs.include?(runner.fetch(:arch))
+        if cask.supports_linux?
+          linux_archs = architectures(cask:, os: :linux)
+          filtered_runners.merge!(LINUX_RUNNERS.select do |runner, _|
+            linux_archs.include?(runner.fetch(:arch))
+          end)
         end
 
-        filtered_runners.merge(linux_runners)
+        # A cask that is disabled doesn't need to be tested
+        filtered_runners.reject do |runner, _|
+          tag = Utils::Bottles::Tag.new(system: runner.fetch(:symbol).to_sym, arch: runner.fetch(:arch).to_sym)
+          cask.refresh_for_tag(tag) { cask.disabled? }
+        end
       end
 
-      sig {
-        params(
-          runners:  T::Array[T::Hash[Symbol, T.any(Symbol, String)]],
-          multi_os: T::Boolean,
-        ).returns(T::Array[[T::Hash[Symbol, T.any(Symbol, String)], T.any(Symbol, String), T::Boolean]])
-      }
-      def runner_arch_pairs(runners:, multi_os:)
-        macos_archs = runners.reject { |r| r.fetch(:symbol) == :linux }.map { |r| r.fetch(:arch) }.uniq
-        linux_archs = runners.select { |r| r.fetch(:symbol) == :linux }.map { |r| r.fetch(:arch) }.uniq
-        product_archs = macos_archs | linux_archs
-        runners.product(product_archs).filter_map do |runner, arch|
-          native_runner_arch = arch == runner.fetch(:arch)
-          # we don't need to run simulated archs on Linux or macOS Sequoia
-          # because they exist as real GitHub hosted runners
-          next if runner.fetch(:symbol) == :linux && !native_runner_arch
-          next if runner.fetch(:symbol) == :sequoia && !native_runner_arch
-          # skip macOS runners simulating architectures not supported on macOS
-          next if runner.fetch(:symbol) != :linux && !native_runner_arch && macos_archs.exclude?(arch)
-          # if it's just a single OS test then we can just use the two real arch runners
-          next if !native_runner_arch && !multi_os
+      sig { params(cask: Cask::Cask).returns(T::Array[T::Hash[Symbol, T.any(Symbol, String)]]) }
+      def runners(cask:)
+        filtered_runners = filter_runners(cask)
 
-          [runner, arch, native_runner_arch]
+        filtered_macos_found = filtered_runners.keys.any? do |runner|
+          cask.to_hash_with_variations["variations"].key?(runner.fetch(:symbol).to_sym)
         end
+
+        # If the cask varies on a macOS version, test it on every possible macOS version.
+        return filtered_runners.keys if filtered_macos_found
+
+        macos_runners, linux_runners = filtered_runners.partition do |runner, _|
+          runner.fetch(:symbol) != :linux
+        end
+        selected_runners = macos_runners.any? ? [random_runner(macos_runners.to_h)] : []
+        selected_runners + linux_runners.map(&:first)
       end
 
       private
@@ -209,33 +204,11 @@ module Homebrew
         params(available_runners: T::Hash[T::Hash[Symbol, T.any(Symbol, String)],
                                           Float]).returns(T::Hash[Symbol, T.any(Symbol, String)])
       }
-      def random_runner(available_runners = ARM_MACOS_RUNNERS)
+      def random_runner(available_runners = MACOS_RUNNERS)
         max_runner = available_runners.max_by { |(_, weight)| rand ** (1.0 / weight) }
         raise "unexpected nil max_runner" unless max_runner
 
         max_runner.first
-      end
-
-      sig { params(cask: Cask::Cask).returns([T::Array[T::Hash[Symbol, T.any(Symbol, String)]], T::Boolean]) }
-      def runners(cask:)
-        filtered_runners = filter_runners(cask)
-
-        filtered_macos_found = filtered_runners.keys.any? do |runner|
-          cask.to_hash_with_variations["variations"].key?(runner.fetch(:symbol).to_sym)
-        end
-
-        if filtered_macos_found
-          # If the cask varies on a MacOS version, test it on every possible macOS version.
-          [filtered_runners.keys, true]
-        else
-          macos_runners, linux_runners = filtered_runners.partition do |runner, _|
-            runner.fetch(:symbol) != :linux
-          end
-          selected_runners = macos_runners.group_by { |runner, _| runner.fetch(:arch) }.map do |_, runners|
-            random_runner(runners.to_h)
-          end + linux_runners.map(&:first)
-          [selected_runners, false]
-        end
       end
 
       sig {
@@ -263,6 +236,7 @@ module Homebrew
           odie "Found Ruby files in wrong directory:\n#{ruby_files_in_wrong_directory.join("\n")}"
         end
 
+        require "cask/cask_loader"
         cask_files_to_check = if cask_names.any?
           cask_names.map do |cask_name|
             Cask::CaskLoader.find_cask_in_tap(cask_name, tap).relative_path_from(tap.path)
@@ -303,19 +277,20 @@ module Homebrew
 
           cask = Cask::CaskLoader.load(path.expand_path)
 
-          runners, multi_os = runners(cask:)
-          runner_arch_pairs(runners:, multi_os:).map do |runner, arch, native_runner_arch|
-            arch_args = native_runner_arch ? [] : ["--arch=#{arch}"]
+          runners = runners(cask:)
+          puts "::warning file=#{path}::No CI runner supports this cask, so it will not be tested." if runners.empty?
+
+          runners.map do |runner|
             runner_output = {
-              name:         "test #{cask_token} (#{runner.fetch(:name)}, #{arch})",
+              name:         "test #{cask_token} (#{runner.fetch(:name)}, #{runner.fetch(:arch)})",
               tap:          tap.name,
               cask:         {
                 token: cask_token,
                 path:  "./#{path}",
               },
-              audit_args:   audit_args + arch_args,
-              fetch_args:   arch_args,
-              skip_install: labels.include?("ci-skip-install") || !native_runner_arch || skip_install,
+              audit_args:,
+              fetch_args:   [],
+              skip_install: labels.include?("ci-skip-install") || skip_install,
               runner:       runner.fetch(:name),
             }
 

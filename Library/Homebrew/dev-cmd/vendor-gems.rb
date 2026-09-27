@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "system_command"
+
 require "abstract_command"
 require "utils/git"
 require "fileutils"
@@ -26,9 +28,9 @@ module Homebrew
 
       sig { override.void }
       def run
-        Homebrew.setup_gem_environment!
+        Utils::GemSetup.setup_gem_environment!
         ENV["PATH"] = (ENV.fetch("PATH").split(":") | ENV.fetch("HOMEBREW_PATH", "").split(":")).join(":")
-        ENV["BUNDLE_WITH"] = Homebrew.valid_gem_groups.join(":")
+        ENV["BUNDLE_WITH"] = Utils::GemSetup.valid_gem_groups.join(":")
 
         ohai "cd #{HOMEBREW_LIBRARY_PATH}"
         HOMEBREW_LIBRARY_PATH.cd do
@@ -45,7 +47,23 @@ module Homebrew
           ohai "bundle install --standalone"
           run_bundle "install", "--standalone"
 
-          if GitHub::Actions.env_set? && HOMEBREW_PREFIX.to_s == HOMEBREW_LINUX_DEFAULT_PREFIX
+          require "bundler"
+          definition = Bundler::Definition.build(Bundler.default_gemfile, Bundler.default_lockfile, false)
+          # Bundler ships with Ruby, outside the directory hashed by Bootsnap.
+          core_gem_names = definition.specs_for([:default])
+                                     .filter_map { |spec| spec.name if spec.name != "bundler" }
+                                     .sort
+          bootsnap_gem_names = Homebrew::Bootsnap.core_gem_names.sort
+          if core_gem_names != bootsnap_gem_names
+            raise <<~EOS
+              Bootsnap core gem list is out of date.
+              Expected: #{core_gem_names.join(", ")}
+              Actual: #{bootsnap_gem_names.join(", ")}
+            EOS
+          end
+
+          if GitHub::Actions.env_set? && HOMEBREW_PREFIX.to_s == HOMEBREW_LINUX_DEFAULT_PREFIX &&
+             !Homebrew::EnvConfig.no_sudo?
             ohai "chmod +t -R /home/linuxbrew/"
             system "sudo", "chmod", "+t", "-R", "/home/linuxbrew/"
           end
@@ -56,10 +74,6 @@ module Homebrew
           ohai "bundle clean"
           run_bundle "clean"
 
-          # Workaround Bundler 2.4.21 issue where platforms may be removed.
-          # Although we don't use 2.4.21, Dependabot does as it currently ignores your lockfile version.
-          # https://github.com/rubygems/rubygems/issues/7169
-          run_bundle "lock", "--add-platform", "aarch64-linux"
           system "git", "add", "Gemfile.lock" unless args.no_commit?
 
           if args.non_bundler_gems?
@@ -70,8 +84,8 @@ module Homebrew
                 Pathname.glob("#{gem}-*/").each { |path| FileUtils.rm_r(path) }
               end
               ohai "gem install #{gem}"
-              safe_system "gem", "install", gem, "--install-dir", "vendor",
-                          "--no-document", "--no-wrappers", "--ignore-dependencies", "--force"
+              SystemCommand.safe_system "gem", "install", gem, "--install-dir", "vendor",
+                                        "--no-document", "--no-wrappers", "--ignore-dependencies", "--force"
               (HOMEBREW_LIBRARY_PATH/"vendor/gems").cd do
                 source = Pathname.glob("#{gem}-*/").first
                 next unless source
@@ -99,13 +113,7 @@ module Homebrew
 
       sig { params(args: String).void }
       def run_bundle(*args)
-        Process.wait(fork do
-          # Native build scripts fail if EUID != UID
-          Process::UID.change_privilege(Process.euid) if Process.euid != Process.uid
-          exec "bundle", *args
-        end)
-
-        raise ErrorDuringExecution.new(["bundle", *args], status: $CHILD_STATUS) unless $CHILD_STATUS.success?
+        SystemCommand.safe_system "bundle", *args
       end
     end
   end

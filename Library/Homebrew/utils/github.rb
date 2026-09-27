@@ -411,11 +411,11 @@ module GitHub
     EOS
     result = API.open_graphql(query, scopes: ["read:org", "user"])
 
-    if result["organization"]["teams"]["nodes"].blank?
-      raise API::Error,
-            "Your token needs the 'read:org' scope to access this API"
+    if result.dig("organization", "teams", "nodes").blank? || result.dig("organization", "team").blank?
+      raise API::Error, "Could not access the team #{org}/#{team}. " \
+                        "Please check that your GitHub account has access to the team and that your token has the " \
+                        "required permissions."
     end
-    raise API::Error, "The team #{org}/#{team} does not exist" if result["organization"]["team"].blank?
 
     result["organization"]["team"]["members"]["nodes"].to_h { |member| [member["login"], member["name"]] }
   end
@@ -512,9 +512,9 @@ module GitHub
 
   sig { params(name: String, version: T.nilable(String)).returns(Regexp) }
   def self.pull_request_title_regex(name, version = nil)
-    return /(^|\s)#{Regexp.quote(name)}(:|,|\s|$)/i if version.blank?
+    return /(?:^|\s)#{Regexp.quote(name)}(?::|,|\s|$)/i if version.blank?
 
-    /(^|\s)#{Regexp.quote(name)}(:|,|\s)(.*\s)?#{Regexp.quote(version)}(:|,|\s|$)/i
+    /(?:^|\s)#{Regexp.quote(name)}(?::|,|\s)(?:.*\s)?#{Regexp.quote(version)}(?::|,|\s|$)/i
   end
 
   sig {
@@ -740,7 +740,9 @@ module GitHub
     result = Utils::Curl.curl_output(
       "--silent", "--head", "--location",
       "--header", "Accept: application/vnd.github.sha",
-      url_to("repos", user, repo, "commits", ref).to_s
+      *API.credentials_curl_args,
+      url_to("repos", user, repo, "commits", ref).to_s,
+      secrets: [API.credentials].compact
     )
 
     return unless result.status.success?
@@ -773,63 +775,20 @@ module GitHub
     result = Utils::Curl.curl_output(
       "--silent", "--head", "--location",
       "--header", "Accept: application/vnd.github.sha",
+      *API.credentials_curl_args,
       "--output", File::NULL,
       # This is a Curl format token, not a Ruby one.
       # rubocop:disable Style/FormatStringToken
       "--write-out", "%{http_code}",
       # rubocop:enable Style/FormatStringToken
-      url_to("repos", user, repo, "commits", commit).to_s
+      url_to("repos", user, repo, "commits", commit).to_s,
+      secrets: [API.credentials].compact
     )
 
     return true unless result.status.success?
     return true if (output = result.stdout).blank?
 
     output != "200"
-  end
-
-  sig {
-    params(repository_name_with_owner: String, user: String, filter: String, from: T.nilable(String),
-           to: T.nilable(String), max: Integer, verbose: T::Boolean).returns(T::Array[String])
-  }
-  def self.repo_commits_for_user(repository_name_with_owner, user, filter, from, to, max, verbose)
-    return [] if Homebrew::EnvConfig.no_github_api?
-
-    params = ["#{filter}=#{user}"]
-    params << "since=#{DateTime.parse(from).iso8601}" if from.present?
-    params << "until=#{DateTime.parse(to).iso8601}" if to.present?
-
-    commits = []
-    API.paginate_rest("#{API_URL}/repos/#{repository_name_with_owner}/commits",
-                      additional_query_params: params.join("&")) do |result|
-      commits.concat(result.map { |c| c["sha"] })
-      if commits.length >= max
-        if verbose
-          opoo "#{user} exceeded #{max} #{repository_name_with_owner} commits as #{filter}, stopped counting!"
-        end
-        break
-      end
-    end
-    commits
-  rescue GitHub::API::GitRepositoryIsEmptyError
-    []
-  end
-
-  sig {
-    params(repository_name_with_owner: String, user: String, max: Integer, verbose: T::Boolean,
-           from: T.nilable(String), to: T.nilable(String)).returns(Integer)
-  }
-  def self.count_repository_commits(repository_name_with_owner, user, max:, verbose:, from: nil, to: nil)
-    odie "Cannot count commits as `$HOMEBREW_NO_GITHUB_API` is set!" if Homebrew::EnvConfig.no_github_api?
-
-    author_shas = repo_commits_for_user(repository_name_with_owner, user, "author", from, to, max, verbose)
-    committer_shas = repo_commits_for_user(repository_name_with_owner, user, "committer", from, to, max, verbose)
-    return 0 if author_shas.blank? && committer_shas.blank?
-
-    author_count = author_shas.count
-    # Only count commits where the author and committer are different.
-    committer_count = committer_shas.difference(author_shas).count
-
-    author_count + committer_count
   end
 
   MAXIMUM_OPEN_PRS = 15
@@ -934,17 +893,6 @@ module GitHub
 
       full_name
     end
-  end
-
-  sig {
-    params(user: String, author: String, from: T.nilable(String), to: T.nilable(String))
-      .returns(T::Array[T::Hash[String, T.untyped]])
-  }
-  def self.search_merged_pull_requests_in_user_or_organisation(user, author, from:, to:)
-    search_issues("", is: "merged", user:, author:, from:, to:)
-  rescue GitHub::API::ValidationFailedError
-    opoo "Couldn't search GitHub for PRs authored by #{author}. Their profile might be private. Defaulting to 0."
-    []
   end
 
   sig {

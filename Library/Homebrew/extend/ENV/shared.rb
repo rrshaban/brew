@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/output"
+
 require "compilers"
 require "development_tools"
 
@@ -36,9 +38,6 @@ module SharedEnvExtension
   ].freeze
   private_constant :SANITIZED_VARS
 
-  sig { returns(T.nilable(T::Boolean)) }
-  attr_reader :build_bottle
-
   sig { returns(T.nilable(String)) }
   attr_reader :bottle_arch
 
@@ -62,6 +61,12 @@ module SharedEnvExtension
     @testing_formula = T.let(testing_formula, T.nilable(T::Boolean))
     reset
   end
+
+  sig { returns(T::Boolean) }
+  def build_bottle? = @build_bottle == true
+
+  sig { returns(T::Boolean) }
+  def debug_symbols? = @debug_symbols == true
 
   sig { void }
   def reset
@@ -118,7 +123,7 @@ module SharedEnvExtension
 
   sig { params(key: String, path: T.any(String, Pathname)).void }
   def append_path(key, path)
-    self[key] = PATH.new(self[key]).append(path)
+    self[key] = PATH.new(self[key]).append(path).to_s
   end
 
   sig { params(rustflags: String).void }
@@ -137,7 +142,7 @@ module SharedEnvExtension
   def prepend_path(key, path)
     return if %w[/usr/bin /bin /usr/sbin /sbin].include? path.to_s
 
-    self[key] = PATH.new(self[key]).prepend(path)
+    self[key] = PATH.new(self[key]).prepend(path).to_s
   end
 
   sig { params(key: String, path: T.any(String, Pathname)).void }
@@ -282,7 +287,7 @@ module SharedEnvExtension
       end
       if gfortran
         puts "This may be changed by setting the `$FC` environment variable."
-        self["FC"] = self["F77"] = gfortran
+        self["FC"] = self["F77"] = gfortran.to_s
         flags = FC_FLAG_VARS
       end
     end
@@ -306,7 +311,8 @@ module SharedEnvExtension
     gcc_version_name = "gcc@#{version}"
 
     gcc = Formulary.factory("gcc")
-    if gcc.respond_to?(:version_suffix) && T.unsafe(gcc).version_suffix == version
+    # `version_suffix` is only defined by the `gcc` formula itself.
+    if gcc.respond_to?(:version_suffix) && gcc.public_send(:version_suffix) == version # rubocop:disable Style/SendWithLiteralMethodName
       gcc
     else
       Formulary.factory(gcc_version_name)
@@ -349,12 +355,12 @@ module SharedEnvExtension
   sig { params(_flags: T::Array[String], _map: T::Hash[Symbol, String]).void }
   def set_cpu_flags(_flags, _map = {}); end
 
-  sig { params(val: T.any(String, Pathname)).returns(String) }
+  sig { params(val: T.any(String, Pathname)).void }
   def cc=(val)
     self["CC"] = self["OBJC"] = val.to_s
   end
 
-  sig { params(val: T.any(String, Pathname)).returns(String) }
+  sig { params(val: T.any(String, Pathname)).void }
   def cxx=(val)
     self["CXX"] = self["OBJCXX"] = val.to_s
   end

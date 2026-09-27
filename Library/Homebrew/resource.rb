@@ -94,22 +94,34 @@ class Resource
     params(
       target:        T.nilable(T.any(String, Pathname)),
       debug_symbols: T::Boolean,
+      staging_path:  T.nilable(Pathname),
+      staged:        T::Boolean,
       block:         T.nilable(T.proc.params(arg0: ResourceStageContext).void),
     ).void
   }
-  def stage(target = nil, debug_symbols: false, &block)
+  def stage(target = nil, debug_symbols: false, staging_path: nil, staged: false, &block)
     raise ArgumentError, "Target directory or block is required" if !target && !block_given?
 
     prepare_patches
     fetch_patches(skip_downloaded: true)
-    fetch unless downloaded?
+    begin
+      if !downloaded?
+        fetch
+      elsif !staged && checksum.present?
+        verify_download_integrity(cached_download)
+      end
+    rescue ChecksumMismatchError
+      # Remove the known-bad download so the next attempt fetches it again.
+      clear_cache
+      raise
+    end
 
-    unpack(target, debug_symbols:, &block)
+    unpack(target, debug_symbols:, staging_path:, staged:, &block)
   end
 
   sig { void }
   def prepare_patches
-    patches.grep(DATAPatch) { |p| p.path = T.cast(T.cast(T.must(owner), SoftwareSpec).owner, ::Formula).path }
+    patches.grep(DATAPatch) { |p| p.path = T.cast(T.cast(owner, SoftwareSpec).owner, ::Formula).path }
   end
 
   sig { params(skip_downloaded: T::Boolean).void }
@@ -131,19 +143,41 @@ class Resource
   # If block is given, yield to that block with `|stage|`, where stage
   # is a {ResourceStageContext}.
   # A target or a block must be given, but not both.
+  # With `staging_path`, unpack into that directory rather than a fresh
+  # temporary one and, with `staged` too, reuse its already unpacked and
+  # patched contents.
   sig {
     params(
       target:        T.nilable(T.any(String, Pathname)),
       debug_symbols: T::Boolean,
+      staging_path:  T.nilable(Pathname),
+      staged:        T::Boolean,
       block:         T.nilable(T.proc.params(arg0: ResourceStageContext).void),
     ).void
   }
-  def unpack(target = nil, debug_symbols: false, &block)
+  def unpack(target = nil, debug_symbols: false, staging_path: nil, staged: false, &block)
     current_working_directory = Pathname.pwd
-    stage_resource(download_name, debug_symbols:) do |staging|
-      downloader.stage do
-        @source_modified_time = downloader.source_modified_time.freeze
-        apply_patches
+    stage_resource(download_name, debug_symbols:, staging_path:) do |staging|
+      # A formula's `fetch` adds files to the shared staging directory, so
+      # record the unpacked source's modification time for the build phase.
+      source_modified_time_path = (staging_path/".source_modified_time" if staging_path)
+      stage_unpacked = proc do
+        source_modified_time = if staged && source_modified_time_path&.exist?
+          Time.at(source_modified_time_path.read.to_i)
+        else
+          downloader.source_modified_time
+        end
+        if source_modified_time_path && !staged
+          source_modified_time_path.write(source_modified_time.to_i.to_s)
+          # Don't dirty the git tree for git clones, which some builds embed in their version.
+          git_dir = staging_path/".git"
+          if git_dir.directory? && !git_dir.symlink?
+            (git_dir/"info").mkpath
+            (git_dir/"info/exclude").open("a") { |file| file.puts source_modified_time_path.basename }
+          end
+        end
+        @source_modified_time = source_modified_time.freeze
+        apply_patches unless staged
         if block
           yield(ResourceStageContext.new(self, staging))
         elsif target
@@ -151,6 +185,12 @@ class Resource
           target = current_working_directory/target if target.relative?
           target.install Pathname.pwd.children
         end
+      end
+
+      if staged
+        downloader.chdir(&stage_unpacked)
+      else
+        downloader.stage(&stage_unpacked)
       end
     end
   end
@@ -275,11 +315,12 @@ class Resource
       .params(
         prefix:        String,
         debug_symbols: T::Boolean,
+        staging_path:  T.nilable(Pathname),
         block:         T.proc.params(arg0: Mktemp).returns(T.type_parameter(:U)),
       ).returns(T.type_parameter(:U))
   }
-  def stage_resource(prefix, debug_symbols: false, &block)
-    Mktemp.new(prefix, retain_in_cache: debug_symbols).run(&block)
+  def stage_resource(prefix, debug_symbols: false, staging_path: nil, &block)
+    Mktemp.new(prefix, retain_in_cache: debug_symbols, path: staging_path).run(&block)
   end
 
   private
@@ -303,8 +344,10 @@ class Resource
 
   sig { override.returns(T::Array[String]) }
   def determine_url_mirrors
+    url = self.url
+    return super if url.nil?
+
     extra_urls = []
-    url = T.must(self.url)
 
     # glibc-bootstrap
     if url.start_with?("https://github.com/Homebrew/glibc-bootstrap/releases/download")
@@ -315,14 +358,15 @@ class Resource
         extra_urls << artifact_url
       end
 
-      if Homebrew::EnvConfig.bottle_domain != HOMEBREW_BOTTLE_DEFAULT_DOMAIN
+      if Homebrew::EnvConfig.bottle_domain_custom?
         tag, filename = url.split("/").last(2)
         extra_urls << "#{Homebrew::EnvConfig.bottle_domain}/glibc-bootstrap/#{tag}/#{filename}"
       end
     end
 
     # PyPI packages: PEP 503 – Simple Repository API <https://peps.python.org/pep-0503>
-    if (pip_index_url = Homebrew::EnvConfig.pip_index_url.presence)
+    if Homebrew::EnvConfig.non_default_variable?(:HOMEBREW_PIP_INDEX_URL) &&
+       (pip_index_url = Homebrew::EnvConfig.pip_index_url.presence)
       pip_index_base_url = pip_index_url.chomp("/").chomp("/simple")
       %w[https://files.pythonhosted.org https://pypi.org].each do |base_url|
         extra_urls << url.sub(base_url, pip_index_base_url) if url.start_with?("#{base_url}/packages")
@@ -347,7 +391,7 @@ class Resource
     def download_queue_type = "Formula"
 
     sig { override.returns(String) }
-    def download_queue_name = "#{T.must(owner).name} (#{version})"
+    def download_queue_name = "#{owner&.name} (#{version})"
   end
 
   # A resource for a bottle manifest.
@@ -356,6 +400,9 @@ class Resource
 
     sig { returns(Bottle) }
     attr_reader :bottle
+
+    sig { params(manifest_annotations: T.nilable(T::Hash[String, String])).void }
+    attr_writer :manifest_annotations
 
     sig { params(bottle: Bottle).void }
     def initialize(bottle)

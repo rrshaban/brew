@@ -1,29 +1,69 @@
 # typed: true
 # frozen_string_literal: true
 
+require "open3"
+
 RSpec.describe Cask::Quarantine do
   let(:klass) { described_class }
+
+  context "when quarantine support is unavailable" do
+    let(:file) { mktmpdir/"Test.app" }
+
+    before do
+      allow(klass).to receive_messages(available?: false, xattr: nil)
+    end
+
+    it "does not detect quarantine" do
+      expect(klass.detect(file)).to be(false)
+    end
+
+    it "returns an empty quarantine status" do
+      expect(klass.status(file)).to eq("")
+    end
+
+    it "does not release quarantine" do
+      expect(klass).not_to receive(:system_command)
+
+      klass.release!(download_path: file)
+    end
+
+    it "does not propagate quarantine" do
+      expect(klass).not_to receive(:system_command!)
+
+      klass.propagate(from: file, to: file)
+    end
+
+    it "does not inherit user approval" do
+      expect(klass).not_to receive(:system_command)
+
+      klass.inherit_user_approval!(download_path: file)
+    end
+
+    it "does not quarantine a cask" do
+      expect(klass).not_to receive(:detect)
+
+      klass.cask!(cask: instance_double(Cask::Cask), download_path: file)
+    end
+
+    it "does not copy extended attributes" do
+      expect(file).not_to receive(:writable?)
+
+      klass.copy_xattrs(file, file, command: class_double(SystemCommand))
+    end
+  end
 
   describe ".available?", :needs_macos do
     before do
       klass.remove_instance_variable(:@quarantine_support) if klass.instance_variable_defined?(:@quarantine_support)
     end
 
-    it "uses the Swift support check by default" do
-      allow(klass).to receive(:check_quarantine_support).and_return([:no_swift, nil])
-
-      with_env(HOMEBREW_DEVELOPER: nil) do
-        expect(klass.available?).to be(false)
-      end
-    end
-
-    it "uses FFI quarantine support in developer mode when xattr works" do
+    it "uses FFI quarantine support when xattr works" do
       allow(klass).to receive(:xattr).and_return(Pathname("/usr/bin/xattr"))
       allow(klass).to receive(:system_command)
         .with(Pathname("/usr/bin/xattr"), args: ["-h"], print_stderr: false)
         .and_return(instance_double(SystemCommand::Result, success?: true))
 
-      with_env(HOMEBREW_DEVELOPER: "1") do
+      with_env(HOMEBREW_DEVELOPER: nil) do
         expect(klass.available?).to be(true)
       end
     end
@@ -63,37 +103,11 @@ RSpec.describe Cask::Quarantine do
           with_env(HOMEBREW_DEVELOPER: nil) do
             klass.cask!(cask:, download_path:)
           end
-        end.to raise_error(Cask::CaskQuarantineError, /couldn.t be opened/)
+        end.to raise_error(Cask::CaskQuarantineError, /Failed to set quarantine properties/)
       end
     end
 
-    it "uses Swift quarantining by default" do
-      download_path = Pathname("/tmp/Test.dmg")
-      swift = Pathname("/usr/bin/swift")
-
-      allow(klass).to receive_messages(detect: false, swift:)
-      allow(klass).to receive(:swift_target_args).and_return(["-target", "arm64-apple-macosx15"])
-      expect(klass).to receive(:system_command)
-        .with(
-          swift,
-          args:         [
-            "-target",
-            "arm64-apple-macosx15",
-            Cask::Quarantine::QUARANTINE_SCRIPT,
-            download_path,
-            "https://example.com/download",
-            "https://example.com",
-          ],
-          print_stderr: false,
-        )
-        .and_return(instance_double(SystemCommand::Result, success?: true))
-
-      with_env(HOMEBREW_DEVELOPER: nil) do
-        klass.cask!(cask:, download_path:)
-      end
-    end
-
-    it "uses FFI quarantining in developer mode" do
+    it "uses FFI quarantining by default" do
       require "os/mac/ffi"
 
       download_path = Pathname("/tmp/Test.dmg")
@@ -106,6 +120,7 @@ RSpec.describe Cask::Quarantine do
       quarantine_properties_key = instance_double(Fiddle::Pointer)
 
       allow(klass).to receive(:detect).with(download_path).and_return(false)
+      allow(MacOS::FFI::CoreFoundation).to receive(:release)
       allow(MacOS::FFI::CoreFoundation).to receive(:string_create).with(download_path.to_s).and_return(path)
       allow(MacOS::FFI::CoreFoundation).to receive(:url_create_with_file_system_path).with(path).and_return(url)
       allow(MacOS::FFI::CoreFoundation).to receive(:string_create).with("Homebrew Cask").and_return(agent_name)
@@ -120,26 +135,53 @@ RSpec.describe Cask::Quarantine do
         quarantine_data_url_key:      instance_double(Fiddle::Pointer),
         quarantine_origin_url_key:    instance_double(Fiddle::Pointer),
       )
-      expect(MacOS::FFI::CoreFoundation).to receive(:dictionary_create).with(
+      expect(MacOS::FFI::CoreFoundation).to receive(:dictionary_create).with({
         MacOS::FFI::LaunchServices.quarantine_agent_name_key => agent_name,
         MacOS::FFI::LaunchServices.quarantine_type_key       => MacOS::FFI::LaunchServices.quarantine_type_web_download,
         MacOS::FFI::LaunchServices.quarantine_data_url_key   => data_url,
         MacOS::FFI::LaunchServices.quarantine_origin_url_key => origin_url,
-      ).and_return(dictionary)
+      }).and_return(dictionary)
       allow(MacOS::FFI::CoreFoundation).to receive(:url_quarantine_properties_key)
         .and_return(quarantine_properties_key)
       expect(MacOS::FFI::CoreFoundation).to receive(:url_set_resource_property_for_key)
         .with(url, quarantine_properties_key, dictionary)
         .and_return(true)
 
-      with_env(HOMEBREW_DEVELOPER: "1") do
+      with_env(HOMEBREW_DEVELOPER: nil) do
         klass.cask!(cask:, download_path:)
       end
     end
   end
 
+  describe ".propagate" do
+    let(:source) { mktmpdir/"download.zip" }
+    let(:destination) { mktmpdir }
+
+    before do
+      allow(klass).to receive(:available?).and_return(true)
+    end
+
+    it "does nothing when the source is not quarantined" do
+      allow(klass).to receive(:status).with(source).and_return("")
+      expect(klass).not_to receive(:system_command!)
+
+      klass.propagate(from: source, to: destination)
+    end
+
+    it "reads the source metadata once when propagating quarantine" do
+      allow(klass).to receive(:system_command!)
+      allow(klass).to receive_messages(
+        xattr:          Pathname("/usr/bin/xattr"),
+        system_command: instance_double(SystemCommand::Result, success?: true),
+      )
+      expect(klass).to receive(:status).with(source).once.and_return("0083;6723b9fa;Safari;event-id")
+
+      klass.propagate(from: source, to: destination)
+    end
+  end
+
   describe ".copy_xattrs", :needs_macos do
-    it "uses FFI in developer mode when the destination is writable" do
+    it "uses FFI when the destination is writable" do
       require "os/mac/ffi"
 
       source = Pathname("/tmp/Source.app")
@@ -149,29 +191,30 @@ RSpec.describe Cask::Quarantine do
       allow(destination).to receive(:writable?).and_return(true)
       expect(MacOS::FFI).to receive(:copy_xattrs).with(source.to_s, destination.to_s)
 
-      with_env(HOMEBREW_DEVELOPER: "1") do
+      with_env(HOMEBREW_DEVELOPER: nil) do
         klass.copy_xattrs(source, destination, command:)
       end
     end
 
-    it "uses Swift by default when the destination needs sudo" do
+    it "uses FFI through vendored Ruby with optional elevation" do
+      require "os/mac/ffi"
+
       source = Pathname("/tmp/Source.app")
       destination = Pathname("/tmp/Destination.app")
-      swift = Pathname("/usr/bin/swift")
       command = class_double(SystemCommand)
+      ruby, *args = HOMEBREW_RUBY_EXEC_ARGS
 
       allow(destination).to receive(:writable?).and_return(false)
-      allow(klass).to receive_messages(swift: swift, swift_target_args: ["-target", "arm64-apple-macosx15"])
       expect(command).to receive(:run!).with(
-        swift,
-        args: [
-          "-target",
-          "arm64-apple-macosx15",
-          Cask::Quarantine::COPY_XATTRS_SCRIPT,
+        ruby,
+        args: args + [
+          "-I",
+          $LOAD_PATH.join(File::PATH_SEPARATOR),
+          OS::Mac::Cask::Quarantine::COPY_XATTRS_SCRIPT,
           source,
           destination,
         ],
-        sudo: true,
+        sudo: nil,
       )
 
       with_env(HOMEBREW_DEVELOPER: nil) do
@@ -179,29 +222,26 @@ RSpec.describe Cask::Quarantine do
       end
     end
 
-    it "uses FFI through brew ruby in developer mode when the destination needs sudo" do
+    it "copies extended attributes when run as a standalone script" do
       require "os/mac/ffi"
 
-      source = Pathname("/tmp/Source.app")
-      destination = Pathname("/tmp/Destination.app")
-      command = class_double(SystemCommand)
+      mktmpdir do |tmpdir|
+        source = tmpdir/"source"
+        destination = tmpdir/"destination"
+        source.write("source")
+        destination.write("destination")
+        MacOS::FFI.set_xattr(source.to_s, "com.homebrew.test.source", "source")
 
-      allow(destination).to receive(:writable?).and_return(false)
-      expect(command).to receive(:run!).with(
-        HOMEBREW_BREW_FILE,
-        args: [
-          "ruby",
-          "--",
-          "-e",
-          OS::Mac::Cask::Quarantine::COPY_XATTRS_RUBY,
-          source,
-          destination,
-        ],
-        sudo: true,
-      )
+        _, stderr, status = Open3.capture3(
+          *HOMEBREW_RUBY_EXEC_ARGS,
+          "-I", $LOAD_PATH.join(File::PATH_SEPARATOR),
+          OS::Mac::Cask::Quarantine::COPY_XATTRS_SCRIPT.to_s,
+          source.to_s,
+          destination.to_s
+        )
 
-      with_env(HOMEBREW_DEVELOPER: "1") do
-        klass.copy_xattrs(source, destination, command:)
+        expect(status).to be_success, stderr
+        expect(MacOS::FFI.get_xattr(destination.to_s, "com.homebrew.test.source")).to eq("source")
       end
     end
   end
@@ -211,6 +251,13 @@ RSpec.describe Cask::Quarantine do
 
     before do
       allow(klass).to receive(:xattr).and_return(Pathname("/usr/bin/xattr"))
+    end
+
+    it "does not locate xattr when quarantine is unavailable" do
+      allow(klass).to receive(:available?).and_return(false)
+      expect(klass).not_to receive(:xattr)
+
+      klass.user_approved?(file)
     end
 
     it "returns true when the user approval flag is set" do
@@ -237,17 +284,73 @@ RSpec.describe Cask::Quarantine do
         xattr:,
       )
       expect(klass).to receive(:system_command).with(
-        xattr,
+        "/usr/bin/xargs",
         args:         [
+          "-0",
+          "--",
+          xattr,
           "-w",
           Cask::Quarantine::QUARANTINE_ATTRIBUTE,
           "03c1;6a51855d;;3C86362A-29CA-4D55-90E7-A6621B9CC78D",
-          file,
         ],
+        input:        file.to_s,
         print_stderr: false,
       ).and_return(instance_double(SystemCommand::Result, success?: true))
 
       klass.inherit_user_approval!(download_path: file)
+    end
+
+    it "mirrors approval onto shared paths and skips paths this version does not have" do
+      mktmpdir do |tmpdir|
+        app = tmpdir/"Test.app"
+        (app/"Contents/MacOS").mkpath
+        FileUtils.touch app/"Contents/MacOS/Test"
+
+        allow(klass).to receive_messages(
+          detect: true,
+          status: "0381;6a51855d;;3C86362A-29CA-4D55-90E7-A6621B9CC78D",
+          xattr:,
+        )
+        expect(klass).to receive(:system_command).with(
+          "/usr/bin/xargs",
+          args:         [
+            "-0",
+            "--",
+            xattr,
+            "-w",
+            Cask::Quarantine::QUARANTINE_ATTRIBUTE,
+            "03c1;6a51855d;;3C86362A-29CA-4D55-90E7-A6621B9CC78D",
+          ],
+          input:        [app, app/"Contents/MacOS/Test"].join("\0"),
+          print_stderr: false,
+        ).and_return(instance_double(SystemCommand::Result, success?: true))
+
+        klass.inherit_user_approval!(download_path:  app,
+                                     approved_paths: ["Contents/MacOS/Test", "Contents/MacOS/Removed"])
+      end
+    end
+  end
+
+  describe ".user_approved_paths" do
+    let(:xattr) { Pathname("/usr/bin/xattr") }
+
+    it "returns only the approved paths, relative to the directory" do
+      mktmpdir do |tmpdir|
+        app = tmpdir/"Test.app"
+        (app/"Contents").mkpath
+        FileUtils.touch app/"Contents/approved"
+        FileUtils.touch app/"Contents/unapproved"
+
+        allow(klass).to receive_messages(xattr: xattr, system_command: instance_double(
+          SystemCommand::Result,
+          stdout: "#{app}: 03c1;6a51855d;;uuid\n" \
+                  "#{app}/Contents: 0381;6a51855d;;uuid\n" \
+                  "#{app}/Contents/approved: 03c1;6a51855d;;uuid\n" \
+                  "#{app}/Contents/unapproved: 0381;6a51855d;;uuid\n",
+        ))
+
+        expect(klass.user_approved_paths(app)).to eq(["Contents/approved"])
+      end
     end
   end
 

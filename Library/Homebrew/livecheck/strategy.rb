@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/output"
+
 require "utils/curl"
 require "livecheck/options"
 
@@ -239,7 +241,7 @@ module Homebrew
           [:default, :browser]
         end
 
-        user_agents.each do |user_agent|
+        user_agents.each_with_index do |user_agent, i|
           begin
             parsed_output = curl_headers(
               *curl_post_args,
@@ -257,8 +259,17 @@ module Homebrew
             next
           end
 
-          parsed_output[:responses].each { |response| headers << response[:headers] }
-          break if headers.present?
+          parsed_output[:responses]&.each { |response| headers << response[:headers] }
+          next unless headers.present?
+
+          if i.positive?
+            Utils::Output.odeprecated(
+              "the user agent fallback in `page_headers`",
+              "the `user_agent:` option in a `livecheck` block",
+            )
+          end
+
+          break
         end
 
         headers
@@ -294,7 +305,7 @@ module Homebrew
         end
 
         stderr = T.let(nil, T.nilable(String))
-        user_agents.each do |user_agent|
+        user_agents.each_with_index do |user_agent, i|
           stdout, stderr, status = curl_output(
             *curl_post_args,
             *args,
@@ -309,6 +320,13 @@ module Homebrew
             user_agent:,
           )
           next unless status.success?
+
+          if i.positive?
+            Utils::Output.odeprecated(
+              "the user agent fallback in `page_content`",
+              "the `user_agent:` option in a `livecheck` block",
+            )
+          end
 
           # stdout contains the header information followed by the page content.
           # We use #scrub here to avoid "invalid byte sequence in UTF-8" errors.

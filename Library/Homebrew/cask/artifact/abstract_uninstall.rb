@@ -1,8 +1,11 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/data"
+
 require "timeout"
 
+require "services/system"
 require "utils/user"
 require "cask/artifact/abstract_artifact"
 require "cask/pkg"
@@ -45,7 +48,7 @@ module Cask
 
       sig { params(cask: Cask, directives: DirectivesType).void }
       def initialize(cask, **directives)
-        directives.assert_valid_keys(*ORDERED_DIRECTIVES, *METADATA_KEYS)
+        ::Utils::Data.assert_valid_keys(directives, *ORDERED_DIRECTIVES, *METADATA_KEYS)
 
         super
         directives[:signal] = Array(directives[:signal]).flatten.each_slice(2).to_a
@@ -76,22 +79,141 @@ module Cask
         @bundle_ids_to_reopen ||= T.let([], T.nilable(T::Array[String]))
       end
 
-      private
+      # :quit/:signal must come before :kext so the kext will not be in use by a running process
+      sig {
+        params(
+          bundle_ids: String,
+          command:    T.nilable(T.class_of(SystemCommand)),
+          upgrade:    T::Boolean,
+          _kwargs:    T.anything,
+        ).void
+      }
+      def uninstall_quit(*bundle_ids, command: nil, upgrade: false, **_kwargs)
+        bundle_ids = bundle_ids.flat_map { |bundle_id| expand_bundle_id(bundle_id) }
 
-      sig { params(options: DirectivesType).void }
-      def dispatch_uninstall_directives(**options)
-        ORDERED_DIRECTIVES.each do |directive_sym|
-          dispatch_uninstall_directive(directive_sym, **options)
+        bundle_ids.each do |bundle_id|
+          next unless running?(bundle_id)
+
+          unless User.current&.gui?
+            opoo "Not logged into a GUI; skipping quitting application ID '#{bundle_id}'."
+            next
+          end
+
+          if hosting_brew?(bundle_id)
+            opoo "Skipping quitting application '#{bundle_id}' as `brew` is running inside it."
+            next
+          end
+
+          ohai "Quitting application '#{bundle_id}'..."
+
+          quit_succeeded = T.let(false, T::Boolean)
+          begin
+            Timeout.timeout(10) do
+              Kernel.loop do
+                next unless quit(bundle_id).success?
+
+                next if running?(bundle_id)
+
+                puts "Application '#{bundle_id}' quit successfully."
+                quit_succeeded = true
+                break
+              end
+            end
+          rescue Timeout::Error
+            opoo "Application '#{bundle_id}' did not quit. #{automation_access_instructions}"
+          end
+
+          bundle_ids_to_reopen << bundle_id if upgrade && quit_succeeded
         end
       end
 
-      sig { params(directive_sym: Symbol, options: T.anything).void }
-      def dispatch_uninstall_directive(directive_sym, **options)
+      # This returns T::Enumerable[[Pathname, T::Array[Pathname]]] when called without a block,
+      # but sorbet doesn't support overloads.
+      sig {
+        params(
+          action: Symbol,
+          paths:  T::Array[T.any(Pathname, String)],
+          _block: T.nilable(T.proc.params(path: T.any(Pathname, String), resolved_paths: T::Array[Pathname]).void),
+        ).returns(T.untyped)
+      }
+      def each_resolved_path(action, paths, &_block)
+        return enum_for(:each_resolved_path, action, paths) unless block_given?
+
+        paths.each do |path|
+          resolved_path = Pathname.new(path.to_s.sub(%r{^~(?=(?:/|$))}, Dir.home))
+
+          if resolved_path.relative?
+            opoo "Skipping #{Formatter.identifier(action)} for relative path '#{path}'."
+            next
+          end
+
+          if resolved_path.each_filename.to_a.intersect?([".", ".."])
+            opoo "Skipping #{Formatter.identifier(action)} for path with relative segments '#{path}'."
+            next
+          end
+
+          begin
+            resolved_paths = Pathname.glob(resolved_path).reject do |target|
+              next false unless undeletable?(target)
+
+              opoo "Skipping #{Formatter.identifier(action)} for undeletable path '#{target}'."
+              true
+            end
+            yield path, resolved_paths
+          rescue Errno::EPERM
+            raise if ::Cask::Utils.full_disk_access_enabled?
+
+            odie "Unable to remove some files. Please enable Full Disk Access for your terminal under " \
+                 "#{::Cask::Utils.privacy_security_preference_pane("Full Disk Access")}."
+          end
+        end
+      end
+
+      sig { params(search: String).returns(T::Array[String]) }
+      def find_launchctl_with_wildcard(search)
+        regex = wildcard_pattern(search)
+        system_command!("/bin/launchctl", args: ["list"])
+          .stdout.lines.drop(1) # skip stdout column headers
+          .filter_map do |line|
+            pid, _state, id = line.chomp.split(/\s+/)
+            id if pid.to_i.nonzero? && id&.match?(regex)
+          end
+      end
+
+      private
+
+      sig {
+        params(
+          command:   T.class_of(SystemCommand),
+          force:     T::Boolean,
+          successor: T.nilable(Cask),
+          upgrade:   T::Boolean,
+        ).void
+      }
+      def dispatch_uninstall_directives(command:, force: false, successor: nil, upgrade: false)
+        ORDERED_DIRECTIVES.each do |directive_sym|
+          dispatch_uninstall_directive(directive_sym, command:, force:, successor:, upgrade:)
+        end
+      end
+
+      # The `uninstall_*` methods are dispatched dynamically, so they take these
+      # options uniformly and ignore the ones they do not need.
+      sig {
+        params(
+          directive_sym: Symbol,
+          command:       T.class_of(SystemCommand),
+          force:         T::Boolean,
+          successor:     T.nilable(Cask),
+          upgrade:       T::Boolean,
+        ).void
+      }
+      def dispatch_uninstall_directive(directive_sym, command:, force: false, successor: nil, upgrade: false)
         return unless directives.key?(directive_sym)
 
         args = directives[directive_sym]
 
-        send(:"uninstall_#{directive_sym}", *(args.is_a?(Hash) ? [args] : args), **options)
+        send(:"uninstall_#{directive_sym}", *(args.is_a?(Hash) ? [args] : args),
+             command:, force:, successor:, upgrade:)
       end
 
       sig { returns(Symbol) }
@@ -102,15 +224,23 @@ module Cask
       # Preserve prior functionality of script which runs first. Should rarely be needed.
       # :early_script should not delete files, better defer that to :script.
       # If cask writers never need :early_script it may be removed in the future.
-      sig { params(directives: DirectivesType, options: T.anything).void }
-      def uninstall_early_script(directives, **options)
-        uninstall_script(directives, directive_name: :early_script, **options)
+      sig {
+        params(
+          directives: DirectivesType,
+          command:    T.class_of(SystemCommand),
+          force:      T::Boolean,
+          _kwargs:    T.anything,
+        ).void
+      }
+      def uninstall_early_script(directives, command:, force: false, **_kwargs)
+        uninstall_script(directives, command:, directive_name: :early_script, force:)
       end
 
       # :launchctl must come before :quit/:signal for cases where app would instantly re-launch
       sig { params(services: String, command: T.class_of(SystemCommand), _kwargs: T.anything).void }
       def uninstall_launchctl(*services, command:, **_kwargs)
         booleans = [false, true]
+        booleans.delete(true) if Homebrew::EnvConfig.no_sudo?
 
         all_services = []
 
@@ -128,14 +258,8 @@ module Cask
         all_services.each do |service|
           ohai "Removing launchctl service #{service}"
           booleans.each do |sudo|
-            plist_status = command.run(
-              "/bin/launchctl",
-              args:         ["list", service],
-              sudo:,
-              sudo_as_root: sudo,
-              print_stderr: false,
-            ).stdout
-            if plist_status.start_with?("{")
+            _, found, = Homebrew::Services::System.launchctl_find_service(service, sudo:)
+            if found
               result = command.run(
                 "/bin/launchctl",
                 args:         ["remove", service],
@@ -189,17 +313,6 @@ module Cask
           end
       end
 
-      sig { params(search: String).returns(T::Array[String]) }
-      def find_launchctl_with_wildcard(search)
-        regex = Regexp.escape(search).gsub("\\*", ".*")
-        system_command!("/bin/launchctl", args: ["list"])
-          .stdout.lines.drop(1) # skip stdout column headers
-          .filter_map do |line|
-            pid, _state, id = line.chomp.split(/\s+/)
-            id if pid.to_i.nonzero? && T.must(id).match?(regex)
-          end
-      end
-
       sig { returns(String) }
       def automation_access_instructions
         <<~EOS
@@ -207,47 +320,6 @@ module Cask
             #{::Cask::Utils.privacy_security_preference_pane("Automation")}
           if you haven't already.
         EOS
-      end
-
-      # :quit/:signal must come before :kext so the kext will not be in use by a running process
-      sig {
-        params(
-          bundle_ids: String,
-          command:    T.nilable(T.class_of(SystemCommand)),
-          upgrade:    T::Boolean,
-          _kwargs:    T.anything,
-        ).void
-      }
-      def uninstall_quit(*bundle_ids, command: nil, upgrade: false, **_kwargs)
-        bundle_ids.each do |bundle_id|
-          next unless running?(bundle_id)
-
-          unless T.must(User.current).gui?
-            opoo "Not logged into a GUI; skipping quitting application ID '#{bundle_id}'."
-            next
-          end
-
-          ohai "Quitting application '#{bundle_id}'..."
-
-          quit_succeeded = T.let(false, T::Boolean)
-          begin
-            Timeout.timeout(10) do
-              Kernel.loop do
-                next unless quit(bundle_id).success?
-
-                next if running?(bundle_id)
-
-                puts "Application '#{bundle_id}' quit successfully."
-                quit_succeeded = true
-                break
-              end
-            end
-          rescue Timeout::Error
-            opoo "Application '#{bundle_id}' did not quit. #{automation_access_instructions}"
-          end
-
-          bundle_ids_to_reopen << bundle_id if upgrade && quit_succeeded
-        end
       end
 
       sig { params(bundle_id: String).returns(T::Boolean) }
@@ -271,6 +343,99 @@ module Cask
 
         system_command("osascript", args:         ["-l", "JavaScript", "-e", script, bundle_id],
                                     print_stderr: true).status.success? || false
+      end
+
+      RUNNING_BUNDLE_IDS_SCRIPT = <<~JAVASCRIPT
+        'use strict';
+
+        ObjC.import('AppKit')
+
+        function run() {
+          var apps = $.NSWorkspace.sharedWorkspace.runningApplications
+          var bundleIds = []
+
+          for (var i = 0; i < apps.count; i++) {
+            var bundleId = apps.objectAtIndex(i).bundleIdentifier
+            if (!bundleId.isNil()) {
+              bundleIds.push(ObjC.unwrap(bundleId))
+            }
+          }
+
+          return bundleIds.join("\\n")
+        }
+      JAVASCRIPT
+      private_constant :RUNNING_BUNDLE_IDS_SCRIPT
+
+      # Expands a `*` wildcard to the bundle IDs of matching running applications.
+      sig { params(bundle_id: String).returns(T::Array[String]) }
+      def expand_bundle_id(bundle_id)
+        return [bundle_id] unless bundle_id.include?("*")
+
+        # Listing running applications needs a GUI session, so warn once for the
+        # pattern rather than enumerating and matching nothing.
+        unless User.current&.gui?
+          opoo "Not logged into a GUI; skipping applications matching '#{bundle_id}'."
+          return []
+        end
+
+        # Anchored so that e.g. `com.example*` cannot match `org.other.com.example`,
+        # and case-insensitive because `Application()` resolves bundle IDs that way.
+        running_bundle_ids.grep(/\A#{wildcard_pattern(bundle_id)}\z/i)
+      end
+
+      # Translates a `*` wildcard into a regular expression fragment, leaving the
+      # rest of the ID literal. Anchoring and case are left to the caller.
+      sig { params(search: String).returns(String) }
+      def wildcard_pattern(search)
+        Regexp.escape(search).gsub("\\*", ".*")
+      end
+
+      # Whether the application with the given bundle ID is an ancestor of this
+      # `brew` process, e.g. the terminal emulator the shell is running in.
+      # Quitting or signalling it would take down `brew` itself.
+      sig { params(bundle_id: String).returns(T::Boolean) }
+      def hosting_brew?(bundle_id)
+        AbstractUninstall.ancestor_bundle_ids.any? { |id| id.casecmp?(bundle_id) }
+      end
+
+      class << self
+        # Bundle IDs of the applications this `brew` process is running inside.
+        # The ancestry of the `brew` process cannot change while it runs, so the
+        # lookup is shared by every artifact of every cask in the same invocation.
+        sig { returns(T::Array[String]) }
+        def ancestor_bundle_ids
+          @ancestor_bundle_ids ||= begin
+            pids = [Process.pid]
+            # `launchd` (PID 1) reports a parent of `0` rather than failing.
+            while (ppid = parent_pid(pids.last)) && ppid > 1 && pids.exclude?(ppid)
+              pids << ppid
+            end
+
+            pids.filter_map { |pid| bundle_identifier_for_pid(pid) }
+          end
+        end
+
+        sig { params(ancestor_bundle_ids: T.nilable(T::Array[String])).returns(T.nilable(T::Array[String])) }
+        attr_writer :ancestor_bundle_ids
+
+        sig { params(_pid: Integer).returns(T.nilable(Integer)) }
+        def parent_pid(_pid) = nil
+
+        sig { params(_pid: Integer).returns(T.nilable(String)) }
+        def bundle_identifier_for_pid(_pid) = nil
+
+        sig { params(_pid: Integer).returns(T.nilable(Integer)) }
+        def owner_uid(_pid) = nil
+      end
+
+      sig { returns(T::Array[String]) }
+      def running_bundle_ids
+        @running_bundle_ids ||= T.let(
+          system_command("osascript", args:         ["-l", "JavaScript", "-e", RUNNING_BUNDLE_IDS_SCRIPT],
+                                      print_stderr: true)
+            .stdout.split("\n").map(&:strip).reject(&:empty?),
+          T.nilable(T::Array[String]),
+        )
       end
 
       sig { params(bundle_id: String).returns(SystemCommand::Result) }
@@ -305,13 +470,34 @@ module Cask
         params(signals: [String, String], command: T.nilable(T.class_of(SystemCommand)), _kwargs: T.anything).void
       }
       def uninstall_signal(*signals, command: nil, **_kwargs)
-        signals.each do |pair|
+        signals = signals.flat_map do |pair|
           raise CaskInvalidError.new(cask, "Each #{stanza} :signal must consist of 2 elements.") if pair.size != 2
 
           signal, bundle_id = pair
-          ohai "Signalling '#{signal}' to application ID '#{bundle_id}'"
+          expand_bundle_id(bundle_id).map { |expanded_id| [signal, expanded_id] }
+        end
+
+        signals.each do |pair|
+          signal, bundle_id = pair
           pids = running_processes(bundle_id).map(&:first)
           next if pids.none?
+
+          if hosting_brew?(bundle_id)
+            opoo "Skipping signalling application '#{bundle_id}' as `brew` is running inside it."
+            next
+          end
+
+          pids.select! do |pid|
+            uid = AbstractUninstall.owner_uid(pid)
+            next true if uid == Process.uid
+
+            reason = uid.nil? ? "its owner could not be determined" : "it is owned by another user"
+            odebug "Skipping signalling PID #{pid} for '#{bundle_id}': #{reason}."
+            false
+          end
+          next if pids.none?
+
+          ohai "Signalling '#{signal}' to application ID '#{bundle_id}'"
 
           # Note that unlike :quit, signals are sent from the current user (not
           # upgraded to the superuser). This is a todo item for the future, but
@@ -319,7 +505,6 @@ module Cask
           # misapplied "kill" by root could bring down the system. The fact that we
           # learned the pid from AppleScript is already some degree of protection,
           # though indirect.
-          # TODO: check the user that owns the PID and don't try to kill those from other users.
           odebug "Unix ids are #{pids.inspect} for processes with bundle identifier #{bundle_id}"
           begin
             Process.kill(signal, *pids)
@@ -452,48 +637,6 @@ module Cask
         end
       end
 
-      # This returns T::Enumerable[[Pathname, T::Array[Pathname]]] when called without a block,
-      # but sorbet doesn't support overloads.
-      sig {
-        params(
-          action: Symbol,
-          paths:  T::Array[T.any(Pathname, String)],
-          _block: T.nilable(T.proc.params(path: T.any(Pathname, String), resolved_paths: T::Array[Pathname]).void),
-        ).returns(T.untyped)
-      }
-      def each_resolved_path(action, paths, &_block)
-        return enum_for(:each_resolved_path, action, paths) unless block_given?
-
-        paths.each do |path|
-          resolved_path = Pathname.new(path.to_s.sub(%r{^~(?=(/|$))}, Dir.home))
-
-          if resolved_path.relative?
-            opoo "Skipping #{Formatter.identifier(action)} for relative path '#{path}'."
-            next
-          end
-
-          if resolved_path.each_filename.any? { |part| [".", ".."].include?(part) }
-            opoo "Skipping #{Formatter.identifier(action)} for path with relative segments '#{path}'."
-            next
-          end
-
-          begin
-            resolved_paths = Pathname.glob(resolved_path).reject do |target|
-              next false unless undeletable?(target)
-
-              opoo "Skipping #{Formatter.identifier(action)} for undeletable path '#{target}'."
-              true
-            end
-            yield path, resolved_paths
-          rescue Errno::EPERM
-            raise if ::Cask::Utils.full_disk_access_enabled?
-
-            odie "Unable to remove some files. Please enable Full Disk Access for your terminal under " \
-                 "#{::Cask::Utils.privacy_security_preference_pane("Full Disk Access")}."
-          end
-        end
-      end
-
       sig { params(paths: T.any(Pathname, String), command: T.class_of(SystemCommand), _kwargs: T.anything).void }
       def uninstall_delete(*paths, command:, **_kwargs)
         return if paths.empty?
@@ -510,21 +653,27 @@ module Cask
         end
       end
 
-      sig { params(paths: T.any(Pathname, String), options: T.anything).void }
-      def uninstall_trash(*paths, **options)
+      sig {
+        params(
+          paths:   T.any(Pathname, String),
+          command: T.nilable(T.class_of(SystemCommand)),
+          _kwargs: T.anything,
+        ).void
+      }
+      def uninstall_trash(*paths, command: nil, **_kwargs)
         return if paths.empty?
 
         resolved_paths = each_resolved_path(:trash, paths).to_a
 
         ohai "Trashing files:", resolved_paths.map(&:first)
-        trash_paths(*resolved_paths.flat_map(&:last), **options)
+        trash_paths(*resolved_paths.flat_map(&:last), command:)
       end
 
       sig {
-        params(paths: Pathname, command: T.nilable(T.class_of(SystemCommand)), _kwargs: T.anything)
+        params(paths: Pathname, command: T.nilable(T.class_of(SystemCommand)))
           .returns(T.nilable([T::Array[String], T::Array[String]]))
       }
-      def trash_paths(*paths, command: nil, **_kwargs)
+      def trash_paths(*paths, command: nil)
         return if paths.empty?
 
         trashed, untrashable = ::Cask::Utils::Trash.trash(*paths, command:)
@@ -542,10 +691,11 @@ module Cask
         directories.all?(&:directory?)
       end
 
-      sig { params(directories: Pathname, command: T.class_of(SystemCommand), _kwargs: T.anything).void }
-      def recursive_rmdir(*directories, command:, **_kwargs)
+      sig { params(directories: Pathname, command: T.class_of(SystemCommand)).void }
+      def recursive_rmdir(*directories, command:)
         directories.all? do |resolved_path|
           puts resolved_path.sub(Dir.home, "~")
+          next false if resolved_path.symlink?
 
           if resolved_path.readable?
             children = resolved_path.children
@@ -580,8 +730,14 @@ module Cask
         end
       end
 
-      sig { params(directories: T.any(Pathname, String), kwargs: T.anything).void }
-      def uninstall_rmdir(*directories, **kwargs)
+      sig {
+        params(
+          directories: T.any(Pathname, String),
+          command:     T.class_of(SystemCommand),
+          _kwargs:     T.anything,
+        ).void
+      }
+      def uninstall_rmdir(*directories, command:, **_kwargs)
         return if directories.empty?
 
         ohai "Removing directories if empty:"
@@ -589,7 +745,7 @@ module Cask
         each_resolved_path(:rmdir, directories) do |_path, resolved_paths|
           next unless resolved_paths.all?(&:directory?)
 
-          recursive_rmdir(*resolved_paths, **kwargs)
+          recursive_rmdir(*resolved_paths, command:)
         end
       end
 

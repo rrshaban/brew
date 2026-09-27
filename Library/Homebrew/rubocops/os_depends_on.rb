@@ -1,6 +1,7 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "macos_version"
 require "rubocops/cask/constants/stanza"
 
 module RuboCop
@@ -28,9 +29,12 @@ module RuboCop
           :vst_plugin,
           :vst3_plugin,
         ].freeze
+        LINUX_ONLY_CASK_STANZAS = [:app_image].freeze
+        PLATFORM_BLOCKS = [:on_arm, :on_intel, :on_system].freeze
 
         CASK_STANZA_ORDER = T.let(RuboCop::Cask::Constants::STANZA_ORDER, T::Array[Symbol])
         MACOS_DEPENDENCY_STANZAS = [:macos, :maximum_macos].freeze
+        LINUX_DEPENDENCY_STANZAS = [:linux].freeze
 
         RESTRICT_ON_SEND = [:depends_on].freeze
 
@@ -40,7 +44,8 @@ module RuboCop
           return unless send_node.is_a?(RuboCop::AST::SendNode)
           return if send_node.method_name != :cask
 
-          add_missing_macos_dependency(node)
+          add_missing_os_dependency(node, :macos)
+          add_missing_os_dependency(node, :linux)
         end
 
         sig { params(node: RuboCop::AST::SendNode).void }
@@ -48,6 +53,52 @@ module RuboCop
           autocorrect_macos_comparison_strings(node)
           check_redundant_bare_macos(node)
           check_conflicting_os_requirements(node)
+
+          macos_pairs = depends_on_pairs(node).select { |pair| symbol_key(pair) == :macos }
+          return if node.receiver || macos_pairs.empty?
+
+          oldest_macos = MacOSVersion::SYMBOLS.values.map { |release| MacOSVersion.new(release) }.min
+          return unless oldest_macos
+
+          macos_pairs.each do |pair|
+            value = pair.value
+            if value.array_type? && (value.values.one? || node.each_ancestor(:class).any?)
+              value = value.values.first
+            end
+            next unless value&.sym_type?
+
+            version = MacOSVersion::RELEASES[value.value]
+            next unless version
+            next if MacOSVersion.new(version) > oldest_macos
+
+            hash = pair.parent
+            next unless hash&.hash_type?
+
+            os_block = node.each_ancestor(:block).any? do |ancestor|
+              method = ancestor.method_name
+              method == :on_system ||
+                (RuboCop::Cask::Constants::ON_SYSTEM_METHODS.include?(method) &&
+                 ![:on_arm, :on_intel].include?(method))
+            end
+            tagged_formula = pair.value.array_type? && !pair.value.values.one?
+            message = if os_block
+              "Remove the redundant minimum macOS dependency from this OS block."
+            elsif !hash.pairs.one?
+              "Remove the redundant `macos:` pair and add a separate `depends_on :macos`."
+            else
+              "Use `depends_on :macos` instead of a redundant minimum macOS version."
+            end
+            add_offense(pair, message:) do |corrector|
+              next if os_block || tagged_formula
+              next if !hash.pairs.one? || !node.arguments.one?
+              next if sibling_depends_on_calls(node).any? { |sibling| bare_os_depends_on?(sibling, :macos) }
+              next if processed_source.comments.any? do |comment|
+                comment.source_range.line.between?(node.first_line, node.last_line)
+              end
+
+              corrector.replace(hash.source_range, ":macos")
+            end
+          end
         end
 
         private
@@ -79,6 +130,10 @@ module RuboCop
 
           message = "Remove redundant `depends_on :macos`."
           add_offense(node.source_range, message:) do |corrector|
+            next if processed_source.comments.any? do |comment|
+              comment.source_range.line.between?(node.first_line, node.last_line)
+            end
+
             corrector.remove(range_by_whole_lines(node.source_range, include_final_newline: true))
           end
         end
@@ -99,43 +154,32 @@ module RuboCop
           add_offense(node.source_range, message: "`depends_on` cannot be macOS-only and Linux-only.")
         end
 
-        sig { params(node: RuboCop::AST::BlockNode).void }
-        def add_missing_macos_dependency(node)
+        sig { params(node: RuboCop::AST::BlockNode, os: Symbol).void }
+        def add_missing_os_dependency(node, os)
           body = node.body
           return unless body
 
-          stanzas = (body.begin_type? ? body.child_nodes : [body]).filter_map do |child|
-            if child.send_type?
-              T.cast(child, RuboCop::AST::SendNode)
-            elsif child.block_type?
-              T.cast(child, RuboCop::AST::BlockNode).send_node
-            end
-          end
+          top_level_stanzas = direct_stanzas(body)
+          stanzas = top_level_stanzas.flat_map { |stanza| [stanza, *platform_block_stanzas(stanza)] }
           return if os_depends_on?(body)
 
-          macos_stanza = stanzas.find do |stanza|
-            case stanza.method_name
-            when :installer
-              stanza.arguments.any? do |argument|
-                argument.hash_type? && argument.pairs.any? { |pair| symbol_key(pair) == :manual }
-              end
-            when :os
-              pairs = depends_on_pairs(stanza)
-              pairs.any? { |pair| symbol_key(pair) == :macos } &&
-                pairs.none? { |pair| symbol_key(pair) == :linux }
-            when *MACOS_ONLY_CASK_STANZAS
-              true
-            else
-              false
-            end
-          end
-          return unless macos_stanza
+          os_stanza = stanzas.find { |stanza| os_only_stanza?(stanza, os) }
+          return unless os_stanza
 
-          add_offense(macos_stanza.source_range,
-                      message: "Add `depends_on :macos` for macOS-only casks.") do |corrector|
+          os_name = (os == :macos) ? "macOS" : "Linux"
+          if cross_platform_cask?(top_level_stanzas, stanzas, os)
+            add_offense(
+              os_stanza.source_range,
+              message: "Move this #{os_name}-only stanza into an `on_#{os}` block for cross-platform casks.",
+            )
+            return
+          end
+
+          add_offense(os_stanza.source_range,
+                      message: "Add `depends_on :#{os}` for #{os_name}-only casks.") do |corrector|
             depends_on_stanza_index = CASK_STANZA_ORDER.index(:depends_on) ||
                                       raise("unexpected nil value for depends_on stanza index")
-            following_stanza = stanzas.find do |stanza|
+            following_stanza = top_level_stanzas.find do |stanza|
               stanza_index = CASK_STANZA_ORDER.index(stanza.method_name)
               stanza_index && stanza_index > depends_on_stanza_index
             end
@@ -143,23 +187,84 @@ module RuboCop
             if following_stanza
               corrector.insert_before(
                 range_by_whole_lines(following_stanza.source_range, include_final_newline: false),
-                "  depends_on :macos\n\n",
+                "  depends_on :#{os}\n\n",
               )
-            elsif (preceding_stanza = stanzas.rfind do |stanza|
+            elsif (preceding_stanza = top_level_stanzas.rfind do |stanza|
               stanza_index = CASK_STANZA_ORDER.index(stanza.method_name)
               stanza_index && stanza_index <= depends_on_stanza_index
             end)
               corrector.insert_after(
-                range_by_whole_lines(preceding_stanza.source_range, include_final_newline: true),
-                "\n  depends_on :macos\n",
+                range_by_whole_lines(full_stanza_source_range(preceding_stanza), include_final_newline: true),
+                "\n  depends_on :#{os}\n",
               )
             else
               corrector.insert_before(
-                range_by_whole_lines(macos_stanza.source_range, include_final_newline: false),
-                "  depends_on :macos\n\n",
+                range_by_whole_lines(os_stanza.source_range, include_final_newline: false),
+                "  depends_on :#{os}\n\n",
               )
             end
           end
+        end
+
+        sig { params(stanza: RuboCop::AST::SendNode, os: Symbol).returns(T::Boolean) }
+        def os_only_stanza?(stanza, os)
+          if os == :macos
+            return MACOS_ONLY_CASK_STANZAS.include?(stanza.method_name) if stanza.method_name != :installer
+
+            stanza.arguments.any? do |argument|
+              argument.hash_type? && argument.pairs.any? { |pair| symbol_key(pair) == :manual }
+            end
+          else
+            LINUX_ONLY_CASK_STANZAS.include?(stanza.method_name)
+          end
+        end
+
+        sig {
+          params(
+            top_level_stanzas: T::Array[RuboCop::AST::SendNode],
+            stanzas:           T::Array[RuboCop::AST::SendNode],
+            os:                Symbol,
+          ).returns(T::Boolean)
+        }
+        def cross_platform_cask?(top_level_stanzas, stanzas, os)
+          other_os = (os == :macos) ? :linux : :macos
+          other_os_block = (other_os == :macos) ? :on_macos : :on_linux
+
+          # `on_system` always spans both operating systems, so it can never imply a bare OS dependency.
+          stanzas.any? { |stanza| stanza.method_name == :on_system } ||
+            top_level_stanzas.any? { |stanza| stanza.method_name == other_os_block } ||
+            stanzas.any? { |stanza| os_only_stanza?(stanza, other_os) }
+        end
+
+        sig { params(node: RuboCop::AST::Node).returns(T::Array[RuboCop::AST::SendNode]) }
+        def direct_stanzas(node)
+          (node.begin_type? ? node.child_nodes : [node]).filter_map do |child|
+            if child.send_type?
+              T.cast(child, RuboCop::AST::SendNode)
+            elsif child.block_type?
+              T.cast(child, RuboCop::AST::BlockNode).send_node
+            end
+          end
+        end
+
+        sig { params(stanza: RuboCop::AST::SendNode).returns(T::Array[RuboCop::AST::SendNode]) }
+        def platform_block_stanzas(stanza)
+          return [] unless PLATFORM_BLOCKS.include?(stanza.method_name)
+
+          block = stanza.parent
+          return [] unless block.is_a?(RuboCop::AST::BlockNode)
+          return [] unless (body = block.body)
+
+          nested_stanzas = direct_stanzas(body)
+          nested_stanzas + nested_stanzas.flat_map { |nested| platform_block_stanzas(nested) }
+        end
+
+        sig { params(stanza: RuboCop::AST::SendNode).returns(Parser::Source::Range) }
+        def full_stanza_source_range(stanza)
+          parent = stanza.parent
+          return parent.source_range if parent.is_a?(RuboCop::AST::BlockNode) && parent.send_node == stanza
+
+          stanza.source_range
         end
 
         sig { params(node: RuboCop::AST::SendNode).returns(T::Array[RuboCop::AST::PairNode]) }
@@ -198,8 +303,7 @@ module RuboCop
             next false if send_node.method_name != :depends_on
 
             bare_os_depends_on?(send_node, :macos) || bare_os_depends_on?(send_node, :linux) ||
-              top_level_macos_depends_on?(send_node) ||
-              depends_on_pairs(send_node).any? { |pair| symbol_key(pair) == :linux }
+              top_level_macos_depends_on?(send_node) || top_level_linux_depends_on?(send_node)
           end
         end
 
@@ -211,6 +315,11 @@ module RuboCop
         sig { params(node: RuboCop::AST::SendNode).returns(T::Boolean) }
         def top_level_macos_depends_on?(node)
           depends_on_pairs(node).any? { |pair| MACOS_DEPENDENCY_STANZAS.include?(symbol_key(pair)) }
+        end
+
+        sig { params(node: RuboCop::AST::SendNode).returns(T::Boolean) }
+        def top_level_linux_depends_on?(node)
+          depends_on_pairs(node).any? { |pair| LINUX_DEPENDENCY_STANZAS.include?(symbol_key(pair)) }
         end
       end
     end

@@ -26,11 +26,6 @@ RSpec.describe Dependency do
       dep = described_class.new("foo", [:build, "bar"])
       expect(dep.tags).to eq([:build, "bar"])
     end
-
-    it "rejects nil names" do
-      # Intentionally using T.unsafe to check runtime behaviour rather than static analysis
-      expect { T.unsafe(described_class).new(nil) }.to raise_error(TypeError)
-    end
   end
 
   describe "::merge_repeats" do
@@ -41,12 +36,7 @@ RSpec.describe Dependency do
       merged = described_class.merge_repeats([dep, dep2, dep3])
       expect(merged.count).to eq(2)
       expect(merged.first).to be_a described_class
-
-      foo_named_dep = T.must(merged.find { |d| d.name == "foo" })
-      expect(foo_named_dep.tags).to eq(["bar"])
-
-      xyz_named_dep = T.must(merged.find { |d| d.name == "xyz" })
-      expect(xyz_named_dep.tags).to eq(["abc"])
+      expect(merged.to_h { |d| [d.name, d.tags] }).to eq("foo" => ["bar"], "xyz" => ["abc"])
     end
 
     it "merges necessity tags" do

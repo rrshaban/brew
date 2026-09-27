@@ -46,7 +46,7 @@ module Homebrew
                description: "List the formulae not installed on request (i.e. installed as dependencies)."
         switch "--installed-as-dependency",
                description: "List the formulae installed as dependencies.",
-               odeprecated: true,
+               odisabled:   true,
                replacement: "--no-installed-on-request"
         switch "--poured-from-bottle",
                description: "List the formulae installed from a bottle."
@@ -99,14 +99,26 @@ module Homebrew
           raise UsageError, "`brew list --versions --json` is only supported by the fast Bash path with `jq`."
         end
 
-        installed_as_dependency = args.no_installed_on_request? || args.installed_as_dependency?
+        installed_as_dependency = args.no_installed_on_request?
 
         if args.full_name? &&
            !(args.installed_on_request? || installed_as_dependency ||
              args.poured_from_bottle? || args.built_from_source?)
           unless args.cask?
-            formula_names = args.no_named? ? Formula.installed : args.named.to_resolved_formulae
-            full_formula_names = formula_names.map(&:full_name).sort(&Cask::List::TAP_AND_NAME_COMPARISON)
+            full_formula_names = if args.no_named?
+              Formula.racks.map do |rack|
+                name = rack.basename.to_s
+                tap = begin
+                  Keg.from_rack(rack)&.tab&.tap
+                rescue JSON::ParserError, SystemCallError, Tap::InvalidNameError
+                  opoo "Could not identify the tap for #{name} from its installation receipt."
+                  nil
+                end
+                (tap.nil? || tap.core_tap?) ? name : "#{tap}/#{name}"
+              end
+            else
+              args.named.to_resolved_formulae.map(&:full_name)
+            end.sort(&Cask::List::TAP_AND_NAME_COMPARISON)
             full_formula_names = Formatter.columns(full_formula_names) unless args.public_send(:"1?")
             puts full_formula_names if full_formula_names.present?
           end
@@ -229,9 +241,12 @@ module Homebrew
             system_command! "ls", args: [*ls_args, HOMEBREW_CELLAR], print_stdout: true
             puts if $stdout.tty? && !args.formula?
           end
-          if !args.formula? && Cask::Caskroom.any_casks_installed?
-            ohai "Casks" if $stdout.tty? && !args.cask?
-            system_command! "ls", args: [*ls_args, Cask::Caskroom.path], print_stdout: true
+          unless args.formula?
+            if Cask::Caskroom.any_casks_installed?
+              ohai "Casks" if $stdout.tty? && !args.cask?
+              system_command! "ls", args: [*ls_args, Cask::Caskroom.path], print_stdout: true
+            end
+            warn_about_broken_caskroom_symlinks
           end
         else
           kegs, casks = args.named.to_kegs_to_casks
@@ -249,6 +264,19 @@ module Homebrew
 
       private
 
+      # A broken symlink in the Caskroom (e.g. a dangling cask rename alias) lists
+      # like an installed cask but cannot load or uninstall, so flag it.
+      # Keep in sync with the broken-symlink warning in `homebrew-list` in
+      # Library/Homebrew/list.sh.
+      sig { void }
+      def warn_about_broken_caskroom_symlinks
+        broken_symlinks = Cask::Caskroom.path.glob("*").select { |child| child.symlink? && !child.exist? }
+        return if broken_symlinks.empty?
+
+        opoo "Broken Caskroom symlinks (`brew cleanup` removes them): " \
+             "#{broken_symlinks.map(&:basename).sort.join(", ")}"
+      end
+
       sig { params(name: String).returns(T.nilable(String)) }
       def pinned_formula_entry(name)
         pin_path = HOMEBREW_PINNED_KEGS/name
@@ -262,7 +290,7 @@ module Homebrew
         pin_path = HOMEBREW_PINNED_CASKS/token
         return if !pin_path.symlink? || !pin_path.exist?
 
-        "#{token}#{" #{pin_path.resolved_path.basename}" if args.versions?}"
+        "#{token}#{" #{Utils::Path.resolved_path(pin_path).basename}" if args.versions?}"
       end
 
       sig { void }
@@ -287,7 +315,9 @@ module Homebrew
       sig { void }
       def list_casks
         casks = if args.no_named?
-          cask_paths = Cask::Caskroom.path.children.reject(&:file?).map do |path|
+          require "cask/cask_loader"
+
+          cask_paths = Cask::Caskroom.path.children.select(&:directory?).map do |path|
             if path.symlink?
               real_path = path.realpath
               real_path.basename.to_s

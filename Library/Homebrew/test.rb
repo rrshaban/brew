@@ -10,11 +10,9 @@ require "extend/ENV"
 require "timeout"
 require "formula_assertions"
 require "formula_free_port"
-require "fcntl"
-require "utils/socket"
 require "cli/parser"
 require "dev-cmd/test"
-require "json/add/exception"
+require "utils/fork"
 require "extend/pathname/write_mkpath_extension"
 
 DEFAULT_TEST_TIMEOUT_SECONDS = T.let(5 * 60, Integer)
@@ -27,8 +25,7 @@ begin
   args = Homebrew::DevCmd::Test.new.args
   Context.current = args.context
 
-  error_pipe = Utils::UNIXSocketExt.open(ENV.fetch("HOMEBREW_ERROR_PIPE"), &:recv_io)
-  error_pipe.fcntl(Fcntl::F_SETFD, Fcntl::FD_CLOEXEC)
+  error_pipe = Utils.forked_child_error_pipe
 
   trap("INT", old_trap)
 
@@ -49,26 +46,19 @@ begin
   ENV.setup_build_environment(formula:, testing_formula: true)
   Pathname.activate_extensions!
 
-  run_test = proc do |_|
-    # TODO: Replace proc usage with direct `formula.run_test` when removing this.
-    # Also update formula.rb 'TODO: replace `returns(BasicObject)` with `void`'
-    if formula.run_test(keep_tmp: args.keep_tmp?) == false
-      require "utils/output"
-      Utils::Output.odisabled "`return false` in test", "`raise \"<reason for failure>\"`"
-      raise "test returned false"
-    end
-  end
+  keep_tmp = args.keep_tmp?
   if args.debug? # --debug is interactive
-    run_test.call(nil)
+    formula.run_test(keep_tmp:)
   else
     # HOMEBREW_TEST_TIMEOUT_SECS is private API and subject to change.
     timeout = ENV["HOMEBREW_TEST_TIMEOUT_SECS"]&.to_i || DEFAULT_TEST_TIMEOUT_SECONDS
-    Timeout.timeout(timeout, &run_test)
+    Timeout.timeout(timeout) do
+      formula.run_test(keep_tmp:)
+    end
   end
 # Any exceptions during the test run are reported.
 rescue Exception => e # rubocop:disable Lint/RescueException
-  error_pipe&.puts e.to_json
-  error_pipe&.close
+  Utils.report_forked_child_error(error_pipe, e)
 ensure
   pid = Process.pid.to_s
   pkill = "/usr/bin/pkill"

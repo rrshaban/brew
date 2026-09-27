@@ -1,6 +1,8 @@
 # typed: true
 # frozen_string_literal: true
 
+require "system_command"
+
 RSpec.describe Utils do
   describe "ruby_check_version_script" do
     subject do
@@ -10,7 +12,8 @@ RSpec.describe Utils do
         ENV.update(homebrew_env)
         # We intentionally don't use the shebang in this script as portable Ruby
         # is usually not in PATH. This aligns with how we run the script in brew.
-        quiet_system RUBY_PATH, "#{HOMEBREW_LIBRARY_PATH}/utils/ruby_check_version_script.rb", required_ruby_version
+        SystemCommand.quiet_system RUBY_PATH, "#{HOMEBREW_LIBRARY_PATH}/utils/ruby_check_version_script.rb",
+                                   required_ruby_version
       end
     end
 
@@ -38,7 +41,7 @@ RSpec.describe Utils do
       it { is_expected.to be true }
     end
 
-    describe "fails on on mismatched major/minor required Ruby version" do
+    describe "fails on mismatched major/minor required Ruby version" do
       let(:required_ruby_version) { "1.2.3" }
 
       it { is_expected.to be false }

@@ -9,6 +9,7 @@ require "utils/tty"
 
 RSpec.describe Homebrew::DevCmd::Lgtm do
   it_behaves_like "parseable arguments"
+  it_behaves_like "a documented command", "lgtm"
 
   describe "#run" do
     subject(:lgtm) { described_class.new(args) }
@@ -16,7 +17,7 @@ RSpec.describe Homebrew::DevCmd::Lgtm do
     let(:args) { [] }
 
     before do
-      allow(Homebrew).to receive(:install_bundler_gems!)
+      allow(Utils::GemSetup).to receive(:install_bundler_gems!)
       allow(lgtm).to receive(:ohai)
       allow(lgtm).to receive(:puts)
       allow(Utils).to receive(:popen_read).with("git", "ls-files", "--others", "--exclude-standard", "--full-name")
@@ -43,19 +44,30 @@ RSpec.describe Homebrew::DevCmd::Lgtm do
       end
 
       it "audits formulae without online checks by default and skips tests for uninstalled formulae" do
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "typecheck", "homebrew/core").ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "style", "--changed", "--fix").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "typecheck", "homebrew/core").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "style", "--changed", "--fix").ordered
         expect(lgtm).to receive(:opoo)
           .with("New formulae or casks were detected. Run `brew lgtm --online` to include `brew audit --new` checks.")
           .ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "audit", "--strict",
-                                                   "--skip-style", "--formula", "homebrew/core/testball").ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "audit", "--strict",
-                                                   "--skip-style", "--formula", "homebrew/core/newball").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "audit", "--strict",
+                "--skip-style", "--formula", "homebrew/core/testball").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "audit", "--strict",
+                "--skip-style", "--formula", "homebrew/core/newball").ordered
         expect(lgtm).to receive(:opoo)
           .with("Skipping `brew test homebrew/core/newball`; the latest version is not installed.")
           .ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "test", "homebrew/core/testball").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "test",
+                "homebrew/core/testball").ordered
 
         lgtm.run
       end
@@ -82,16 +94,27 @@ RSpec.describe Homebrew::DevCmd::Lgtm do
       end
 
       it "audits changed formulae with --online and new formulae with --new" do
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "typecheck", "homebrew/core").ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "style", "--changed", "--fix").ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "audit", "--strict", "--online",
-                                                   "--skip-style", "--formula", "homebrew/core/testball").ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "audit", "--new",
-                                                   "--skip-style", "--formula", "homebrew/core/newball").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "typecheck", "homebrew/core").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "style", "--changed", "--fix").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "audit", "--strict", "--online",
+                "--skip-style", "--formula", "homebrew/core/testball").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "audit", "--new",
+                "--skip-style", "--formula", "homebrew/core/newball").ordered
         expect(lgtm).to receive(:opoo)
           .with("Skipping `brew test homebrew/core/newball`; the latest version is not installed.")
           .ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "test", "homebrew/core/testball").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "test",
+                "homebrew/core/testball").ordered
 
         lgtm.run
       end
@@ -113,15 +136,23 @@ RSpec.describe Homebrew::DevCmd::Lgtm do
       end
 
       it "audits casks without online checks by default" do
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "typecheck", "homebrew/cask").ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "style", "--changed", "--fix").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "typecheck", "homebrew/cask").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "style", "--changed", "--fix").ordered
         expect(lgtm).to receive(:opoo)
           .with("New formulae or casks were detected. Run `brew lgtm --online` to include `brew audit --new` checks.")
           .ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "audit", "--strict",
-                                                   "--skip-style", "--cask", "homebrew/cask/test-cask").ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "audit", "--strict",
-                                                   "--skip-style", "--cask", "homebrew/cask/new-cask").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "audit", "--strict",
+                "--skip-style", "--cask", "homebrew/cask/test-cask").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "audit", "--strict",
+                "--skip-style", "--cask", "homebrew/cask/new-cask").ordered
 
         lgtm.run
       end
@@ -144,12 +175,20 @@ RSpec.describe Homebrew::DevCmd::Lgtm do
       end
 
       it "audits changed casks with --online and new casks with --new" do
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "typecheck", "homebrew/cask").ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "style", "--changed", "--fix").ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "audit", "--strict", "--online",
-                                                   "--skip-style", "--cask", "homebrew/cask/test-cask").ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "audit", "--new",
-                                                   "--skip-style", "--cask", "homebrew/cask/new-cask").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "typecheck", "homebrew/cask").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "style", "--changed", "--fix").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "audit", "--strict", "--online",
+                "--skip-style", "--cask", "homebrew/cask/test-cask").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "audit", "--new",
+                "--skip-style", "--cask", "homebrew/cask/new-cask").ordered
 
         lgtm.run
       end
@@ -173,8 +212,12 @@ RSpec.describe Homebrew::DevCmd::Lgtm do
       end
 
       it "warns that untracked formulae and casks are skipped" do
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "typecheck", "homebrew/core").ordered
-        expect(lgtm).to receive(:safe_system).with(HOMEBREW_BREW_FILE, "style", "--changed", "--fix").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "typecheck", "homebrew/core").ordered
+        expect(SystemCommand)
+          .to receive(:safe_system)
+          .with(HOMEBREW_BREW_FILE, "style", "--changed", "--fix").ordered
         expect(lgtm).to receive(:opoo)
           .with("Untracked formula or cask files are not checked by `brew lgtm`; stage or commit them first.")
           .ordered
@@ -185,7 +228,7 @@ RSpec.describe Homebrew::DevCmd::Lgtm do
   end
 
   describe "cache fallback" do
-    let(:repository_root) { Pathname(T.must(__dir__)).parent.parent.parent.parent }
+    let(:repository_root) { HOMEBREW_LIBRARY_PATH.parent.parent }
     let(:test_root) do
       (repository_root/"tmp").mkpath
       Pathname(Dir.mktmpdir("brew-lgtm-cache-fallback-", repository_root/"tmp"))

@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/timer"
+
 # Strategy for downloading a Git repository.
 #
 # @api public
@@ -22,6 +24,13 @@ class GitDownloadStrategy < VCSDownloadStrategy
     super
     @ref_type ||= T.let(:branch, T.nilable(Symbol))
     @ref ||= T.let("master", T.untyped)
+  end
+
+  sig { override.params(timeout: T.nilable(T.any(Float, Integer))).void }
+  def fetch(timeout: nil)
+    require "utils/git"
+    Utils::Git.ensure_installed!
+    super
   end
 
   # Returns the most recent modified time for all files in the current working directory after stage.
@@ -49,13 +58,54 @@ class GitDownloadStrategy < VCSDownloadStrategy
     @last_commit || ""
   end
 
+  sig { returns(T::Boolean) }
+  def ref?
+    silent_command("git",
+                   args: ["--git-dir", git_dir, "rev-parse", "-q", "--verify", "--end-of-options",
+                          "#{@ref}^{commit}"])
+      .success?
+  end
+
+  sig { returns(T::Array[String]) }
+  def clone_args
+    args = %w[clone]
+
+    case @ref_type
+    when :branch, :tag
+      args << "--branch" << @ref
+    end
+
+    args << "--no-checkout" << "--filter=blob:none" if partial_clone_sparse_checkout?
+
+    args << "--config" << "advice.detachedHead=false" # Silences “detached head” warning.
+    args << "--config" << "core.fsmonitor=false" # Prevent `fsmonitor` from watching this repository.
+    args << "--end-of-options" << @url << cached_location.to_s
+  end
+
   private
+
+  sig { override.returns(Symbol) }
+  def fetch_home_read_exception = :git
+
+  sig { override.params(sandbox: Sandbox).void }
+  def allow_fetch_credentials(sandbox)
+    # Let Git and SSH resolve configuration, includes, URL rewrites and agent sockets.
+    sandbox.allow_network(path: "/", type: :subpath)
+  end
 
   # Read user Git config so credential helpers work for private downloads,
   # but never block on an interactive credential prompt.
   sig { override.returns(T::Hash[String, String]) }
   def env
-    { "GIT_TERMINAL_PROMPT" => "0" }
+    { "GIT_TERMINAL_PROMPT" => "0" }.tap do |env|
+      if fetching? && Sandbox.isolate_operation?
+        env["HOME"] = Dir.home(ENV.fetch("USER"))
+        env["PATH"] = PATH.new(ENV.fetch("PATH"), ORIGINAL_PATHS).to_s
+        if (socket = ENV.fetch("SSH_AUTH_SOCK", nil))
+          env["SSH_AUTH_SOCK"] = socket
+        end
+      end
+    end
   end
 
   # Local, read-only repository inspections (`git --git-dir … rev-parse`/`show`)
@@ -101,13 +151,6 @@ class GitDownloadStrategy < VCSDownloadStrategy
     cached_location/".git"
   end
 
-  sig { returns(T::Boolean) }
-  def ref?
-    silent_command("git",
-                   args: ["--git-dir", git_dir, "rev-parse", "-q", "--verify", "#{@ref}^{commit}"])
-      .success?
-  end
-
   sig { override.returns(String) }
   def current_revision
     system_command("git", args: ["--git-dir", git_dir, "rev-parse", "-q", "--verify", "HEAD"],
@@ -130,22 +173,6 @@ class GitDownloadStrategy < VCSDownloadStrategy
 
     require "utils/git"
     Utils::Git.supports_partial_clone_sparse_checkout?
-  end
-
-  sig { returns(T::Array[String]) }
-  def clone_args
-    args = %w[clone]
-
-    case @ref_type
-    when :branch, :tag
-      args << "--branch" << @ref
-    end
-
-    args << "--no-checkout" << "--filter=blob:none" if partial_clone_sparse_checkout?
-
-    args << "--config" << "advice.detachedHead=false" # Silences “detached head” warning.
-    args << "--config" << "core.fsmonitor=false" # Prevent `fsmonitor` from watching this repository.
-    args << @url << cached_location.to_s
   end
 
   sig { returns(String) }
@@ -196,25 +223,22 @@ class GitDownloadStrategy < VCSDownloadStrategy
     # Convert any shallow clone to full clone
     if shallow_dir?
       command! "git",
-               args:      ["fetch", "origin", "--unshallow"],
-               chdir:     cached_location,
-               timeout:   Utils::Timer.remaining(timeout),
-               reset_uid: true
+               args:    ["fetch", "origin", "--unshallow"],
+               chdir:   cached_location,
+               timeout: Utils::Timer.remaining(timeout)
     else
       command! "git",
-               args:      ["fetch", "origin"],
-               chdir:     cached_location,
-               timeout:   Utils::Timer.remaining(timeout),
-               reset_uid: true
+               args:    ["fetch", "origin"],
+               chdir:   cached_location,
+               timeout: Utils::Timer.remaining(timeout)
     end
   end
 
   sig { override.params(timeout: T.nilable(Time)).void }
   def clone_repo(timeout: nil)
     command! "git",
-             args:      clone_args,
-             timeout:   Utils::Timer.remaining(timeout),
-             reset_uid: true
+             args:    clone_args,
+             timeout: Utils::Timer.remaining(timeout)
 
     command! "git",
              args:    ["config", "homebrew.cacheversion", cache_version],
@@ -251,15 +275,13 @@ class GitDownloadStrategy < VCSDownloadStrategy
   sig { params(timeout: T.nilable(Time)).void }
   def update_submodules(timeout: nil)
     command! "git",
-             args:      ["submodule", "foreach", "--recursive", "git submodule sync"],
-             chdir:     cached_location,
-             timeout:   Utils::Timer.remaining(timeout),
-             reset_uid: true
+             args:    ["submodule", "foreach", "--recursive", "git submodule sync"],
+             chdir:   cached_location,
+             timeout: Utils::Timer.remaining(timeout)
     command! "git",
-             args:      ["submodule", "update", "--init", "--recursive"],
-             chdir:     cached_location,
-             timeout:   Utils::Timer.remaining(timeout),
-             reset_uid: true
+             args:    ["submodule", "update", "--init", "--recursive"],
+             chdir:   cached_location,
+             timeout: Utils::Timer.remaining(timeout)
     fix_absolute_submodule_gitdir_references!
   end
 
@@ -273,9 +295,8 @@ class GitDownloadStrategy < VCSDownloadStrategy
   sig { void }
   def fix_absolute_submodule_gitdir_references!
     submodule_dirs = command!("git",
-                              args:      ["submodule", "--quiet", "foreach", "--recursive", "pwd"],
-                              chdir:     cached_location,
-                              reset_uid: true).stdout
+                              args:  ["submodule", "--quiet", "foreach", "--recursive", "pwd"],
+                              chdir: cached_location).stdout
 
     submodule_dirs.lines.map(&:chomp).each do |submodule_dir|
       work_dir = Pathname.new(submodule_dir)
@@ -283,6 +304,10 @@ class GitDownloadStrategy < VCSDownloadStrategy
       # Only check and fix if `.git` is a regular file, not a directory.
       dot_git = work_dir/".git"
       next unless dot_git.file?
+
+      # This Ruby write runs in the parent, outside Git's sandbox.
+      Utils::Path.ensure_child_of!(cached_location, dot_git,
+                                   message: "Git submodule metadata escapes the download directory: #{dot_git}")
 
       git_dir = dot_git.read.chomp[/^gitdir: (.*)$/, 1]
       if git_dir.nil?

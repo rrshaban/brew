@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 require "dev-cmd/determine-test-runners"
@@ -6,8 +6,8 @@ require "cmd/shared_examples/args_parse"
 
 RSpec.describe Homebrew::DevCmd::DetermineTestRunners do
   def get_runners(file)
-    runner_line = File.open(file, &:first)
-    json_text = runner_line[/runners=(.*)/, 1]
+    runner_line = File.open(file, &:first).to_s
+    json_text = runner_line[/runners=(.*)/, 1].to_s
     runner_hash = JSON.parse(json_text)
     runner_hash.map { |item| item["runner"].delete_suffix(ephemeral_suffix) }
                .sort
@@ -26,6 +26,8 @@ RSpec.describe Homebrew::DevCmd::DetermineTestRunners do
     {
       "HOMEBREW_LINUX_RUNNER"       => linux_runner,
       "HOMEBREW_MACOS_LONG_TIMEOUT" => "false",
+      "GITHUB_BASE_REF"             => nil,
+      "GITHUB_EVENT_NAME"           => nil,
       "GITHUB_RUN_ID"               => ephemeral_suffix.split("-").second,
     }.freeze
   end
@@ -37,9 +39,6 @@ RSpec.describe Homebrew::DevCmd::DetermineTestRunners do
       next if macos_version > GitHubRunnerMatrix::NEWEST_HOMEBREW_CORE_MACOS_RUNNER
 
       out << "#{v}-arm64"
-      next if macos_version > GitHubRunnerMatrix::NEWEST_HOMEBREW_CORE_INTEL_MACOS_RUNNER
-
-      out << "#{v}-x86_64"
     end
 
     out << linux_runner
@@ -50,7 +49,21 @@ RSpec.describe Homebrew::DevCmd::DetermineTestRunners do
 
   it_behaves_like "parseable arguments"
 
-  it "assigns all runners for formulae without any requirements", :integration_test do
+  it "preserves base-branch transition coverage after the bottle block is removed", :integration_test do
+    path = setup_test_formula "testball", bottle_block: <<~RUBY
+      bottle do
+        sha256 arm64_golden_gate: "#{"a" * 64}"
+      end
+    RUBY
+    repository = CoreTap.instance.path
+    Utils.safe_popen_read("git", "-C", repository, "init", "--quiet")
+    Utils.safe_popen_read("git", "-C", repository, "add", path)
+    Utils.safe_popen_read("git", "-C", repository, "-c", "user.name=Test", "-c", "user.email=test@brew.sh",
+                          "commit", "--quiet", "--no-gpg-sign", "-m", "Initial bottle")
+    revision = Utils.safe_popen_read("git", "-C", repository, "rev-parse", "HEAD").strip
+    Utils.safe_popen_read("git", "-C", repository, "update-ref", "refs/remotes/origin/main", revision)
+    Utils.safe_popen_read("git", "-C", repository, "symbolic-ref", "refs/remotes/origin/HEAD",
+                          "refs/remotes/origin/main")
     setup_test_formula "testball"
 
     expect { brew "determine-test-runners", "testball", runner_env.merge({ "GITHUB_OUTPUT" => github_output }) }
@@ -58,7 +71,7 @@ RSpec.describe Homebrew::DevCmd::DetermineTestRunners do
       .and be_a_success
 
     expect(File.read(github_output)).not_to be_empty
-    expect(get_runners(github_output).sort).to eq(all_runners.sort)
+    expect(get_runners(github_output).sort).to eq((all_runners + ["27-arm64"]).uniq.sort)
   end
 end
 

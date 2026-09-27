@@ -1,10 +1,13 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/ruby"
+
 require "json"
 require "development_tools"
 require "utils/curl"
 require "utils/output"
+require "vulns/identify"
 
 # Rather than calling `new` directly, use one of the class methods like {SBOM.create}.
 class SBOM
@@ -30,11 +33,7 @@ class SBOM
   # Instantiates a {SBOM} for a new installation of a formula.
   sig { params(formula: Formula, tab: Tab).returns(T.attached_class) }
   def self.create(formula, tab)
-    active_spec = if formula.stable?
-      T.must(formula.stable)
-    else
-      T.must(formula.head)
-    end
+    active_spec = formula.active_spec
     active_spec_sym = formula.active_spec_sym
 
     new(
@@ -144,7 +143,7 @@ class SBOM
       "externalRefs"     => [
         {
           "referenceCategory" => "PACKAGE-MANAGER",
-          "referenceLocator"  => "pkg:brew/#{formula_full_name}@#{version}",
+          "referenceLocator"  => brew_purl(formula_full_name, version),
           "referenceType"     => "purl",
         },
       ],
@@ -157,6 +156,17 @@ class SBOM
     }
   end
   private_class_method :bottle_package
+
+  sig { params(full_name: String, version: T.nilable(T.any(String, Version))).returns(String) }
+  def self.brew_purl(full_name, version)
+    namespace, _, name = full_name.rpartition("/")
+    Homebrew::Vulns::Purl.new(
+      type:      "brew",
+      namespace: namespace.presence,
+      name:,
+      version:   version&.to_s,
+    ).to_s
+  end
 
   sig {
     params(
@@ -190,7 +200,7 @@ class SBOM
 
   sig { params(data: T.nilable(T::Hash[Symbol, T.anything]), bottling: T::Boolean).returns(T::Array[String]) }
   def schema_validation_errors(data = nil, bottling: false)
-    unless Homebrew.require? "json_schemer"
+    unless Utils::Ruby.require? "json_schemer"
       error_message = "Need json_schemer to validate SBOM, run `brew install-bundler-gems --add-groups=bottle`!"
       odie error_message if ENV["HOMEBREW_ENFORCE_SBOM"]
       return []
@@ -497,7 +507,7 @@ class SBOM
         externalRefs:     [
           {
             referenceCategory: "PACKAGE-MANAGER",
-            referenceLocator:  "pkg:brew/#{tap}/#{name}@#{stable_version}",
+            referenceLocator:  SBOM.brew_purl([source.tap_name, name].compact.join("/"), stable_version),
             referenceType:     "purl",
           },
         ],
@@ -535,6 +545,24 @@ class SBOM
       package
     end
 
+    source_purl = SBOM.brew_purl([source.tap_name, name].compact.join("/"), spec_version)
+
+    external_refs = T.let([
+      {
+        referenceCategory: "PACKAGE-MANAGER",
+        referenceLocator:  source_purl,
+        referenceType:     "purl",
+      },
+    ], T::Array[SPDXSymbolHash])
+
+    if (registry_pkg = Homebrew::Vulns::Identify.registry_package(source.url))
+      external_refs << {
+        referenceCategory: "PACKAGE-MANAGER",
+        referenceLocator:  registry_pkg.purl,
+        referenceType:     "purl",
+      }
+    end
+
     [
       {
         SPDXID:           "SPDXRef-Archive-#{name}-src",
@@ -546,7 +574,7 @@ class SBOM
         licenseConcluded: assert_value(license),
         downloadLocation: source.url,
         copyrightText:    assert_value(nil),
-        externalRefs:     [],
+        externalRefs:     external_refs,
         checksums:        [
           {
             algorithm:     "SHA256",
@@ -616,7 +644,7 @@ class SBOM
         externalRefs:     [
           {
             referenceCategory: "PACKAGE-MANAGER",
-            referenceLocator:  "pkg:brew/#{dependency["full_name"]}@#{dependency_pkg_version}",
+            referenceLocator:  SBOM.brew_purl(dependency.fetch("full_name").to_s, dependency_pkg_version),
             referenceType:     "purl",
           },
         ],

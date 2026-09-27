@@ -1,23 +1,22 @@
 ---
-title: Homebrew Security and Supply Chain
-description: Homebrew security and supply chain defences, including package review, checksums, signed metadata, bottles, sandboxing and tap trust.
+description: Homebrew security and supply chain defences, including formula and Cask trust models, checksums, signed metadata, bottles, Gatekeeper, sandboxing and tap trust.
 redirect_from:
   - /Supply-Chain-Security
-last_review_date: "2026-06-15"
+last_review_date: "2026-09-19"
 ---
 
 # Homebrew Security and Supply Chain
 
 Homebrew installs software from across the open source ecosystem.
 That makes the security of the software supply chain, the humans involved, repositories, build systems and download servers that turn source code into something you run, a core concern for us.
-This Homebrew security guide explains the recent supply-side security incidents affecting other package managers, how Homebrew's trust model differs and the steps we have taken to protect our users.
+This Homebrew security guide explains the recent supply-chain security incidents affecting other package managers, how Homebrew's trust model differs and the steps we have taken to protect our users.
 
 * Table of Contents
 {:toc}
 
 ## Recent incidents in other ecosystems
 
-The npm and PyPI ecosystems have been repeatedly targeted by supply-side attacks.
+The npm and PyPI ecosystems have been repeatedly targeted by supply-chain attacks.
 Recurring patterns include:
 
 * **Maintainer account takeover.**
@@ -38,9 +37,9 @@ A single compromised credential turns into immediate, automated, worldwide code 
 
 ## How Homebrew is different
 
-The Homebrew team is aware of the supply-side security issues with other package managers.
+The Homebrew team is aware of the supply-chain security issues with other package managers.
 Homebrew's design differs in several structural ways that limit the blast radius of an upstream compromise.
-Most of these protections long predate the recent wave of supply-side attacks and the current focus on them; they are core to how Homebrew has always packaged software rather than a reaction to any single incident.
+Most of these protections long predate the recent wave of supply-chain attacks and the current focus on them; they are core to how Homebrew has always packaged software rather than a reaction to any single incident.
 
 ### Human review on all changes
 
@@ -72,8 +71,8 @@ This makes the official Homebrew namespace structurally resistant to the typosqu
 Homebrew does not trust, recommend or automatically install from any third-party non-Homebrew repositories.
 Only official Homebrew taps and built-in commands are trusted by default.
 A non-official tap is executable code, not plain metadata, so loading it can run Ruby with your user's privileges.
-Homebrew is moving to require explicit trust for non-official taps, and `brew trust` lets you trust a single formula, cask or command rather than a whole tap.
-See [Tap Trust](Tap-Trust.md) for how to trust only what you need and the recently added `brew trust`, `brew untrust` and `Brewfile` `trusted: true` controls.
+Non-official taps require explicit trust by default, and `brew trust` lets you trust a single formula, cask or command rather than a whole tap.
+See [Tap Trust](Tap-Trust.md) for how to trust only what you need with `brew trust`, `brew untrust` and the `Brewfile` `trusted: true` option.
 
 Homebrew's [tap migrations](Migrating-A-Formula-To-A-Tap.md) stay within the Homebrew organisation: a formula or cask is only ever migrated into or within official Homebrew taps, never out to a third-party tap.
 A rename or move therefore cannot silently redirect users to a non-Homebrew repository.
@@ -120,7 +119,9 @@ When you deviate from these supported paths, such as building from source or ins
 Checksums prove that the downloaded bytes match the reviewed metadata.
 Bottle provenance attestations add a different check: who built those bytes and from what source.
 Homebrew ships bottle attestation verification in `Library/Homebrew/attestation.rb`; when `HOMEBREW_VERIFY_ATTESTATIONS` is set, Homebrew uses GitHub's attestation tooling to verify `homebrew/core` bottle build provenance before installation.
+Homebrew can also verify bottles from supported third-party GitHub taps against that tap's own GitHub Actions identity.
 Homebrew CI also emits bottle attestations with `actions/attest`, binding bottle artifacts to the GitHub Actions identity and build context that produced them.
+Third-party taps can do the same for their own bottles.
 We hope to make attestation verification the default in future once it can be implemented in pure Ruby rather than depending on the `gh` tool.
 
 These attestations are backed by Sigstore's transparency log, which is the one cross-check in this pipeline that is not hosted by GitHub.
@@ -171,35 +172,64 @@ That keeps AI useful as automation while preserving the human accountability and
 
 ### No arbitrary code execution on install by default
 
-Installing a bottle unpacks reviewed, prebuilt files.
-Builds from source run inside a sandbox (see below).
-Running a formula's `post_install` step, whether from a bottle or a source build, may run upstream-supplied software, but this too runs inside the sandbox.
+Installing a bottle uses reviewed, prebuilt files, reducing the need to run upstream build scripts on your machine.
+Homebrew uses sandboxing to limit package-supplied code where supported, but some installations require trusting vendor code with broader access (see below).
 
 ### Sandboxing
 
-Builds, `post_install` steps and tests run inside a sandbox that restricts filesystem and network access:
+Homebrew uses sandboxing on macOS and Linux to limit what package processing, builds, supported installation steps and tests can access.
+The aim is least privilege: give each operation only the filesystem, network and credential access it needs.
+This reduces the risk that a malicious or faulty package can alter unrelated software, damage Homebrew or expose personal data.
 
-* **macOS sandboxing** has long confined formula builds.
-* **Linux sandboxing** extends the same protection to Homebrew on Linux.
-* **Sandboxing reads of sensitive locations** prevents build and test code from reading sensitive parts of your home directory (such as credentials and SSH keys), limiting what a malicious build could exfiltrate.
+Sandbox permissions are defined by Homebrew's reviewed code.
+Sandboxing complements maintainer review, download verification and explicit trust decisions; it does not make arbitrary third-party code safe to run.
+The separate trust requirements for taps and vendor-provided casks still apply.
+
+Available protections depend on the operating system and configuration.
+Some operations can continue with a warning when sandboxing is unavailable or Homebrew relies on an external sandbox.
 
 ### Environment filtering
 
-Homebrew builds run with a filtered, sanitised environment rather than your full shell environment, so secrets and unexpected configuration in your environment are not exposed to build and test code.
+Homebrew limits which environment settings reach package code, reducing accidental exposure of secrets and unexpected configuration.
 
 ### Casks have a different trust model
 
-[Casks](Cask-Cookbook.md) install prebuilt applications straight from the vendor rather than from a Homebrew-built bottle, so their trust model is necessarily weaker than that of formulae.
-Homebrew reviews the cask definition and verifies a `sha256` checksum of the download where it can, but some casks set `sha256 :no_check` because the upstream `url` does not change between releases, and many set `auto_updates true` to declare that the application updates itself.
-For those casks the vendor, not Homebrew, controls the bytes you eventually run, and self-updating apps fetch later versions outside Homebrew entirely.
-Cask installation artifacts are treated as trusted vendor installation actions once a cask is accepted, so prefer casks from vendors you trust.
+Formulae and casks share Homebrew's reviewed package metadata and signed JSON API, but they do not share the same artefact security model.
+`homebrew/core` formulae are open source build recipes based on checksummed source.
+Homebrew builds bottles for formulae in its own controlled, ephemeral CI and checksums the result, so users normally trust Homebrew's reviewed source-to-bottle pipeline rather than a binary supplied and signed by the upstream developer.
+All formula installations run without `sudo`.
 
-Even so, installing a cask is at worst no less secure than downloading and running that software directly from the vendor yourself, which is the realistic alternative.
-At best, when a cask pins a `sha256`, Homebrew additionally guarantees the download has not changed since a maintainer reviewed it, which is much more secure than an unverified manual download.
+[Casks](Cask-Cookbook.md) instead install prebuilt applications and installers supplied directly by the upstream developer.
+This is necessary for native macOS applications and proprietary software, but Homebrew usually cannot reproduce those binaries from source or compare them with an independently produced build.
+A cask's `sha256` proves that the downloaded bytes match the package metadata, but it does not prove who produced those bytes or whether the program inside is trustworthy.
+Some casks must use `sha256 :no_check` because their download URL changes contents in place, while self-updating applications can replace themselves outside Homebrew entirely.
+Cask installation artefacts are treated as trusted vendor installation actions once a cask is accepted, so users must still trust the vendor.
+Vendor installer scripts and macOS package installers run outside Homebrew's sandbox and may change files beyond Homebrew's directories.
+Some cask installations run without `sudo`.
+Others require elevated privileges, such as those that use macOS `.pkg` installers.
+
+On macOS, code signing, notarisation and Gatekeeper provide independent checks that compensate for this weaker artefact model:
+
+* A [Developer ID signature](https://developer.apple.com/developer-id/) ties the artefact to a certificate Apple issued to a registered developer and lets macOS detect changes made after it was signed.
+* [Apple's notary service](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution) automatically scans submitted software for known malicious content and code-signing problems, records the result and issues a ticket that Apple can later revoke.
+* [Gatekeeper](https://support.apple.com/guide/security/gatekeeper-and-runtime-protection-sec5599b66df/web) checks the developer identity, notarisation ticket and signature when quarantined software is first opened or installed.
+
+Homebrew applies macOS quarantine attributes to Cask downloads so Gatekeeper performs these checks instead of Homebrew bypassing them.
+Homebrew also audits apps, installers and other executable artefacts in official macOS casks that Gatekeeper can assess and requires them to pass on a default macOS configuration.
+These controls are not a guarantee that an application is harmless: notarisation is an automated malware check, not a source review or App Store review.
+They are nevertheless a meaningful additional trust layer outside the upstream download server and Homebrew's metadata, with an attributable developer, tamper detection and a revocation path if malicious software is discovered later.
+For a `sha256 :no_check` cask, this can be the principal validation of changing download contents that is independent of the upstream server.
+
+This requirement can make older casks ineligible even when users have run earlier versions without incident.
+That history does not authenticate the next download, detect later tampering or provide a revocable identity for it.
+Keeping such a cask would also require users to override the same macOS protection that Homebrew relies on for vendor-built artefacts.
+Homebrew therefore [deprecates, disables and eventually removes](Deprecating-Disabling-and-Removing.md#when-to-deprecate-casks) casks that fail Gatekeeper checks rather than normalising a security bypass.
+Removal does not mean Homebrew has determined that the software is malware; it means the upstream artefact no longer meets the security baseline for distribution through `homebrew/cask`.
+The cask can become eligible again when upstream provides artefacts that pass the checks.
 
 ### Cooldowns on riskier ecosystems
 
-For ecosystems with a track record of fast-moving supply-side attacks, Homebrew applies a download cooldown: a freshly-published upstream version is not adopted immediately, giving the wider community time to detect and report a malicious release before Homebrew users are exposed.
+For ecosystems with a track record of fast-moving supply-chain attacks, Homebrew applies a download cooldown: a freshly-published upstream version is not adopted immediately, giving the wider community time to detect and report a malicious release before Homebrew users are exposed.
 Cooldowns have been added for:
 
 * [Bundler](https://github.com/Homebrew/brew/pull/22555)
@@ -208,8 +238,8 @@ Cooldowns have been added for:
 * [PyPI resource resolution](https://github.com/Homebrew/brew/pull/21920)
 * [npm and PyPI in `bump`](https://github.com/Homebrew/brew/pull/21888)
 
-Homebrew applies these cooldowns narrowly, only to the language ecosystems that have actually suffered fast-moving supply-side attacks, rather than as a blanket delay on every package.
-A blanket cooldown would trade a small, speculative reduction in supply-side risk for a real, across-the-board delay in shipping critical fixes: when a zero-day in something like OpenSSL is being exploited in the wild, Homebrew works to get the fix to users as fast as possible, and Homebrew's design means upgrading one package can require upgrading others.
+Homebrew applies these cooldowns narrowly, only to the language ecosystems that have actually suffered fast-moving supply-chain attacks, rather than as a blanket delay on every package.
+A blanket cooldown would trade a small, speculative reduction in supply-chain risk for a real, across-the-board delay in shipping critical fixes: when a zero-day in something like OpenSSL is being exploited in the wild, Homebrew works to get the fix to users as fast as possible, and Homebrew's design means upgrading one package can require upgrading others.
 Across Homebrew's history far more users have been protected by shipping zero-day fixes quickly than have been exposed to npm-style token-theft or crypto-mining attacks, so a global cooldown would be a net negative for most users' security.
 The deeper reason Homebrew does not need a general cooldown is that, unlike language package managers, it already separates publishing from distribution: an upstream release does not reach users until it has passed human review, CI and checksum verification, which is the very review window that language-ecosystem cooldowns are trying to recreate.
 
@@ -220,23 +250,30 @@ Given our trust model, risk profile and the breadth of ecosystems we support, we
 
 When the two conflict, Homebrew prioritises security over backwards compatibility.
 Homebrew's [deprecation](Deprecating-Disabling-and-Removing.md) policy and regular major and minor releases let us deprecate, then disable, then entirely remove a risky behaviour or default across successive releases, often within roughly six to nine months.
-Being willing to break compatibility on that timescale is a large part of why Homebrew has been able to respond to new supply-side threats faster than ecosystems that must preserve old behaviour indefinitely.
+Being willing to break compatibility on that timescale is a large part of why Homebrew has been able to respond to new supply-chain threats faster than ecosystems that must preserve old behaviour indefinitely.
 
 ## Trust model comparison
 
-| Property                            | Homebrew                                                  | npm / PyPI                               |
-| ----------------------------------- | --------------------------------------------------------- | ---------------------------------------- |
-| Who can publish a change            | Homebrew maintainers, via pull request                    | Any package owner, directly              |
-| Human review of each release        | Always                                                    | None                                     |
-| Time from upstream release to users | Reviewed, plus a cooldown for riskier ecosystems          | Immediate                                |
-| Download integrity                  | Pinned `sha256` in reviewed metadata                      | Trust the registry at install time       |
-| What most users install             | Bottles built by Homebrew CI                              | Publisher-uploaded artifacts             |
-| Code execution on install           | Sandboxed `post_install` on a minority of packages        | `preinstall`/`postinstall` or `setup.py` |
-| Build and install isolation         | macOS and Linux sandbox, sensitive-path and env filtering | None by default                          |
-| Trust concentration                 | Vetted, 2FA-required maintainer team                      | Per-package owner credentials            |
+| Property                            | Homebrew                                                        | npm / PyPI                               |
+| ----------------------------------- | --------------------------------------------------------------- | ---------------------------------------- |
+| Who can publish a change            | Homebrew maintainers, via pull request                          | Any package owner, directly              |
+| Human review of each release        | Always                                                          | None                                     |
+| Time from upstream release to users | Reviewed, plus a cooldown for riskier ecosystems                | Immediate                                |
+| Download integrity                  | Pinned `sha256` in reviewed metadata                            | Trust the registry at install time       |
+| What most users install             | Bottles built by Homebrew CI                                    | Publisher-uploaded artifacts             |
+| Code execution on install           | Sandboxed installation steps where supported                    | `preinstall`/`postinstall` or `setup.py` |
+| Build and install isolation         | Filesystem, network and credential restrictions where supported | None by default                          |
+| Trust concentration                 | Vetted, 2FA-required maintainer team                            | Per-package owner credentials            |
 
 ## Looking ahead
 
 This is not a solved problem and we do not claim Homebrew is immune.
-We have taken steps to mitigate these risks for our users, some long-standing (macOS sandboxing, human review on all changes, environment filtering, all package maintainers being Homebrew maintainers) and some newer (Linux sandboxing, sandboxing reads of sensitive locations, cooldowns on riskier ecosystems).
-We will continue to monitor the supply-side security landscape and take further steps as needed.
+Homebrew combines human review, sandboxing, restricted access to sensitive data and cooldowns for riskier ecosystems to mitigate these risks.
+We will continue to monitor the supply-chain security landscape and take further steps as needed.
+
+## Local trust model
+
+Homebrew is designed for a single trusted owning account on macOS or Linux.
+Homebrew provides no security guarantees when users with write permissions to the Homebrew prefix are considered untrusted.
+This also applies when Homebrew is installed or upgraded through MDM.
+See [Support Tiers](Support-Tiers.md#unsupported) for unsupported multi-user configurations.

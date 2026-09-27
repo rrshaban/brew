@@ -1,6 +1,11 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "system_command"
+require "utils/output"
+
+require "utils/text"
+
 require "abstract_command"
 require "migrator"
 require "formulary"
@@ -34,9 +39,31 @@ module Homebrew
       def run
         return output_update_report if $stdout.tty?
 
-        redirect_stdout($stderr) do
+        Utils::Output.redirect_stdout($stderr) do
           output_update_report
         end
+      end
+
+      sig { void }
+      def migrate_caskroom_caskfiles_to_json
+        return unless Cask::Caskroom.path.directory?
+
+        Cask::Caskroom.path.glob("*/.metadata/*/*/Casks/*.{json,rb}").each do |caskfile|
+          Cask::Caskroom.migrate_caskfile_to_json(caskfile)
+        rescue => e
+          opoo "Failed to migrate #{caskfile} to JSON metadata: #{e}"
+        end
+      end
+
+      sig { void }
+      def donation_message
+        return if Settings.read("donationmessage") == "true"
+
+        ohai "Homebrew is run entirely by unpaid volunteers. Please consider donating:"
+        puts "  #{Formatter.url("https://github.com/Homebrew/brew#-donations")}\n\n"
+
+        # Consider the message possibly missed if not a TTY.
+        Settings.write "donationmessage", true if $stdout.tty?
       end
 
       private
@@ -85,11 +112,12 @@ module Homebrew
                   before_revision = ENV.fetch("HOMEBREW_UPDATE_BEFORE#{old_repository_var_suffix}", nil)
                   if before_revision.present? && tap.installed?
                     git_args = ["-C", tap.path.to_s]
-                    safe_system "git", *git_args, "reset", "--hard", "-q", before_revision
+                    SystemCommand.safe_system "git", *git_args, "reset", "--hard", "-q", before_revision
                     branch = Utils.popen_read("git", *git_args, "symbolic-ref", "--short", "-q", "HEAD").chomp
                     branch = branch.presence || tap.git_repository.origin_branch_name
                     if branch.present?
-                      safe_system "git", *git_args, "update-ref", "refs/remotes/origin/#{branch}", before_revision
+                      SystemCommand.safe_system "git", *git_args, "update-ref", "refs/remotes/origin/#{branch}",
+                                                before_revision
                     end
                   end
                   denied_redirects << e.message
@@ -214,7 +242,7 @@ module Homebrew
         unless updated_taps.empty?
           auto_update_header
           puts "Updated #{Utils.pluralize("tap", updated_taps.count,
-                                          include_count: true)} (#{updated_taps.to_sentence})."
+                                          include_count: true)} (#{Utils::Text.to_sentence(updated_taps)})."
           updated = true
         end
 
@@ -229,7 +257,7 @@ module Homebrew
 
             hub.dump(auto_update: args.auto_update?) unless args.quiet?
             hub.reporters.each(&:migrate_tap_migration)
-            hub.reporters.each(&:migrate_cask_rename)
+            hub.migrate_cask_renames
             hub.reporters.each { |r| r.migrate_formula_rename(force: args.force?, verbose: args.verbose?) }
 
             CacheStoreDatabase.use(:descriptions) do |db|
@@ -251,6 +279,17 @@ module Homebrew
         Commands.rebuild_commands_completion_list
         link_completions_manpages_and_docs
         Tap.installed.each(&:link_completions_and_manpages)
+
+        # Only prewarm when the update changed `Library/Homebrew/vendor`:
+        # portable Ruby bumps rotate the whole Bootsnap cache key and
+        # vendored gem bumps rewrite gem trees this run never loads, while
+        # for code-only updates this run has already recompiled most of
+        # what the next command needs.
+        if !args.auto_update? && initial_revision != current_revision &&
+           !SystemCommand.quiet_system("git", "-C", HOMEBREW_REPOSITORY.to_s, "diff", "--quiet",
+                                       initial_revision, current_revision, "--", "Library/Homebrew/vendor")
+          Homebrew::Bootsnap.prewarm!
+        end
 
         failed_fetch_dirs = ENV["HOMEBREW_MISSING_REMOTE_REF_DIRS"]&.split("\n")
         if failed_fetch_dirs.present?
@@ -319,8 +358,9 @@ module Homebrew
           [CoreTap.instance, CoreCaskTap.instance].each do |tap|
             next unless tap.installed?
 
-            if default_branches.include?(tap.git_branch) &&
-               (Date.parse(T.must(tap.git_repository.last_commit_date)) <= Date.today.prev_month)
+            last_commit_date = tap.git_repository.last_commit_date
+            if default_branches.include?(tap.git_branch) && last_commit_date &&
+               (Date.parse(last_commit_date) <= Date.today.prev_month)
               ohai "#{tap.name} is old and unneeded, untapping to save space..."
               tap.uninstall
             else
@@ -354,22 +394,6 @@ module Homebrew
       end
 
       sig { void }
-      def migrate_caskroom_caskfiles_to_json
-        return unless Homebrew::EnvConfig.developer?
-        return unless Cask::Caskroom.path.directory?
-
-        Cask::Caskroom.path.glob("*/.metadata/*/*/Casks/*.{internal.json,rb}").each do |caskfile|
-          cask = Cask::CaskLoader.load(caskfile, warn: false)
-          next if cask.uninstall_flight_blocks?
-
-          (caskfile.dirname/"#{cask.token}.json").atomic_write(JSON.pretty_generate(cask.to_installed_json_hash))
-          caskfile.unlink
-        rescue => e
-          opoo "Failed to migrate #{caskfile} to JSON metadata: #{e}"
-        end
-      end
-
-      sig { void }
       def analytics_message
         return if Utils::Analytics.messages_displayed?
         return if Utils::Analytics.no_message_output?
@@ -397,17 +421,6 @@ module Homebrew
 
         # Consider the messages possibly missed if not a TTY.
         Utils::Analytics.messages_displayed! if $stdout.tty?
-      end
-
-      sig { void }
-      def donation_message
-        return if Settings.read("donationmessage") == "true"
-
-        ohai "Homebrew is run entirely by unpaid volunteers. Please consider donating:"
-        puts "  #{Formatter.url("https://github.com/Homebrew/brew#donations")}\n\n"
-
-        # Consider the message possibly missed if not a TTY.
-        Settings.write "donationmessage", true if $stdout.tty?
       end
 
       sig { void }

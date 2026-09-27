@@ -1,7 +1,6 @@
 # typed: strict
 # frozen_string_literal: true
 
-require "method_source"
 require "rubocop"
 require_relative "../../../rubocops"
 
@@ -16,7 +15,10 @@ module Tapioca
         all_modules.select do |klass|
           next unless klass.singleton_class < ::RuboCop::AST::NodePattern::Macros
 
-          path = T.must(Object.const_source_location(klass.to_s)).fetch(0).to_s
+          source_location = Object.const_source_location(klass.to_s)
+          next if source_location.nil?
+
+          path = source_location.fetch(0).to_s
           # exclude vendored code, to avoid contradicting their RBI files
           !path.include?("/vendor/bundle/ruby/") &&
             # exclude source code that already has an RBI file
@@ -30,7 +32,11 @@ module Tapioca
       def decorate
         root.create_path(constant) do |klass|
           constant.instance_methods(false).each do |method_name|
-            source = constant.instance_method(method_name).source.lstrip
+            source_location = constant.instance_method(method_name).source_location
+            next if source_location.nil?
+
+            source_file, source_line = source_location
+            source = File.readlines(source_file).fetch(source_line - 1).lstrip
             # For more info on these DSLs:
             #   https://www.rubydoc.info/gems/rubocop-ast/RuboCop/AST/NodePattern/Macros
             #   https://github.com/rubocop/rubocop-ast/blob/HEAD/lib/rubocop/ast/node_pattern.rb

@@ -1,6 +1,11 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "api/env"
+require "utils/profiling"
+
+require "utils/text"
+
 require "abstract_command"
 require "formula"
 require "utils/curl"
@@ -43,20 +48,23 @@ module Homebrew
         switch "--eval-all",
                description: "Evaluate all available formulae and casks, whether installed or not, to audit them.",
                env:         :eval_all,
-               odeprecated: true
+               replacement: "the default trusted-tap behaviour",
+               odisabled:   true
         switch "--new",
                description: "Run various additional style checks to determine if a new formula or cask is eligible " \
                             "for Homebrew. This should be used when creating new formulae or casks and implies " \
                             "`--strict` and `--online`."
         switch "--[no-]signing",
                description: "Audit for app signatures, which are required by macOS on ARM.",
-               odeprecated: true
+               odisabled:   true
         switch "--changed",
                description: "Check files that were changed from the `main` branch."
         flag   "--tap=",
                description: "Check formulae and casks within the given tap, specified as <user>`/`<repo>."
         switch "--fix",
-               description: "Fix style violations automatically using RuboCop's auto-correct feature."
+               description: "Fix style violations automatically using RuboCop's auto-correct feature. " \
+                            "When passed with `--online` for casks, also correct the `depends_on macos:` " \
+                            "stanza and the case of artifact stanzas."
         switch "--display-cop-names",
                description: "Include the RuboCop cop name for each violation in the output. This is the default.",
                hidden:      true
@@ -103,7 +111,7 @@ module Homebrew
           os_arch_combinations.find { |os, _arch| os != :linux } || os_arch_combinations.fetch(0)
 
         Homebrew.auditing = true
-        Homebrew.inject_dump_stats!(FormulaAuditor, /^audit_/) if args.audit_debug?
+        Utils::Profiling.inject_stats!(FormulaAuditor, /^audit_/) if args.audit_debug?
 
         strict = args.new? || args.strict?
         online = args.new? || args.online?
@@ -113,13 +121,13 @@ module Homebrew
 
         gem_groups = ["audit", "ast"]
         gem_groups << "style" unless skip_style
-        Homebrew.install_bundler_gems!(groups: gem_groups)
+        Utils::GemSetup.install_bundler_gems!(groups: gem_groups)
         require "utils/ast"
 
         ENV.activate_extensions!
         ENV.setup_build_environment
 
-        audit_formulae, audit_casks = Homebrew.with_no_api_env do # audit requires full Ruby source
+        audit_formulae, audit_casks = Homebrew::API.with_no_api_env do # audit requires full Ruby source
           if args.changed?
             tap = Tap.from_path(Dir.pwd)
             odie "`brew audit --changed` must be run inside a tap!" if tap.blank?
@@ -154,19 +162,8 @@ module Homebrew
             no_named_args = true
             [Formula.installed, Cask::Caskroom.casks]
           elsif args.no_named?
-            eval_all = args.eval_all?
-            eval_all ||= Homebrew::EnvConfig.tap_trust_configured?
-
-            unless eval_all
-              # This odisabled should probably stick around indefinitely.
-              odisabled "`brew audit`",
-                        "set `HOMEBREW_REQUIRE_TAP_TRUST=1`"
-            end
             no_named_args = true
-            [
-              Formula.all(eval_all:),
-              Cask::Cask.all(eval_all:),
-            ]
+            [Formula.all, Cask::Cask.all]
           else
             if args.named.any? { |named_arg| named_arg.end_with?(".rb") }
               # This odisabled should probably stick around indefinitely,
@@ -245,7 +242,13 @@ module Homebrew
               # Audit requires full Ruby source so disable API. We shouldn't do this for taps however so that we
               # don't unnecessarily require a full Homebrew/core clone.
               fa = if f.core_formula?
-                Homebrew.with_no_api_env(&audit_proc)
+                Homebrew::API.with_no_api_env(&audit_proc)
+              elsif Homebrew::EnvConfig.automatically_set_no_install_from_api?
+                with_env(
+                  HOMEBREW_NO_INSTALL_FROM_API:                   nil,
+                  HOMEBREW_AUTOMATICALLY_SET_NO_INSTALL_FROM_API: nil,
+                  &audit_proc
+                )
               else
                 audit_proc.call
               end
@@ -263,7 +266,9 @@ module Homebrew
           path = cask.sourcefile_path
 
           errors = os_arch_combinations.flat_map do |os, arch|
-            next [] if os == :linux
+            # Linux-only casks have no stanza values for macOS, so audit them
+            # under Linux instead.
+            os = :linux if os != :linux && !cask.supports_macos?
 
             SimulateSystem.with(os:, arch:) do
               odebug "Auditing Cask #{cask} on os #{os} and arch #{arch}"
@@ -276,11 +281,9 @@ module Homebrew
                 audit_online:   args.online? || nil,
                 audit_strict:   args.strict? || nil,
 
-                # No need for `|| nil` for `--[no-]signing`
-                # because boolean switches are already `nil` if not passed
-                audit_signing:  args.signing?,
+                audit_signing:  nil,
                 audit_new_cask: args.new? || nil,
-                quarantine:     true,
+                audit_fix:      args.fix? || nil,
                 any_named_args: !no_named_args,
                 only:           args.only || [],
                 except:         args.except || [],
@@ -315,7 +318,7 @@ module Homebrew
           error_sources << Utils.pluralize("cask", cask_count, include_count: true) if cask_count.positive?
           error_sources << Utils.pluralize("tap", tap_count, include_count: true) if tap_count.positive?
 
-          errors_summary += " in #{error_sources.to_sentence}" if error_sources.any?
+          errors_summary += " in #{Utils::Text.to_sentence(error_sources)}" if error_sources.any?
 
           errors_summary += " detected"
 
@@ -324,13 +327,18 @@ module Homebrew
               ", #{Utils.pluralize("problem", corrected_problem_count, include_count: true)} corrected"
           end
 
-          ofail "#{errors_summary}."
+          # Succeed when everything was corrected, as `brew style --fix` does.
+          if total_problems_count == corrected_problem_count
+            opoo "#{errors_summary}."
+          else
+            ofail "#{errors_summary}."
+          end
         end
 
         return unless GitHub::Actions.env_set?
 
         annotations = formula_problems.merge(cask_problems).flat_map do |(_, path), problems|
-          problems.map do |problem|
+          problems.reject { |problem| problem[:corrected] }.map do |problem|
             GitHub::Actions::Annotation.new(
               :error,
               problem[:message],

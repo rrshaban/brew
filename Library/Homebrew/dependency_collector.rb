@@ -5,7 +5,7 @@ require "dependency"
 require "dependencies"
 require "requirement"
 require "requirements"
-require "cachable"
+require "cacheable"
 
 # A dependency is a formula that another formula needs to install.
 # A requirement is something other than a formula that another formula
@@ -19,7 +19,7 @@ require "cachable"
 # specifications into the proper kinds of dependencies and requirements.
 class DependencyCollector
   extend T::Generic
-  extend Cachable
+  extend Cacheable
 
   Cache = type_template { { fixed: T::Hash[T.untyped, T.untyped] } }
 
@@ -79,7 +79,7 @@ class DependencyCollector
   def cache_key(spec)
     if spec.is_a?(Resource)
       if spec.download_strategy <= CurlDownloadStrategy
-        return "#{spec.download_strategy}#{File.extname(T.must(spec.url)).split("?").first}"
+        return "#{spec.download_strategy}#{File.extname(resource_url(spec)).split("?").first}"
       end
 
       return spec.download_strategy
@@ -99,8 +99,15 @@ class DependencyCollector
   sig { params(related_formula_names: T::Set[String]).returns(T.nilable(Dependency)) }
   def glibc_dep_if_needed(related_formula_names); end
 
-  sig { params(related_formula_names: T::Set[String]).returns(T.nilable(Dependency)) }
-  def bubblewrap_dep_if_needed(related_formula_names); end
+  # Names implicitly added to any formula's deps right now, reusing the same checks
+  # `Formula#add_global_deps_to_spec` uses to inject them onto a real formula.
+  sig { returns(T::Set[String]) }
+  def implicit_dependency_names
+    [
+      gcc_dep_if_needed(Set.new),
+      glibc_dep_if_needed(Set.new),
+    ].compact.to_set(&:name)
+  end
 
   sig { params(tags: T::Array[T.any(String, Symbol)]).returns(T.nilable(Dependency)) }
   def git_dep_if_needed(tags)
@@ -218,11 +225,11 @@ class DependencyCollector
     return if strategy.nil?
 
     if strategy <= HomebrewCurlDownloadStrategy
-      [curl_dep_if_needed(tags), parse_url_spec(T.must(spec.url), tags)]
+      [curl_dep_if_needed(tags), parse_url_spec(resource_url(spec), tags)]
     elsif strategy <= NoUnzipCurlDownloadStrategy
       # ensure NoUnzip never adds any dependencies
     elsif strategy <= CurlDownloadStrategy
-      parse_url_spec(T.must(spec.url), tags)
+      parse_url_spec(resource_url(spec), tags)
     elsif strategy <= GitDownloadStrategy
       git_dep_if_needed(tags)
     elsif strategy <= SubversionDownloadStrategy
@@ -240,6 +247,14 @@ class DependencyCollector
     else
       raise TypeError, "#{strategy.inspect} is not an AbstractDownloadStrategy subclass"
     end
+  end
+
+  sig { params(spec: Resource).returns(String) }
+  def resource_url(spec)
+    url = spec.url
+    raise ArgumentError, "Resource #{spec.name} has no URL" if url.nil?
+
+    url
   end
 
   sig { params(url: String, tags: T::Array[T.any(String, Symbol)]).returns(T.nilable(Dependency)) }

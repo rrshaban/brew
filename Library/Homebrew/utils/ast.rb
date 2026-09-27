@@ -2,7 +2,9 @@
 # frozen_string_literal: true
 
 require "ast_constants"
+require "on_system"
 require "rubocop-ast"
+require "rubocops/cask/constants/stanza"
 
 module Utils
   # Helper functions for editing Ruby files.
@@ -46,7 +48,7 @@ module Utils
     sig { params(node: Node).returns(T.untyped) }
     def literal_value(node)
       return node.str_content if node.str_type?
-      return T.unsafe(node).value if node.sym_type? || node.numeric_type?
+      return node.value if node.is_a?(RuboCop::AST::BasicLiteralNode) && (node.sym_type? || node.numeric_type?)
 
       nil
     end
@@ -90,7 +92,18 @@ module Utils
       extend Forwardable
       include AST
 
+      PATCH_PLATFORM_BLOCKS = T.let(
+        [*OnSystem::ARCH_OPTIONS, *OnSystem::BASE_OS_OPTIONS, *MacOSVersion::SYMBOLS.keys, :system].map do |name|
+          :"on_#{name}"
+        end.freeze,
+        T::Array[Symbol],
+      )
+
       delegate process: :tree_rewriter
+
+      # Top-level nodes in the formula body.
+      sig { returns(T::Array[Node]) }
+      attr_reader :children
 
       sig { params(formula_contents: String).void }
       def initialize(formula_contents)
@@ -183,6 +196,18 @@ module Utils
         replace_stanza_value(resource_stanza(resource_name, name, old_value:), value)
       end
 
+      sig {
+        params(
+          resource_name: String,
+          name:          Symbol,
+          key:           Symbol,
+          value:         T.any(Numeric, String, Symbol),
+        ).void
+      }
+      def replace_resource_stanza_hash_value(resource_name, name, key, value)
+        replace_stanza_hash_value(resource_stanza(resource_name, name), key, value)
+      end
+
       sig { params(resource_name: String, name: Symbol).returns(T::Boolean) }
       def resource_stanza?(resource_name, name)
         matching_stanzas(body_children(resource(resource_name).body), name).present?
@@ -257,6 +282,39 @@ module Utils
         remove_stanza_node(stanza_node)
       end
 
+      # Yields patch blocks in all scopes; the caller returns patches or branches to remove.
+      # Removes platform wrappers emptied by patch removal, including their comments.
+      sig { params(block: T.proc.params(node: BlockNode).returns(T::Array[BlockNode])).void }
+      def remove_patches(&block)
+        nodes = children.flat_map { |node| node.each_node(:block).to_a }.grep(BlockNode)
+        removals = nodes.flat_map do |node|
+          next [] if node.method_name != :patch || node.send_node.receiver
+
+          yield(node)
+        end
+
+        nodes.reverse_each do |node|
+          next if node.send_node.receiver
+          next unless PATCH_PLATFORM_BLOCKS.include?(node.method_name)
+          next if node.body.nil?
+          next unless body_children(node.body).all? { |child| removals.any? { |removal| removal.equal?(child) } }
+
+          removals.reject! { |removal| node.source_range.contains?(removal.source_range) }
+          removals << node
+        end
+        removals.each { |node| remove_stanza_node(node) }
+      end
+
+      # Finds DSL calls regardless of their platform or enclosing scope.
+      sig { params(name: Symbol).returns(T::Boolean) }
+      def contains_call?(name)
+        children.any? do |node|
+          node.each_node(:send).any? do |call|
+            call.method_name == name && call.receiver.nil?
+          end
+        end
+      end
+
       sig { params(name: Symbol, replacement: T.any(Numeric, String, Symbol), type: T.nilable(Symbol)).void }
       def replace_stanza(name, replacement, type: nil)
         stanza_node = stanza(name, type:)
@@ -307,9 +365,6 @@ module Utils
 
       sig { returns(ProcessedSource) }
       attr_reader :processed_source
-
-      sig { returns(T::Array[Node]) }
-      attr_reader :children
 
       sig { returns(TreeRewriter) }
       attr_reader :tree_rewriter
@@ -445,7 +500,7 @@ module Utils
         groups = T.let([], T::Array[T::Array[BlockNode]])
         resource_nodes.each do |resource_node|
           previous_group = groups.last
-          if previous_group.nil? || !resource_stanzas_contiguous?(T.must(previous_group.last), resource_node)
+          if previous_group.nil? || !resource_stanzas_contiguous?(previous_group.fetch(-1), resource_node)
             groups << [resource_node]
           else
             previous_group << resource_node
@@ -465,8 +520,8 @@ module Utils
 
       sig { params(group: T::Array[BlockNode]).returns(Parser::Source::Range) }
       def resource_stanza_group_range(group)
-        first_range = source_range_with_leading_resource_error_comments(T.must(group.first).source_range)
-        last_range = whole_line_range(T.must(group.last).source_range, include_following_blank_lines: true)
+        first_range = source_range_with_leading_resource_error_comments(group.fetch(0).source_range)
+        last_range = whole_line_range(group.fetch(-1).source_range, include_following_blank_lines: true)
         first_range.with(
           begin_pos: first_range.begin_pos - first_range.column,
           end_pos:   last_range.end_pos,
@@ -671,6 +726,45 @@ module Utils
         end
       end
 
+      # Sets the minimum macOS version of the `depends_on macos:` stanza, adding
+      # the stanza when it is missing. Returns `false` when the minimum version
+      # cannot be expressed, e.g. an exact version list or a maximum.
+      sig { params(version: Symbol).returns(T::Boolean) }
+      def update_depends_on_macos_minimum!(version)
+        if (macos_pair = top_level_depends_on_macos_pair)
+          return false unless minimum_macos_value?(macos_pair.value)
+
+          tree_rewriter.replace(macos_pair.value.source_range, ruby_literal(version))
+          return true
+        end
+
+        # A second stanza alongside a bare `depends_on :macos` would be flagged
+        # as redundant by `Homebrew/OSDependsOn`.
+        if (bare_argument = top_level_bare_depends_on_macos_argument)
+          tree_rewriter.replace(bare_argument.source_range, "macos: #{ruby_literal(version)}")
+          return true
+        end
+
+        return false if depends_on_macos?
+
+        new_stanza = "depends_on macos: #{ruby_literal(version)}"
+
+        if (existing_stanza = top_level_stanzas(:depends_on).last)
+          indent = " " * existing_stanza.source_range.column
+          tree_rewriter.insert_after(whole_line_range(existing_stanza.source_range), "#{indent}#{new_stanza}\n")
+          return true
+        end
+
+        successor = stanza_successor(:depends_on)
+        return false if successor.nil?
+
+        indent = " " * successor.source_range.column
+        line_range = whole_line_range(successor.source_range)
+        separator = "\n" unless cask_contents[0...line_range.begin_pos].to_s.match?(/(\n\n|do\n)\z/)
+        tree_rewriter.insert_before(line_range, "#{separator}#{indent}#{new_stanza}\n\n")
+        true
+      end
+
       private
 
       sig { returns(String) }
@@ -707,6 +801,45 @@ module Utils
       def top_level_stanzas(name)
         body_children(cask_block.body).grep(SendNode).select do |node|
           node.method_name == name && node.receiver.nil? && node.first_argument.present?
+        end
+      end
+
+      # Only a bare symbol or a `>=` comparison states a minimum macOS version.
+      sig { params(node: Node).returns(T::Boolean) }
+      def minimum_macos_value?(node)
+        return true if node.sym_type?
+        return false unless node.str_type?
+
+        node.str_content&.match?(/\A\s*>=/) || false
+      end
+
+      sig { returns(T.nilable(RuboCop::AST::PairNode)) }
+      def top_level_depends_on_macos_pair
+        pairs = top_level_stanzas(:depends_on).flat_map do |stanza_node|
+          stanza_node.arguments.grep(RuboCop::AST::HashNode).flat_map(&:pairs)
+        end
+        pairs.find { |pair| literal_value(pair.key) == :macos }
+      end
+
+      sig { returns(T.nilable(Node)) }
+      def top_level_bare_depends_on_macos_argument
+        stanza_node = top_level_stanzas(:depends_on).find do |node|
+          argument = node.first_argument
+          argument&.sym_type? && literal_value(argument) == :macos
+        end
+        stanza_node&.first_argument
+      end
+
+      # The first top-level stanza which must be ordered after `name`.
+      sig { params(name: Symbol).returns(T.nilable(SendNode)) }
+      def stanza_successor(name)
+        stanza_order = RuboCop::Cask::Constants::STANZA_ORDER
+        index = stanza_order.index(name)
+        return if index.nil?
+
+        body_children(cask_block.body).grep(SendNode).find do |node|
+          successor_index = stanza_order.index(node.method_name)
+          successor_index.present? && successor_index > index
         end
       end
 

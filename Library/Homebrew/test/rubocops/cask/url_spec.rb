@@ -7,8 +7,7 @@ RSpec.describe RuboCop::Cop::Cask::Url, :config do
   it "allows regular `url` blocks in homebrew-cask" do
     expect_no_offenses <<~CASK, "/homebrew-cask/Casks/f/foo.rb"
       cask "foo" do
-        url "https://example.com/download/foo-v1.2.0.dmg",
-            verified: "example.com/download/"
+        url "https://example.com/download/foo-v1.2.0.dmg"
       end
     CASK
   end
@@ -27,8 +26,7 @@ RSpec.describe RuboCop::Cop::Cask::Url, :config do
   it "allows regular `url` blocks in a non-homebrew-cask tap" do
     expect_no_offenses <<~CASK, "/homebrew-tap/Casks/f/foo.rb"
       cask "foo" do
-        url "https://example.com/download/foo-v1.2.0.dmg",
-            verified: "example.com/download/"
+        url "https://example.com/download/foo-v1.2.0.dmg"
       end
     CASK
   end
@@ -46,15 +44,15 @@ RSpec.describe RuboCop::Cop::Cask::Url, :config do
   it "reports an offense for a keyword parameter on the same line as the URL" do
     expect_offense <<~CASK
       cask "foo" do
-        url "https://example.com/download/foo-v1.2.0.dmg", verified: "example.com/download/"
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Keyword URL parameter should be on a new indented line.
+        url "https://example.com/download/foo-v1.2.0.dmg", header: "Accept: application/octet-stream"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Keyword URL parameter should be on a new indented line.
       end
     CASK
 
     expect_correction <<~CASK
       cask "foo" do
         url "https://example.com/download/foo-v1.2.0.dmg",
-            verified: "example.com/download/"
+            header: "Accept: application/octet-stream"
       end
     CASK
   end
@@ -62,8 +60,8 @@ RSpec.describe RuboCop::Cop::Cask::Url, :config do
   it "reports an offense for a `url` stanza with only keyword arguments" do
     expect_offense <<~CASK
       cask "foo" do
-        url verified: "example.com/download/"
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ The `url` stanza requires a URL argument.
+        url header: "Accept"
+        ^^^^^^^^^^^^^^^^^^^^ The `url` stanza requires a URL argument.
       end
     CASK
   end
@@ -96,142 +94,70 @@ RSpec.describe RuboCop::Cop::Cask::Url, :config do
     CASK
   end
 
-  it "accepts a `verified` value that does not start with a protocol" do
+  it "accepts multiple keyword parameters each on their own line" do
     expect_no_offenses <<~CASK
       cask "foo" do
         url "https://example.com/download/foo-v1.2.0.dmg",
-            verified: "example.com/download/"
+            header: "Accept: application/octet-stream",
+            user_agent: :fake
       end
     CASK
   end
 
-  it "reports an offense for a `verified` value that starts with a protocol" do
+  it "reports an offense for a keyword parameter on the same line as another keyword parameter" do
     expect_offense <<~CASK
       cask "foo" do
         url "https://example.com/download/foo-v1.2.0.dmg",
-            verified: "https://example.com/download/"
-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Verified URL parameter value should not contain a URL scheme.
+            header: "Accept: application/octet-stream", user_agent: :fake
+                                                        ^^^^^^^^^^^^^^^^^ Keyword URL parameter should be on a new indented line.
       end
     CASK
 
     expect_correction <<~CASK
       cask "foo" do
         url "https://example.com/download/foo-v1.2.0.dmg",
-            verified: "example.com/download/"
+            header: "Accept: application/octet-stream",
+            user_agent: :fake
       end
     CASK
   end
 
-  context "when then URL does not have a path and ends with a /" do
-    it "accepts a `verified` value ending with a /" do
-      expect_no_offenses <<~CASK
-        cask "foo" do
-          url "https://example.org/",
-              verified: "example.org/"
-        end
-      CASK
-    end
-
-    it "reports an offense for a `verified` value not ending a /" do
-      expect_offense <<~CASK
-        cask "foo" do
-          url "https://example.org/",
-              verified: "example.org"
-                        ^^^^^^^^^^^^^ Verified URL parameter value should end with a /.
-        end
-      CASK
-
-      expect_correction <<~CASK
-        cask "foo" do
-          url "https://example.org/",
-              verified: "example.org/"
-        end
-      CASK
-    end
-  end
-
-  context "when the URL has a path and does not end with a /" do
-    it "accepts a `verified` value with one path component" do
-      expect_no_offenses <<~CASK
-        cask "foo" do
-          url "https://github.com/Foo",
-              verified: "github.com/Foo"
-        end
-      CASK
-    end
-
-    it "accepts a `verified` value with two path components" do
-      expect_no_offenses <<~CASK
-        cask "foo" do
-          url "https://github.com/foo/foo.git",
-              verified: "github.com/foo/foo"
-        end
-      CASK
-    end
-  end
-
-  context "when the url ends with a /" do
-    it "accepts a `verified` value ending with a /" do
-      expect_no_offenses <<~CASK
-        cask "foo" do
-          url "https://github.com/",
-              verified: "github.com/"
-        end
-      CASK
-    end
-
-    it "reports an offense for a `verified` value not ending with a /" do
-      expect_offense <<~CASK
-        cask "foo" do
-          url "https://github.com/",
-              verified: "github.com"
-                        ^^^^^^^^^^^^ Verified URL parameter value should end with a /.
-        end
-      CASK
-
-      expect_correction <<~CASK
-        cask "foo" do
-          url "https://github.com/",
-              verified: "github.com/"
-        end
-      CASK
-    end
-  end
-
-  it "accepts a `verified` value with a path ending with a /" do
-    expect_no_offenses <<~CASK
-      cask "foo" do
-        url "https://github.com/Foo/foo/releases/download/v1.2.0/foo-v1.2.0.dmg",
-            verified: "github.com/Foo/foo/"
-      end
-    CASK
-  end
-
-  context "when the URL uses interpolation" do
-    it "accepts a `verified` value with a path ending with a /" do
-      expect_no_offenses <<~CASK
-        cask "foo" do
-          version "1.2.3"
-          url "Cask/Url: https://example.com/download/foo-v\#{version}.dmg",
-              verified: "example.com/download/"
-        end
-      CASK
-    end
-  end
-
-  it "reports an offense for a `verified` value with a path component that doesn't end with a /" do
+  it "reports an offense for a keyword splat on the same line as another keyword parameter" do
     expect_offense <<~CASK
       cask "foo" do
-        url "https://github.com/Foo/foo/releases/download/v1.2.0/foo-v1.2.0.dmg",
-            verified: "github.com/Foo/foo"
-                      ^^^^^^^^^^^^^^^^^^^^ Verified URL parameter value should end with a /.
+        url "https://example.com/download/foo-v1.2.0.dmg",
+            header: "Accept: application/octet-stream", **options
+                                                        ^^^^^^^^^ Keyword URL parameter should be on a new indented line.
       end
     CASK
 
     expect_correction <<~CASK
       cask "foo" do
-        url "https://github.com/Foo/foo/releases/download/v1.2.0/foo-v1.2.0.dmg",
-            verified: "github.com/Foo/foo/"
+        url "https://example.com/download/foo-v1.2.0.dmg",
+            header: "Accept: application/octet-stream",
+            **options
+      end
+    CASK
+  end
+
+  it "reports an offense for a keyword parameter on the last line of a multiline keyword parameter" do
+    expect_offense <<~CASK
+      cask "foo" do
+        url "https://example.com/download/foo-v1.2.0.dmg",
+            data: {
+              key: "value",
+            }, user_agent: :fake
+               ^^^^^^^^^^^^^^^^^ Keyword URL parameter should be on a new indented line.
+      end
+    CASK
+
+    expect_correction <<~CASK
+      cask "foo" do
+        url "https://example.com/download/foo-v1.2.0.dmg",
+            data: {
+              key: "value",
+            },
+            user_agent: :fake
       end
     CASK
   end

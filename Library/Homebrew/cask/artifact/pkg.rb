@@ -1,7 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
-require "plist"
+require "utils/data"
+require "utils/text"
 
 require "utils/user"
 require "cask/artifact/abstract_artifact"
@@ -11,20 +12,30 @@ module Cask
   module Artifact
     # Artifact corresponding to the `pkg` stanza.
     class Pkg < AbstractArtifact
+      sig { override.returns(T::Boolean) }
+      def requires_sudo? = true
+
       sig { returns(Pathname) }
       attr_reader :path
 
-      sig { returns(T::Hash[Symbol, T.untyped]) }
+      sig { returns(T::Hash[Symbol, DirectivesType]) }
       attr_reader :stanza_options
 
-      sig { params(cask: Cask, path: T.any(String, Pathname), stanza_options: T.untyped).returns(T.attached_class) }
+      # The stanza options are validated below rather than typed as keywords so
+      # that an unknown key names itself in the error.
+      sig {
+        params(cask: Cask, path: T.any(String, Pathname), stanza_options: DirectivesType)
+          .returns(T.attached_class)
+      }
       def self.from_args(cask, path, **stanza_options)
-        # odeprecated: `allow_untrusted` disables certificate verification and is being removed.
-        stanza_options.assert_valid_keys(:allow_untrusted, :choices)
+        if stanza_options.key?(:allow_untrusted)
+          odeprecated "`allow_untrusted` in the `pkg` stanza", "a trusted package"
+        end
+        ::Utils::Data.assert_valid_keys(stanza_options, :allow_untrusted, :choices)
         new(cask, path, **stanza_options)
       end
 
-      sig { params(cask: Cask, path: T.any(String, Pathname), stanza_options: T.untyped).void }
+      sig { params(cask: Cask, path: T.any(String, Pathname), stanza_options: DirectivesType).void }
       def initialize(cask, path, **stanza_options)
         super
         @path = T.let(cask.staged_path.join(path), Pathname)
@@ -38,12 +49,16 @@ module Cask
 
       sig {
         params(
-          command:  T.class_of(SystemCommand),
-          verbose:  T::Boolean,
-          _options: T.anything,
+          adopt:        T::Boolean,
+          auto_updates: T.nilable(T::Boolean),
+          force:        T::Boolean,
+          verbose:      T::Boolean,
+          predecessor:  T.nilable(Cask),
+          command:      T.class_of(SystemCommand),
         ).void
       }
-      def install_phase(command: SystemCommand, verbose: false, **_options)
+      def install_phase(adopt: false, auto_updates: false, force: false, verbose: false, predecessor: nil,
+                        command: SystemCommand)
         run_installer(command:, verbose:)
       end
 
@@ -57,7 +72,7 @@ module Cask
           pkgs = Pathname.glob(cask.staged_path/"**"/"*.pkg").map { |path| path.relative_path_from(cask.staged_path) }
 
           message = "Could not find PKG source file '#{pkg}'"
-          message += ", found #{pkgs.map { |path| "'#{path}'" }.to_sentence} instead" if pkgs.any?
+          message += ", found #{::Utils::Text.to_sentence(pkgs.map { |path| "'#{path}'" })} instead" if pkgs.any?
           message += "."
 
           raise CaskError, message
@@ -68,8 +83,7 @@ module Cask
           "-target", "/"
         ]
         args << "-verboseR" if verbose
-        # odeprecated: `allow_untrusted` disables certificate verification and is being removed.
-        args << "-allowUntrusted" if stanza_options.fetch(:allow_untrusted, false)
+        args << "-allowUntrusted" if stanza_options[:allow_untrusted]
         with_choices_file do |choices_path|
           args << "-applyChoiceChangesXML" << choices_path if choices_path
 
@@ -96,9 +110,13 @@ module Cask
           .void
       }
       def with_choices_file(&_blk)
-        choices = stanza_options.fetch(:choices, {})
-        return yield nil if choices.empty?
+        choices = stanza_options[:choices]
+        # An invalid `choices` still reaches `Plist::Emit.dump` below, so that
+        # `installer` rejects it instead of using the default choices.
+        return yield nil if choices.nil?
+        return yield nil if (choices.is_a?(Array) || choices.is_a?(Hash)) && choices.empty?
 
+        require "plist"
         Tempfile.open(["choices", ".xml"]) do |file|
           file.write Plist::Emit.dump(choices)
           file.close

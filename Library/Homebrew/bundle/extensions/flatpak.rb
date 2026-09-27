@@ -60,13 +60,45 @@ module Homebrew
           @installed_packages = T.let(nil, T.nilable(T::Array[Package]))
         end
 
+        sig {
+          override.params(
+            _name:   String,
+            options: Homebrew::Bundle::EntryOptions,
+          ).returns(T::Boolean)
+        }
+        def batch_installable?(_name, options = {})
+          !T.cast(options.fetch(:remote, "flathub"), String).start_with?("http://", "https://")
+        end
+
+        sig { override.params(entries: T::Array[Dsl::Entry], verbose: T::Boolean).returns(T::Boolean) }
+        def install_batch!(entries, verbose: false)
+          flatpak = package_manager_executable
+          unless flatpak
+            $stderr.puts "flatpak is not installed. Install it with your distribution's package manager."
+            return false
+          end
+          flatpak = flatpak.to_s
+
+          success = T.let(true, T::Boolean)
+          entries.group_by { |entry| [entry.options.fetch(:remote, "flathub"), entry.options[:url]] }
+                 .each do |(remote, url), remote_entries|
+            remote = T.cast(remote, String)
+            ensure_named_remote_exists!(flatpak, remote, T.cast(url, String), verbose:) if url
+            installed = Bundle.system(flatpak, "install", "-y", "--system", remote,
+                                      *remote_entries.map(&:name), verbose:)
+            success &&= installed
+          end
+          success
+        end
+
         sig { returns(T::Hash[String, String]) }
         def remote_urls
           remote_urls = @remote_urls
           return remote_urls if remote_urls
 
           @remote_urls = if (flatpak = package_manager_executable)
-            output = `#{flatpak} remote-list --system --columns=name,url 2>/dev/null`.chomp
+            output = Utils.popen_read_text(flatpak, "remote-list", "--system", "--columns=name,url",
+                                           err: File::NULL).chomp
             urls = {}
             output.split("\n").each do |line|
               parts = line.strip.split("\t")
@@ -92,7 +124,8 @@ module Homebrew
             # List applications with their origin remote
             # Using --app to filter applications only
             # Using --columns=application,origin to get app IDs and their remotes
-            output = `#{flatpak} list --app --columns=application,origin 2>/dev/null`.chomp
+            output = Utils.popen_read_text(flatpak, "list", "--app", "--columns=application,origin",
+                                           err: File::NULL).chomp
 
             packages = output.split("\n").filter_map do |line|
               parts = line.strip.split("\t")
@@ -176,7 +209,7 @@ module Homebrew
           _ = no_upgrade
           _ = url
 
-          return false unless package_manager_installed?
+          return true unless package_manager_installed?
 
           # Check if package is installed at all (regardless of remote)
           if package_installed?(name)
@@ -206,10 +239,14 @@ module Homebrew
           _ = no_upgrade
           _ = force
 
-          return true unless package_manager_installed?
           return true unless preinstall
 
-          flatpak = package_manager_executable!.to_s
+          flatpak = package_manager_executable
+          if flatpak.nil?
+            $stderr.puts "flatpak is not installed. Install it with your distribution's package manager."
+            return false
+          end
+          flatpak = flatpak.to_s
 
           # 3-tier remote handling:
           # - Tier 1: no URL → use named remote (default: flathub)
@@ -258,7 +295,8 @@ module Homebrew
           return false unless Bundle.system(flatpak, "install", "-y", "--system", url, verbose:)
 
           # Get the actual remote name used by Flatpak
-          output = `#{flatpak} list --app --columns=application,origin 2>/dev/null`.chomp
+          output = Utils.popen_read_text(flatpak, "list", "--app", "--columns=application,origin",
+                                         err: File::NULL).chomp
           installed = output.split("\n").find { |line| line.start_with?(name) }
           actual_remote = installed ? installed.split("\t")[1] : "#{name}-origin"
           actual_remote ||= "#{name}-origin"
@@ -318,7 +356,8 @@ module Homebrew
         # Get URL for an existing remote, or nil if not found
         sig { params(flatpak: String, remote_name: String).returns(T.nilable(String)) }
         def get_remote_url(flatpak, remote_name)
-          output = `#{flatpak} remote-list --system --columns=name,url 2>/dev/null`.chomp
+          output = Utils.popen_read_text(flatpak, "remote-list", "--system", "--columns=name,url",
+                                         err: File::NULL).chomp
           output.split("\n").each do |line|
             parts = line.split("\t")
             return parts[1] if parts[0] == remote_name

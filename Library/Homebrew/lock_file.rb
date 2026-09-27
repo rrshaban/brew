@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/interrupts"
+
 require "fcntl"
 require "utils/output"
 
@@ -14,6 +16,9 @@ class LockFile
   sig { returns(Pathname) }
   attr_reader :path
 
+  sig { returns(Pathname) }
+  attr_reader :locked_path
+
   sig { params(type: Symbol, locked_path: Pathname).void }
   def initialize(type, locked_path)
     @locked_path = locked_path
@@ -24,7 +29,7 @@ class LockFile
 
   sig { void }
   def lock
-    ignore_interrupts do
+    Utils::Interrupts.ignore do
       next if @lockfile.present?
 
       path.dirname.mkpath
@@ -69,7 +74,7 @@ class LockFile
 
   sig { params(unlink: T::Boolean).void }
   def unlock(unlink: false)
-    ignore_interrupts do
+    Utils::Interrupts.ignore do
       next if @lockfile.nil?
 
       @path.unlink if unlink

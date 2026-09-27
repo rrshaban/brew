@@ -33,6 +33,32 @@ RSpec.describe Homebrew::Cmd::Bundle::CheckSubcommand, :no_api do
                                                            taps_to_tap:         nothing)
       expect { do_check }.not_to raise_error
     end
+
+    it "recognises installed casks alongside formulae", :cask, :integration_test do
+      allow(Formulary).to receive(:loader_for).and_call_original
+      setup_test_formula "testball", tab_attributes: { installed_on_request: true }
+
+      installed_caskfile = Cask::Caskroom.path/
+                           "local-caffeine/.metadata/1.2.3/20250101000000.000/Casks/local-caffeine.rb"
+      installed_caskfile.dirname.mkpath
+      FileUtils.cp cask_path("local-caffeine"), installed_caskfile
+
+      brewfile = mktmpdir/"Brewfile"
+      brewfile.write <<~RUBY
+        brew "testball", link: false
+        cask "local-caffeine"
+      RUBY
+
+      brew_env = {
+        "HOMEBREW_SORBET_RECURSIVE" => nil,
+        "HOMEBREW_SORBET_RUNTIME"   => nil,
+      }
+
+      expect { brew "bundle", "check", "--no-upgrade", "--verbose", "--file=#{brewfile}", brew_env }
+        .to output("The Brewfile's dependencies are satisfied.\n").to_stdout
+        .and not_to_output.to_stderr
+        .and be_a_success
+    end
   end
 
   context "when no dependencies are specified" do
@@ -102,7 +128,7 @@ RSpec.describe Homebrew::Cmd::Bundle::CheckSubcommand, :no_api do
     end
 
     it "raises an error for an implicitly unlinked non-keg-only formula" do
-      Homebrew::Bundle::Brew.instance_variable_set(:@formulae_by_name, { "abc" => { link?: false } })
+      Homebrew::Bundle::Brew.formulae_by_name = { "abc" => { link?: false } }
       allow_any_instance_of(Pathname).to receive(:read).and_return("brew 'abc'")
       allow(Formula["abc"]).to receive(:linked?).and_return(false)
 
@@ -111,7 +137,7 @@ RSpec.describe Homebrew::Cmd::Bundle::CheckSubcommand, :no_api do
     end
 
     it "does not raise an error when live link status satisfies an implicit check" do
-      Homebrew::Bundle::Brew.instance_variable_set(:@formulae_by_name, { "abc" => { link?: false } })
+      Homebrew::Bundle::Brew.formulae_by_name = { "abc" => { link?: false } }
       allow_any_instance_of(Pathname).to receive(:read).and_return("brew 'abc'")
       allow(Formula["abc"]).to receive(:linked?).and_return(true)
 
@@ -130,7 +156,7 @@ RSpec.describe Homebrew::Cmd::Bundle::CheckSubcommand, :no_api do
       end
 
       it "outputs the implicit link status error" do
-        Homebrew::Bundle::Brew.instance_variable_set(:@formulae_by_name, { "abc" => { link?: true } })
+        Homebrew::Bundle::Brew.formulae_by_name = { "abc" => { link?: true } }
         allow_any_instance_of(Pathname).to receive(:read).and_return("brew 'abc'")
         allow(Formula["abc"]).to receive(:linked?).and_return(true)
 
@@ -142,8 +168,8 @@ RSpec.describe Homebrew::Cmd::Bundle::CheckSubcommand, :no_api do
     context "with install mode enabled" do
       it "raises an error after install leaves a formula with the wrong link status" do
         args = args_for_subcommand(:check, install?: true, global?: false, verbose?: false, upgrade_formulae: nil,
-                                           jobs: nil, file: nil)
-        allow(Homebrew::Cmd::Bundle).to receive(:redirect_stdout).and_yield
+                                           file: nil)
+        allow(Utils::Output).to receive(:redirect_stdout).and_yield
         allow(Homebrew::Bundle::Brew).to receive(:install!).and_return(true)
         allow_any_instance_of(Pathname).to receive(:read).and_return("brew 'abc', link: true")
         allow(Formula["abc"]).to receive_messages(linked?: false, keg_only?: false)

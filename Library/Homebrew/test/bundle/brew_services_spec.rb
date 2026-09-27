@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 require "bundle"
@@ -132,31 +132,30 @@ RSpec.describe Homebrew::Bundle::Brew::Services do
   end
 
   describe ".versioned_service_file" do
-    let(:foo) do
+    subject(:foo) do
       instance_double(
         Formula,
-        name:         "fooformula",
-        version:      "1.0",
-        rack:         HOMEBREW_CELLAR/"fooformula",
-        plist_name:   "homebrew.mxcl.fooformula",
-        service_name: "fooformula",
+        name:          "fooformula",
+        version:       "1.0",
+        rack:          HOMEBREW_CELLAR/"fooformula",
+        plist_name:    "sh.brew.fooformula",
+        plist_names:   ["sh.brew.fooformula", "homebrew.mxcl.fooformula"],
+        service_name:  "sh.brew.fooformula",
+        service_names: ["sh.brew.fooformula", "homebrew.fooformula"],
       )
     end
 
-    shared_examples "returns the versioned service file" do
+    shared_examples "returns the versioned service file" do |name, extension|
       it "returns the versioned service file" do
-        expect(Formula).to receive(:[]).with(foo.name).and_return(foo)
-        expect(Homebrew::Bundle).to receive(:formula_versions_from_env).with(foo.name).and_return(foo.version)
+        expect(Formula).to receive(:[]).with(subject.name).and_return(subject)
+        expect(Homebrew::Bundle).to receive(:formula_versions_from_env).with(subject.name).and_return(subject.version)
 
-        prefix = foo.rack/"1.0"
-        allow(FileTest).to receive(:directory?).and_call_original
-        expect(FileTest).to receive(:directory?).with(prefix.to_s).and_return(true)
+        prefix = subject.rack/"1.0"
+        prefix.mkpath
+        service_file = prefix/"#{subject.public_send(name)}.#{extension}"
+        service_file.write("service")
 
-        service_file = prefix/service_basename
-        allow(FileTest).to receive(:file?).and_call_original
-        expect(FileTest).to receive(:file?).with(service_file.to_s).and_return(true)
-
-        expect(described_class.versioned_service_file(foo.name)).to eq(service_file)
+        expect(described_class.versioned_service_file(subject.name)).to eq(service_file)
       end
     end
 
@@ -165,9 +164,20 @@ RSpec.describe Homebrew::Bundle::Brew::Services do
         allow(Homebrew::Services::System).to receive(:launchctl?).and_return(true)
       end
 
-      let(:service_basename) { "#{foo.plist_name}.plist" }
+      include_examples "returns the versioned service file", :plist_name, "plist"
 
-      include_examples "returns the versioned service file"
+      it "returns the compatible versioned service file" do
+        expect(Formula).to receive(:[]).with(foo.name).and_return(foo)
+        expect(Homebrew::Bundle).to receive(:formula_versions_from_env).with(foo.name).and_return(foo.version)
+
+        prefix = foo.rack/foo.version
+        prefix.mkpath
+        service_file = prefix/"homebrew.mxcl.fooformula.plist"
+        (prefix/"sh.brew.fooformula.plist").unlink if (prefix/"sh.brew.fooformula.plist").exist?
+        service_file.write("service")
+
+        expect(described_class.versioned_service_file(foo.name)).to eq(service_file)
+      end
     end
 
     context "with systemd" do
@@ -175,9 +185,19 @@ RSpec.describe Homebrew::Bundle::Brew::Services do
         allow(Homebrew::Services::System).to receive(:launchctl?).and_return(false)
       end
 
-      let(:service_basename) { "#{foo.service_name}.service" }
+      include_examples "returns the versioned service file", :service_name, "service"
 
-      include_examples "returns the versioned service file"
+      it "returns the compatible versioned service file" do
+        expect(Formula).to receive(:[]).with(foo.name).and_return(foo)
+        expect(Homebrew::Bundle).to receive(:formula_versions_from_env).with(foo.name).and_return(foo.version)
+
+        prefix = foo.rack/foo.version
+        prefix.mkpath
+        service_file = prefix/"homebrew.fooformula.service"
+        service_file.write("service")
+
+        expect(described_class.versioned_service_file(foo.name)).to eq(service_file)
+      end
     end
   end
 end

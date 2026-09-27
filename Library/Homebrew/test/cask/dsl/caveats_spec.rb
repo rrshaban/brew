@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 require "test/cask/dsl/shared_examples/base"
@@ -7,7 +7,6 @@ RSpec.describe Cask::DSL::Caveats, :cask do
   subject(:caveats) { described_class.new(cask) }
 
   let(:cask) { Cask::CaskLoader.load(cask_path("with-caveats-everything")) }
-  let(:dsl) { caveats }
 
   it_behaves_like Cask::DSL::Base
 
@@ -20,6 +19,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         logout
         "Custom caveat text."
       end
@@ -38,7 +38,9 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       allow(Homebrew::SimulateSystem).to receive(:current_arch).and_return(:arm)
+      allow(Hardware::CPU).to receive(:rosetta_installed?).and_return(false)
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         requires_rosetta
       end
 
@@ -52,6 +54,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         reboot
       end
 
@@ -69,6 +72,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
     it "returns true for invoked caveats" do
       allow(Homebrew::SimulateSystem).to receive(:current_arch).and_return(:arm)
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         requires_rosetta
       end
 
@@ -78,6 +82,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
     it "returns true even when caveat condition is false" do
       allow(Homebrew::SimulateSystem).to receive(:current_arch).and_return(:intel)
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         requires_rosetta
       end
 
@@ -113,15 +118,28 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         kext
       end
 
       expect(caveats.to_s).to eq(expected_caveats_str)
     end
 
+    it "does not return kext caveat text on Linux" do
+      Homebrew::SimulateSystem.with(os: :linux) do
+        caveats.eval_caveats do
+          T.bind(self, Cask::DSL::Caveats)
+          kext
+        end
+      end
+
+      expect(caveats.to_s).to be_empty
+    end
+
     it "does not return kext caveat text on macOS Ventura and earlier" do
       allow(MacOS).to receive(:version).and_return(MacOSVersion.from_symbol(:ventura))
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         kext
       end
 
@@ -142,6 +160,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         unsigned_accessibility
       end
 
@@ -160,10 +179,42 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         unsigned_accessibility
       end
 
       expect(caveats.to_s).to eq(expected_caveats_str)
+    end
+
+    it "returns text using default `access` value when the argument is `nil`" do
+      expected_caveats_str = <<~EOS
+        #{cask} is not signed and requires Accessibility access,
+        so you will need to re-grant Accessibility access every time the app is updated.
+
+        Enable or re-enable it in:
+          System Settings → Privacy & Security → Accessibility
+        To re-enable, untick and retick #{cask}.app.
+      EOS
+
+      Homebrew::SimulateSystem.with(os: :ventura) do
+        caveats.eval_caveats do
+          T.bind(self, Cask::DSL::Caveats)
+          unsigned_accessibility nil
+        end
+      end
+
+      expect(caveats.to_s).to eq(expected_caveats_str)
+    end
+
+    it "does not return unsigned_accessibility caveat text on Linux" do
+      Homebrew::SimulateSystem.with(os: :linux) do
+        caveats.eval_caveats do
+          T.bind(self, Cask::DSL::Caveats)
+          unsigned_accessibility
+        end
+      end
+
+      expect(caveats.to_s).to be_empty
     end
   end
 
@@ -176,6 +227,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         path_environment_variable "/example/path"
       end
 
@@ -193,6 +245,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         zsh_path_helper "/example/path"
       end
 
@@ -206,10 +259,11 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       expected_caveats_str = <<~EOS
         Cask #{cask} installs files under /usr/local. The presence of such
         files can cause warnings when running `brew doctor`, which is considered
-        to be a bug in Homebrew Cask.
+        to be a bug in Homebrew's cask handling.
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         files_in_usr_local
       end
 
@@ -219,6 +273,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
     it "does not return caveat text when HOMEBREW_PREFIX does not start /usr/local" do
       stub_const("HOMEBREW_PREFIX", "/opt/homebrew")
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         files_in_usr_local
       end
 
@@ -234,6 +289,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         depends_on_java
       end
 
@@ -247,6 +303,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         depends_on_java :any
       end
 
@@ -260,6 +317,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         depends_on_java "11+"
       end
 
@@ -273,6 +331,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         depends_on_java "11"
       end
 
@@ -281,8 +340,9 @@ RSpec.describe Cask::DSL::Caveats, :cask do
   end
 
   describe "#requires_rosetta" do
-    it "returns Rosetta caveat text if the current arch is :arm" do
+    it "returns Rosetta caveat text if the current arch is :arm and Rosetta 2 is not installed" do
       allow(Homebrew::SimulateSystem).to receive(:current_arch).and_return(:arm)
+      allow(Hardware::CPU).to receive(:rosetta_installed?).and_return(false)
       expected_caveats_str = <<~EOS
         #{cask} is built for Intel macOS and so requires Rosetta 2 to be installed.
         You can install Rosetta 2 with:
@@ -291,16 +351,42 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         requires_rosetta
       end
 
       expect(caveats.to_s).to eq(expected_caveats_str)
     end
 
+    it "does not return a caveat string if the current arch is :arm but Rosetta 2 is already installed" do
+      allow(Homebrew::SimulateSystem).to receive(:current_arch).and_return(:arm)
+      allow(Hardware::CPU).to receive(:rosetta_installed?).and_return(true)
+      caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
+        requires_rosetta
+      end
+
+      expect(caveats.to_s).to be_empty
+    end
+
     it "does not return a caveat string if the current arch is not :arm" do
       allow(Homebrew::SimulateSystem).to receive(:current_arch).and_return(:intel)
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         requires_rosetta
+      end
+
+      expect(caveats.to_s).to be_empty
+    end
+
+    it "does not return a caveat string on Linux" do
+      allow(Hardware::CPU).to receive(:rosetta_installed?).and_return(false)
+
+      Homebrew::SimulateSystem.with(os: :linux, arch: :arm) do
+        caveats.eval_caveats do
+          T.bind(self, Cask::DSL::Caveats)
+          requires_rosetta
+        end
       end
 
       expect(caveats.to_s).to be_empty
@@ -314,6 +400,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         logout
       end
 
@@ -328,6 +415,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         reboot
       end
 
@@ -343,6 +431,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         license "https://brew.sh/test-license/"
       end
 
@@ -358,6 +447,7 @@ RSpec.describe Cask::DSL::Caveats, :cask do
       EOS
 
       caveats.eval_caveats do
+        T.bind(self, Cask::DSL::Caveats)
         free_license "https://brew.sh/test-free-license/"
       end
 

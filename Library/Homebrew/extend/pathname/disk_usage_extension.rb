@@ -29,9 +29,8 @@ module DiskUsageExtension
   sig { returns(String) }
   def abv
     out = +""
-    @file_count, @disk_usage = compute_disk_usage
-    out << "#{Formatter.number_readable(@file_count)} files, " if @file_count > 1
-    out << Formatter.disk_usage_readable(@disk_usage).to_s
+    out << "#{Formatter.number_readable(file_count)} files, " if file_count > 1
+    out << Formatter.disk_usage_readable(disk_usage).to_s
     out.freeze
   end
 
@@ -46,7 +45,7 @@ module DiskUsageExtension
     end
 
     path = if symlink?
-      resolved_path
+      Utils::Path.resolved_path(Pathname(to_path))
     else
       self
     end
@@ -56,12 +55,12 @@ module DiskUsageExtension
       file_count = 0
       disk_usage = 0
       path.find do |f|
-        if f.directory?
-          disk_usage += f.lstat.size
+        # use Pathname#lstat instead of Pathname#stat to get info of symlink itself.
+        stat = f.lstat
+        if stat.directory? || (stat.symlink? && f.directory?)
+          disk_usage += stat.size
         else
-          file_count += 1 if f.basename.to_s != ".DS_Store"
-          # use Pathname#lstat instead of Pathname#stat to get info of symlink itself.
-          stat = f.lstat
+          file_count += 1 if File.basename(f.to_s) != ".DS_Store"
           file_id = [stat.dev, stat.ino]
           # count hardlinks only once.
           unless scanned_files.include?(file_id)

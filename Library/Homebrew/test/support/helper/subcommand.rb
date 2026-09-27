@@ -8,8 +8,11 @@ module Test
 
       requires_ancestor { Kernel }
 
-      class Args
+      class Args < Homebrew::CLI::Args
         attr_reader :named
+
+        # Value flags that are unset unless a spec provides them.
+        KNOWN_NIL_OPTIONS = [:jobs].freeze
 
         KNOWN_PREDICATES = [
           :all?,
@@ -79,6 +82,7 @@ module Test
         ].freeze
 
         def initialize(named:, **options)
+          super()
           @named = named
           @options = options
         end
@@ -88,13 +92,16 @@ module Test
             @options.fetch(name)
           elsif args.empty? && KNOWN_PREDICATES.include?(name)
             false
+          elsif args.empty? && KNOWN_NIL_OPTIONS.include?(name)
+            nil
           else
             super
           end
         end
 
         def respond_to_missing?(name, include_private = false)
-          @options.key?(name) || KNOWN_PREDICATES.include?(name) || super
+          @options.key?(name) || KNOWN_PREDICATES.include?(name) ||
+            KNOWN_NIL_OPTIONS.include?(name) || super
         end
       end
 
@@ -119,13 +126,12 @@ module Test
           verbose:      T::Boolean,
           force:        T::Boolean,
           ask:          T::Boolean,
-          jobs:         Integer,
           zap:          T::Boolean,
           no_type_args: T::Boolean,
         ).returns(Homebrew::Cmd::Bundle::SubcommandContext)
       }
       def bundle_subcommand_context(subcommand, global: false, file: nil, no_upgrade: false, verbose: false,
-                                    force: false, ask: false, jobs: 1, zap: false, no_type_args: true)
+                                    force: false, ask: false, zap: false, no_type_args: true)
         Homebrew::Cmd::Bundle::SubcommandContext.new(
           subcommand:   subcommand.to_s,
           global:,
@@ -134,7 +140,6 @@ module Test
           verbose:,
           force:,
           ask:,
-          jobs:,
           zap:,
           no_type_args:,
           extensions:   Homebrew::Bundle.extensions,

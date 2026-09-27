@@ -50,7 +50,7 @@ module Homebrew
 
       sig { override.void }
       def run
-        Homebrew.install_bundler_gems!(groups: ["style"])
+        Utils::GemSetup.install_bundler_gems!(groups: ["style"])
 
         if args.changed? && !args.no_named?
           raise UsageError, "`--changed` and named arguments are mutually exclusive!"
@@ -70,24 +70,19 @@ module Homebrew
         end
 
         only_cops = args.only_cops
-        except_cops = args.except_cops
+        # `--only-cops` takes precedence, so no cops are excluded when it is set.
+        except_cops = args.except_cops || %w[FormulaAuditStrict] unless only_cops
 
-        options = {
+        Homebrew.failed = !Style.check_style_and_print(
+          target || [],
           fix:         args.fix?,
           todo:        args.todo?,
+          except_cops:,
+          only_cops:,
           reset_cache: args.reset_cache?,
           debug:       args.debug?,
           verbose:     args.verbose?,
-        }
-        if only_cops
-          options[:only_cops] = only_cops
-        elsif except_cops
-          options[:except_cops] = except_cops
-        else
-          options[:except_cops] = %w[FormulaAuditStrict]
-        end
-
-        Homebrew.failed = !Style.check_style_and_print(target || [], **options)
+        )
       end
 
       sig { returns(T::Array[Pathname]) }
@@ -96,9 +91,10 @@ module Homebrew
         odie "`brew style --changed` must be run inside a git repository!" unless $CHILD_STATUS.success?
 
         Utils::Git.changed_files(repository).filter_map do |file|
-          next if !file.end_with?(".rb", ".sh", ".yml", ".rbi") && file != "bin/brew"
+          path = Pathname(file).expand_path(repository)
+          next if !file.end_with?(".rb", ".sh", ".yml", ".rbi") && Style.shell_scripts.exclude?(path)
 
-          Pathname(file).expand_path(repository)
+          path
         end.select(&:exist?)
       end
     end

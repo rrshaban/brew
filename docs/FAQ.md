@@ -1,5 +1,5 @@
 ---
-last_review_date: "2026-06-10"
+last_review_date: "2026-09-13"
 ---
 
 # FAQ (Frequently Asked Questions)
@@ -79,7 +79,7 @@ Homebrew doesn't support arbitrary mixing and matching of formula versions, so e
 
 Which is usually: `~/Library/Caches/Homebrew`
 
-## My Mac `.app`s don’t find Homebrew utilities
+## My macOS `.app`s don’t find Homebrew utilities
 
 GUI apps on macOS don't have Homebrew's prefix in their `PATH` by default. You can fix this by running `sudo launchctl config user path "$(brew --prefix)/bin:${PATH}"` and then rebooting, as documented in `man launchctl`. Note that this sets the `launchctl` `PATH` for *all users*.
 
@@ -90,7 +90,7 @@ Running a developer command (e.g. `brew edit`, `brew create`) enables Homebrew's
 * Homebrew may auto-run `brew update` before some commands every hour instead of every 24 hours.
 * Updates track the latest commit on `main` instead of the latest stable tag.
 
-To switch back to the default behavior, run `brew developer off`. If you only want to switch back to stable tags, set `HOMEBREW_UPDATE_TO_TAG=1` in your shell environment. To control auto-update frequency, use `HOMEBREW_AUTO_UPDATE_SECS`; to disable auto-updates entirely, set `HOMEBREW_NO_AUTO_UPDATE=1`.
+To switch back to the default behaviour, run `brew developer off`. If you only want to switch back to stable tags, set `HOMEBREW_UPDATE_TO_TAG=1` in your shell environment. To control auto-update frequency, use `HOMEBREW_AUTO_UPDATE_SECS`; to disable auto-updates entirely, set `HOMEBREW_NO_AUTO_UPDATE=1`.
 
 ## How do I contribute to Homebrew?
 
@@ -104,20 +104,20 @@ If available, bottled binaries will be used by default except under the followin
 
 * The `--build-from-source` option is invoked.
 * No bottle is available for the machine's currently running OS version. (Bottles for macOS are generated only for supported macOS versions.)
-* Homebrew is installed to a prefix other than the default (although some bottles support this).
+* The bottle cannot be relocated to Homebrew's prefix or Cellar.
 * Formula options were passed to the install command. For example, `brew install <formula>` will try to find a bottled binary, but `brew install --with-foo <formula>` will trigger a source build.
 
 We aim to bottle everything.
 
 ## Why should I install Homebrew in the default location?
 
-Homebrew's pre-built binary packages (known as [bottles](Bottles.md)) of many formulae can only be used if you install in the default installation prefix, otherwise they have to be built from source. Building from source takes a long time, is prone to failure, and is not supported. The default prefix is:
+Homebrew's default prefix supports its pre-built binary packages (known as [bottles](Bottles.md)) and is used by the installer:
 
 * `/opt/homebrew` for macOS on Apple Silicon,
 * `/usr/local` for macOS on Intel, and
 * `/home/linuxbrew/.linuxbrew` for Linux.
 
-Do yourself a favour and install to the default prefix so that you can use our pre-built binary packages. *Pick another prefix at your peril!*
+Compatible [custom prefixes](Support-Tiers.md#custom-prefixes) can also use bottles.
 
 ## Why is the default installation prefix `/opt/homebrew` on Apple Silicon?
 
@@ -125,36 +125,30 @@ The prefix `/opt/homebrew` was chosen to allow installations in `/opt/homebrew` 
 
 ## Why is the default installation prefix `/home/linuxbrew/.linuxbrew` on Linux?
 
-The prefix `/home/linuxbrew/.linuxbrew` was chosen to avoid writing to system-owned directories after installation while still allowing most precompiled binaries (bottles) to be used. Homebrew is designed for single-user installations rather than shared role accounts. See [Support Tiers](Support-Tiers.md#unsupported) for unsupported multi-user environments.
+The prefix `/home/linuxbrew/.linuxbrew` was chosen to avoid writing to system-owned directories after installation while still allowing most precompiled binaries (bottles) to be used.
+Homebrew is designed for one owning account, which can be a [dedicated account](Installation.md#running-as-the-homebrew-owner).
+See [Support Tiers](Support-Tiers.md#unsupported) for unsupported multi-user environments.
 
 ## Why does Homebrew say sudo is bad?
 
-__tl;dr__ Sudo is dangerous, and you installed TextMate.app without sudo anyway.
+Homebrew runs formula builds and installations as the owning account because upstream build scripts should not have unrestricted system access.
+Some casks and system services need elevated privileges; see [running without sudo](Installation.md#running-without-sudo).
 
-Homebrew refuses to work using sudo.
+## What are the default ownership and permissions used by Homebrew?
 
-You should only ever sudo a tool you trust. Of course, you can trust Homebrew 😉 — but do you trust the multi-megabyte Makefile that Homebrew runs? Developers often understand C++ far better than they understand `make` syntax. It’s too high a risk to sudo such stuff. It could modify (or upload) any files on your system. And indeed, we’ve seen some build scripts try to modify `/usr` even when the prefix was specified as something else entirely.
-
-We use the macOS sandbox to stop this but this doesn't work when run as the `root` user (which also has read and write access to almost everything on the system).
-The sandbox is part of Homebrew's wider [Software Supply Chain Security](Homebrew-Security-and-Supply-Chain.md) measures.
-
-Did you `chown root /Applications/TextMate.app`? Probably not. So is it that important to `chown root wget`?
-
-Note: Homebrew is primarily designed for single-user use and does not work well in multi-user configurations.
-
-## What is the default ownership and permissions used by Homebrew?
-
-First, see previous question regarding sudo.
-
-Ownership on macOS, all subdirectories and files use a forced default of `admin` user group (instead of lower default user group `staff`) and the current user that executed the installation.
+The macOS installer uses the selected account and the `admin` group for administrators, or the account's primary group otherwise.
+Casks use the managing account's effective group when it is not an administrator or sudo is disabled.
 
 Ownership on Linux, all subdirectories and files default to the current user and the user group that executed the installation.
 
-By default, permissions for Homebrew-managed directories and files are `0755 (u=rwx,g=rx,o=rx)` on both macOS and Linux. This means that only the owning user (typically the installing user) can modify or replace files within the Homebrew prefix, while all users are allowed to read and execute installed binaries.
+Installed executable files commonly use `0755 (u=rwx,g=rx,o=rx)`, allowing other accounts to read and execute them.
+The installers also make some managed directories group-writable for administrators and custom primary groups.
+For non-admin macOS accounts whose primary group is `staff`, the installers remove group and other write permissions from the prefix and cache, and Homebrew restricts its umask while preserving stricter settings.
+Check directory permissions, group membership and access control lists when provisioning a dedicated owner.
 
 When a Homebrew-installed binary is executed, it runs with the privileges of the user who launched it.
 
-Note: Homebrew is primarily designed for single-user use and does not work well in multi-user configurations.
+Use a [single owning account](Installation.md#running-as-the-homebrew-owner) to manage the installation.
 
 ## Why isn’t a particular command documented?
 
@@ -201,6 +195,12 @@ Use `brew log <formula>` to find out! Likely because it had [unresolved issues](
 
 For disabled and deprecated formulae, running `brew info <formula>` will also provide an explanation.
 
+## Why was a cask disabled or removed after a macOS security check?
+
+Official macOS casks must pass Homebrew's Gatekeeper checks without requiring users to bypass them.
+A failure is not a malware verdict, but the cask may be deprecated, disabled and eventually removed until upstream provides artefacts that pass.
+The [Cask security model](Homebrew-Security-and-Supply-Chain.md#casks-have-a-different-trust-model) explains why this policy differs from formulae and what signing, notarisation and Gatekeeper add.
+
 ## Homebrew is a poor name, it's too generic; why was it chosen?
 
 Homebrew's creator @mxcl wasn't too concerned with the beer theme and didn't consider that the project may actually prove popular. By the time Max realised that it was popular, it was too late. However, today, the first Google hit for "homebrew" is not beer related 😉
@@ -215,36 +215,33 @@ You can [modify a tool's build configuration](How-to-Build-Software-Outside-Home
 
 `brew edit <formula>` and edit the formula directly. Currently there is no other way to do this.
 
-## Why aren’t some apps included during `brew upgrade`?
+<a data-proofer-ignore name="why-arent-some-apps-included-during-brew-upgrade"></a>
 
-After running `brew upgrade`, you may notice some casks you think should be upgrading, aren’t.
+## How does `brew upgrade` handle apps that update themselves?
 
-As you’re likely aware, a lot of macOS software can upgrade itself:
+Many apps can update themselves without Homebrew:
 
 <img src="assets/img/docs/sparkle-test-app-software-update.png" width="600" alt="Sparkle update window">
 
-That could cause conflicts when used in tandem with Homebrew Cask’s `upgrade` mechanism.
+An app’s own updater can make Homebrew’s installation record older than the app that is actually installed.
+Blindly replacing the app based on that record could downgrade it.
 
-When software uses its built-in mechanisms to upgrade itself, it happens without Homebrew Cask’s knowledge, causing both versions get out of sync. If you were to then upgrade through Homebrew Cask while we have a lower version of the software on record, you’d get a downgrade.
+Casks for self-updating apps declare `auto_updates true`.
+For a versioned cask that installs a single readable app bundle, Homebrew compares the bundle’s version metadata with the cask's current version.
+The default `brew upgrade` includes the cask when the installed app appears older and skips it when the installed app appears to be the same version or newer.
 
-There are a few ideas to fix this problem:
+This comparison is not available for every artifact or versioning scheme.
+When Homebrew cannot make a reliable comparison, it normally skips the self-updating cask instead of guessing.
+To persistently opt out of automatic upgrades for all `auto_updates true` casks, add `export HOMEBREW_NO_UPGRADE_AUTO_UPDATES_CASKS=1` to your shell configuration.
+This does not affect upgrades requested with `--greedy` or `--greedy-auto-updates`.
 
-* Try to prevent the software’s automated updates. `brew pin <cask>` can prevent Homebrew from upgrading a cask, but it does not disable an app’s own updater. Most software on Homebrew Cask is closed-source, so trying to control that for every app would be guesswork.
-* Try to extract the installed software’s version and compare it to the cask, deciding what to do at that time. It’d be a complicated solution that would break other parts of our methodology, such as using versions to interpolate `url` values (a definite win for maintainability). This solution also isn’t universal, as many software developers are inconsistent in their versioning schemes (and app bundles are meant to have two version strings) and it doesn’t work for all types of software we support.
+Casks that use [`version :latest`](Cask-Cookbook.md#special-value-latest) have no version number to compare and are excluded from an ordinary `brew upgrade`.
+When such a cask is named explicitly or included with `--greedy-latest`, Homebrew downloads the current artifact and, when possible, compares its SHA-256 checksum with the checksum recorded during installation.
+It skips reinstalling the cask when the artifact has not changed.
 
-So we let software be. Anything installed with Homebrew Cask should behave the same as if it were installed manually. But since we also want to support software that doesn’t self-upgrade, we add [`auto_updates true`](https://github.com/Homebrew/homebrew-cask/blob/aa461148bbb5119af26b82cccf5003e2b4e50d95/Casks/a/alfred.rb#L18) to casks for software that does. When Homebrew can detect that the version currently installed in the user’s `appdir` is older than the latest version in the tap, `brew upgrade` will try to upgrade these casks automatically. To disable this default behaviour, set `HOMEBREW_NO_UPGRADE_AUTO_UPDATES_CASKS=1`.
-
-Casks which use [`version :latest`](Cask-Cookbook.md#special-value-latest) are also excluded, because we have no way to track their installed version. It helps to ask the developers of such software to provide versioned releases (i.e. include the version in the path of the download `url`).
-
-If you still want to force software to be upgraded via Homebrew Cask, you can reference it specifically in the `upgrade` command:
-
-    brew upgrade <cask>
-
-Or use the `--greedy` switch:
-
-    brew upgrade --greedy
-
-Refer to the `upgrade` section of the [`brew` manual page](Manpage.md) for more details.
+Naming a cask explicitly, using `--greedy-auto-updates` or using the broader `--greedy` option can include casks that the default checks skip.
+Set `HOMEBREW_UPGRADE_GREEDY=1` to apply `--greedy` persistently to all cask upgrades, or list selected casks in the space-separated `HOMEBREW_UPGRADE_GREEDY_CASKS` variable.
+Refer to the `upgrade` section of the [`brew` manual page](Manpage.md) for the full option details.
 
 ## Why don't you rewrite Homebrew in Rust to make it faster?
 

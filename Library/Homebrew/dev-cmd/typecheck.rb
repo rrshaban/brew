@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "system_command"
+
 require "abstract_command"
 require "fileutils"
 
@@ -51,22 +53,19 @@ module Homebrew
         end
 
         update = args.update? || args.update_all?
-        groups = update ? Homebrew.valid_gem_groups : ["typecheck"]
-        Homebrew.install_bundler_gems!(groups:)
-
-        # Sorbet doesn't use bash privileged mode so we align EUID and UID here.
-        Process::UID.change_privilege(Process.euid) if Process.euid != Process.uid
+        groups = update ? Utils::GemSetup.valid_gem_groups : ["typecheck"]
+        Utils::GemSetup.install_bundler_gems!(groups:)
 
         HOMEBREW_LIBRARY_PATH.cd do
           if update
             workers = args.debug? ? ["--workers=1"] : []
-            safe_system "bundle", "exec", "tapioca", "annotations"
-            safe_system "bundle", "exec", "tapioca", "dsl", *workers
+            SystemCommand.safe_system "bundle", "exec", "tapioca", "annotations"
+            SystemCommand.safe_system "bundle", "exec", "tapioca", "dsl", *workers
             # Prefer adding args here: Library/Homebrew/sorbet/tapioca/config.yml
             tapioca_args = args.update_all? ? ["--all"] : []
 
             ohai "Updating Tapioca RBI files..."
-            safe_system "bundle", "exec", "tapioca", "gem", *tapioca_args
+            SystemCommand.safe_system "bundle", "exec", "tapioca", "gem", *tapioca_args
 
             ohai "Trimming RuboCop RBI because by default it's massive..."
             trim_rubocop_rbi
@@ -107,6 +106,9 @@ module Homebrew
             else
               srb_exec << "--disable-watchman"
             end
+          else
+            # Sorbet's LSP mode allows only one input directory.
+            cd("sorbet") { srb_exec << "--dir" << "../../.github/scripts" }
           end
 
           srb_exec += ["--ignore", args.ignore] if args.ignore.present?

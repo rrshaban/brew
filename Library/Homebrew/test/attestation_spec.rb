@@ -76,7 +76,7 @@ RSpec.describe Homebrew::Attestation do
 
   describe "::gh_executable" do
     it "calls ensure_executable" do
-      expect(described_class).to receive(:ensure_executable!)
+      expect(Utils::Executable).to receive(:ensure!)
         .with("gh", reason: "verifying attestations", latest: true)
         .and_return(fake_gh)
 
@@ -220,6 +220,54 @@ RSpec.describe Homebrew::Attestation do
         .and_return(fake_result_json_resp)
 
       described_class.check_attestation fake_all_bottle, Homebrew::Attestation::HOMEBREW_CORE_REPO
+    end
+  end
+
+  describe "::check_formula_attestation" do
+    let(:bottle_resource) { instance_double(Resource, owner: formula_owner) }
+    let(:attested_bottle) { instance_double(Bottle, resource: bottle_resource) }
+    let(:formula_owner) do
+      formula("fformula-name", tap: Tap.fetch("thirdparty", "tap")) do
+        T.bind(self, T.class_of(Formula))
+        url "https://brew.sh/fformula-name-1.0.tar.gz"
+      end
+    end
+
+    it "uses the tap repository for supported third-party taps" do
+      expect(described_class).to receive(:check_attestation)
+        .with(attested_bottle, "thirdparty/homebrew-tap")
+        .and_return({})
+
+      described_class.check_formula_attestation(attested_bottle)
+    end
+
+    it "routes homebrew/core bottles through the core verifier" do
+      core_formula = formula("core-attested") do
+        T.bind(self, T.class_of(Formula))
+        url "https://brew.sh/core-attested-1.0.tar.gz"
+      end
+      core_bottle = instance_double(Bottle, resource: instance_double(Resource, owner: core_formula))
+
+      expect(described_class).to receive(:check_core_attestation)
+        .with(core_bottle)
+        .and_return({})
+
+      described_class.check_formula_attestation(core_bottle)
+    end
+
+    it "raises for third-party taps with custom remotes" do
+      custom_tap = instance_double(
+        Tap,
+        core_tap?:      false,
+        official?:      false,
+        custom_remote?: true,
+        name:           "thirdparty/tap",
+      )
+      allow(formula_owner).to receive(:tap).and_return(custom_tap)
+
+      expect do
+        described_class.check_formula_attestation(attested_bottle)
+      end.to raise_error(Homebrew::Attestation::UnsupportedTapError, /non-default remote/)
     end
   end
 

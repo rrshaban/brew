@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 require "cask/utils/trash"
@@ -8,12 +8,12 @@ RSpec.describe Cask::Utils::Trash do
     let(:path) { Pathname("/tmp/example") }
     let(:trashed_path) { "/Users/example/.Trash/example" }
 
-    it "uses the Foundation trash implementation in developer mode" do
+    it "uses the Foundation trash implementation by default" do
       expect(MacOS::FFI::Foundation).to receive(:trash_paths)
         .with([path.to_s])
         .and_return([[trashed_path], []])
 
-      with_env(HOMEBREW_DEVELOPER: "1") do
+      with_env(HOMEBREW_DEVELOPER: nil) do
         expect(described_class.trash(path)).to eq([[trashed_path], []])
       end
     end
@@ -29,20 +29,6 @@ RSpec.describe Cask::Utils::Trash do
         .with(path.to_s)
         .and_return(trashed_path)
 
-      with_env(HOMEBREW_DEVELOPER: "1") do
-        expect(described_class.trash(path)).to eq([[trashed_path], []])
-      end
-    end
-
-    it "uses the Swift trash implementation by default" do
-      expect(described_class).to receive(:system_command)
-        .with(
-          HOMEBREW_LIBRARY_PATH/"cask/utils/trash.swift",
-          args:         [path],
-          print_stderr: false,
-        )
-        .and_return(instance_double(SystemCommand::Result, stdout: "#{trashed_path}\n"))
-
       with_env(HOMEBREW_DEVELOPER: nil) do
         expect(described_class.trash(path)).to eq([[trashed_path], []])
       end
@@ -57,12 +43,8 @@ RSpec.describe Cask::Utils::Trash do
     let(:info_path) { trash_path/"info" }
     let(:path) { mktmpdir/"folder with spaces"/"example file.txt" }
 
-    around do |example|
-      old_xdg_data_home = ENV.fetch("XDG_DATA_HOME", nil)
+    before do
       ENV["XDG_DATA_HOME"] = xdg_data_home.to_s
-      example.run
-    ensure
-      ENV["XDG_DATA_HOME"] = old_xdg_data_home
     end
 
     it "moves files into the XDG trash and writes a trashinfo file" do

@@ -13,7 +13,7 @@ module Homebrew::EnvConfig
     sig { returns(T.nilable(::String)) }
     def allowed_taps; end
 
-    sig { returns(Integer) }
+    sig { returns(String) }
     def api_auto_update_secs; end
 
     sig { returns(String) }
@@ -31,7 +31,10 @@ module Homebrew::EnvConfig
     sig { returns(T::Boolean) }
     def ask?; end
 
-    sig { returns(T.nilable(::String)) }
+    sig { returns(T::Boolean) }
+    def auto_update_quiet?; end
+
+    sig { returns(String) }
     def auto_update_secs; end
 
     sig { returns(T::Boolean) }
@@ -139,6 +142,9 @@ module Homebrew::EnvConfig
     sig { returns(T::Boolean) }
     def bundle_install_cleanup?; end
 
+    sig { returns(String) }
+    def bundle_jobs; end
+
     sig { returns(T::Boolean) }
     def bundle_no_describe?; end
 
@@ -163,10 +169,10 @@ module Homebrew::EnvConfig
     sig { returns(T.nilable(::String)) }
     def cask_opts_require_sha; end
 
-    sig { returns(Integer) }
+    sig { returns(String) }
     def cleanup_max_age_days; end
 
-    sig { returns(Integer) }
+    sig { returns(String) }
     def cleanup_periodic_full_days; end
 
     sig { returns(T::Boolean) }
@@ -178,7 +184,7 @@ module Homebrew::EnvConfig
     sig { returns(String) }
     def curl_path; end
 
-    sig { returns(Integer) }
+    sig { returns(String) }
     def curl_retries; end
 
     sig { returns(T::Boolean) }
@@ -220,7 +226,7 @@ module Homebrew::EnvConfig
     sig { returns(T::Boolean) }
     def eval_all?; end
 
-    sig { returns(Integer) }
+    sig { returns(String) }
     def fail_log_lines; end
 
     sig { returns(T::Boolean) }
@@ -383,6 +389,9 @@ module Homebrew::EnvConfig
     def no_proxy; end
 
     sig { returns(T::Boolean) }
+    def no_relocate_build_prefix?; end
+
+    sig { returns(T::Boolean) }
     def no_require_tap_trust?; end
 
     sig { returns(T::Boolean) }
@@ -390,6 +399,9 @@ module Homebrew::EnvConfig
 
     sig { returns(T::Boolean) }
     def no_sandbox_linux?; end
+
+    sig { returns(T::Boolean) }
+    def no_sudo?; end
 
     sig { returns(T::Boolean) }
     def no_update_report_new?; end
@@ -403,7 +415,7 @@ module Homebrew::EnvConfig
     sig { returns(T::Boolean) }
     def no_verify_attestations?; end
 
-    sig { returns(T.nilable(::String)) }
+    sig { returns(String) }
     def pip_index_url; end
 
     sig { returns(T::Boolean) }
@@ -430,7 +442,7 @@ module Homebrew::EnvConfig
     sig { returns(T::Boolean) }
     def sorbet_runtime?; end
 
-    sig { returns(T.nilable(::String)) }
+    sig { returns(String) }
     def ssh_config_path; end
 
     sig { returns(T.nilable(::String)) }

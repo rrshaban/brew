@@ -166,13 +166,13 @@ module Homebrew
         path = URI(url!).path
         return unless path.present?
 
-        pypi_package_name, = File.basename(path).split("-", 2)
+        pypi_package_name = File.basename(path).split("-", 2).fetch(0)
       else
         url =~ %r{/(?<package_name>[^/]+)-}
         pypi_package_name = Regexp.last_match(:package_name).to_s
       end
 
-      T.must(pypi_package_name).gsub!(/[_.]/, "-")
+      pypi_package_name = pypi_package_name.gsub(/[_.]/, "-")
 
       return if name.to_s.casecmp(pypi_package_name.to_s)&.zero?
 
@@ -281,7 +281,7 @@ module Homebrew
       return unless url.to_s.end_with?(".git")
       return unless Utils::Git.remote_exists?(url.to_s)
 
-      detected_branch = Utils.popen_read("git", "ls-remote", "--symref", url.to_s, "HEAD")
+      detected_branch = Utils.popen_read("git", "ls-remote", "--symref", "--end-of-options", url.to_s, "HEAD")
                              .match(%r{ref: refs/heads/(.*?)\s+HEAD})&.to_a&.second
 
       if specs[:branch].blank?

@@ -45,18 +45,46 @@ RSpec.describe Homebrew::API::Cask::CaskStructGenerator do
   specify "::process_artifacts" do
     input = [
       { preflight: nil },
-      { foo:       ["arg1", "arg2"] },
-      { bar:       ["arg1", "arg2", { kwarg1: "value1" }] },
-      { baz:       [{ kwarg1: "value1" }] },
+      { pkg:        ["arg1", "arg2"] },
+      { uninstall:  ["arg1", "arg2", { kwarg1: "value1" }] },
+      { stage_only: [{ kwarg1: "value1" }] },
+      {
+        target:         "$HOMEBREW_PREFIX/share/zsh/site-functions/_foo",
+        zsh_completion: ["$APPDIR/Foo.app/Contents/Resources/completions/zsh/_foo"],
+      },
+      {
+        zsh_completion: ["$APPDIR/Bar.app/Contents/Resources/completions/zsh/_bar"],
+        target:         "$HOMEBREW_PREFIX/share/zsh/site-functions/_bar",
+      },
+      {
+        target: "/Applications/Bar.app",
+        app:    ["Foo.app", { target: "Bar.app" }],
+      },
     ]
     expected_output = [
       [:preflight, [], {}, Homebrew::API::CaskStruct::EMPTY_BLOCK],
-      [:foo, ["arg1", "arg2"], {}, nil],
-      [:bar, ["arg1", "arg2"], { kwarg1: "value1" }, nil],
-      [:baz, [], { kwarg1: "value1" }, nil],
+      [:pkg, ["arg1", "arg2"], {}, nil],
+      [:uninstall, ["arg1", "arg2"], { kwarg1: "value1" }, nil],
+      [:stage_only, [], { kwarg1: "value1" }, nil],
+      [:zsh_completion, ["$APPDIR/Foo.app/Contents/Resources/completions/zsh/_foo"], {}, nil],
+      [:zsh_completion, ["$APPDIR/Bar.app/Contents/Resources/completions/zsh/_bar"], {}, nil],
+      [:app, ["Foo.app"], { target: "Bar.app" }, nil],
     ]
     output = described_class.process_artifacts(input)
     expect(output).to eq expected_output
+  end
+
+  it "rejects unknown artifact keys" do
+    input = [
+      { system: ["/usr/bin/true"] },
+      { instance_eval: ["raise 'unexpected dispatch'"] },
+    ]
+
+    expect(described_class.process_artifacts(input)).to be_empty
+  end
+
+  it "rejects artifacts without a DSL key" do
+    expect(described_class.process_artifacts([{ target: "/Applications/Foo.app" }])).to be_empty
   end
 
   specify "::process_url_specs" do
@@ -73,5 +101,10 @@ RSpec.describe Homebrew::API::Cask::CaskStructGenerator do
     }
     output = described_class.process_url_specs(input)
     expect(output).to eq expected_output
+  end
+
+  it "drops the deprecated verified URL spec from existing metadata" do
+    output = described_class.process_url_specs({ verified: "cdn.example.com/", bar: "baz" })
+    expect(output).to eq({ bar: "baz" })
   end
 end

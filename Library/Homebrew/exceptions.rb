@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/text"
+
 # We intentionally want to have many exceptions in this file.
 # rubocop:disable Style/OneClassPerFile
 
@@ -134,12 +136,13 @@ class FormulaOrCaskUnavailableError < RuntimeError
 
   sig { returns(String) }
   def did_you_mean
+    require "api/env"
     require "formula"
 
-    similar_formula_names = Homebrew.with_no_api_env_if_needed(@without_api) { Formula.fuzzy_search(name) }
+    similar_formula_names = Homebrew::API.with_no_api_env_if_needed(@without_api) { Formula.fuzzy_search(name) }
     return "" if similar_formula_names.blank?
 
-    "Did you mean #{similar_formula_names.to_sentence two_words_connector: " or ", last_word_connector: " or "}?"
+    "Did you mean #{Utils::Text.to_sentence(similar_formula_names, conjunction: "or")}?"
   end
 
   sig { returns(String) }
@@ -490,15 +493,20 @@ class TapRedirectNotAllowedError < RuntimeError; end
 
 # Raised when another Homebrew operation is already in progress.
 class OperationInProgressError < RuntimeError
-  sig { params(locked_path: Pathname).void }
-  def initialize(locked_path)
+  sig { params(locked_path: Pathname, waited: T.nilable(Integer)).void }
+  def initialize(locked_path, waited: nil)
     full_command = Homebrew.running_command_with_args.presence || "brew"
     lock_context = if (env_lock_context = Homebrew::EnvConfig.lock_context.presence)
       "\n#{env_lock_context}"
     end
+    advice = if waited
+      "Gave up after waiting #{waited} seconds. Terminate it to continue."
+    else
+      "Please wait for it to finish or terminate it to continue."
+    end
     message = <<~EOS
       A `#{full_command}` process has already locked #{locked_path}.#{lock_context}
-      Please wait for it to finish or terminate it to continue.
+      #{advice}
     EOS
 
     super message
@@ -714,14 +722,7 @@ class BuildError < RuntimeError
     end
 
     require "diagnostic"
-    checks = Homebrew::Diagnostic::Checks.new
-    checks.build_error_checks.each do |check|
-      out = checks.send(check)
-      next if out.nil?
-
-      puts
-      ofail out
-    end
+    Homebrew::Diagnostic.checks(:build_error_checks, fatal: false)
   end
 end
 
@@ -735,7 +736,7 @@ class UnbottledError < RuntimeError
     msg = <<~EOS
       The following #{Utils.pluralize("formula", formulae.count)} cannot be installed from #{Utils.pluralize("bottle", formulae.count)} and must be
       built from source.
-        #{formulae.to_sentence}
+        #{Utils::Text.to_sentence(formulae)}
     EOS
     msg += "#{DevelopmentTools.installation_instructions}\n" unless DevelopmentTools.installed?
     msg.freeze
@@ -824,7 +825,7 @@ class HomebrewCurlDownloadStrategyError < CurlDownloadStrategyError
   end
 end
 
-# Raised by {Kernel#safe_system} in `utils.rb`.
+# Raised when a system command fails.
 class ErrorDuringExecution < RuntimeError
   sig { returns(T::Array[T.nilable(T.any(Pathname, String, T::Array[String], T::Hash[String, T.nilable(String)]))]) }
   attr_reader :cmd
@@ -850,8 +851,18 @@ class ErrorDuringExecution < RuntimeError
     ).void
   }
   def initialize(cmd, status:, output: nil, secrets: [])
+    redacted_cmd = Formatter.redact_secrets(cmd.shelljoin.gsub('\=', "="), secrets)
+    cmd = cmd.map do |arg|
+      case arg
+      when String then Formatter.redact_secrets(arg, secrets)
+      when Array then arg.map { |value| Formatter.redact_secrets(value, secrets) }
+      when Hash then arg.transform_values { |value| Formatter.redact_secrets(value, secrets) if value }
+      else arg
+      end
+    end
     @cmd = cmd
     @status = status
+    output = output&.map { |type, line| [type, Formatter.redact_secrets(line, secrets)] }
     @output = output
 
     @exitstatus = T.let(
@@ -877,8 +888,6 @@ class ErrorDuringExecution < RuntimeError
       end,
       T.nilable(Integer),
     )
-
-    redacted_cmd = Formatter.redact_secrets(cmd.shelljoin.gsub('\=', "="), secrets)
 
     reason = if exitstatus
       "exited with #{exitstatus}"
@@ -920,11 +929,12 @@ class ChecksumMissingError < ArgumentError; end
 # Raised by {Pathname#verify_checksum} when verification fails.
 class ChecksumMismatchError < RuntimeError
   sig { returns(Checksum) }
-  attr_reader :expected
+  attr_reader :expected, :actual
 
   sig { params(path: T.any(Pathname, String), expected: Checksum, actual: Checksum).void }
   def initialize(path, expected, actual)
     @expected = expected
+    @actual = actual
 
     super <<~EOS
       SHA-256 mismatch
@@ -1023,7 +1033,8 @@ class CyclicDependencyError < RuntimeError
   def initialize(strongly_connected_components)
     super <<~EOS
       The following packages contain cyclic dependencies:
-        #{strongly_connected_components.select { |packages| packages.count > 1 }.map(&:to_sentence).join("\n  ")}
+        #{strongly_connected_components.select { |packages| packages.count > 1 }
+                                                .map { |packages| Utils::Text.to_sentence(packages) }.join("\n  ")}
     EOS
   end
 end

@@ -1,6 +1,8 @@
 # typed: true
 # frozen_string_literal: true
 
+require "utils/shell"
+
 require "utils/shell_completion"
 
 RSpec.describe Utils::ShellCompletion do
@@ -75,6 +77,18 @@ RSpec.describe Utils::ShellCompletion do
   end
 
   describe ".generate_completion_output" do
+    it "gives completion generators EOF instead of inheriting standard input" do
+      IO.pipe do |reader, writer|
+        writer.write("parent input")
+        writer.close
+        $stdin.reopen(reader)
+
+        expect(described_class.generate_completion_output(
+                 [RbConfig.ruby, "-e", 'print $stdin.read.empty? ? "completion output" : "inherited input"'], nil, {}
+               )).to eq("completion output")
+      end
+    end
+
     it "calls safe_popen_read with commands and shell parameter" do
       expect(Utils).to receive(:safe_popen_read).with(
         {}, "/usr/bin/foo", "completions", "bash", err: :err
@@ -103,6 +117,23 @@ RSpec.describe Utils::ShellCompletion do
       ).and_return("output")
 
       described_class.generate_completion_output(["/usr/bin/foo"], nil, {})
+    end
+
+    it "suppresses stderr when requested" do
+      expect(Utils).to receive(:safe_popen_read).with(
+        {}, "/usr/bin/foo"
+      ).and_return("output")
+
+      described_class.generate_completion_output(["/usr/bin/foo"], nil, {}, print_stderr: false)
+    end
+
+    it "prints stderr when HOMEBREW_STDERR is set" do
+      ENV["HOMEBREW_STDERR"] = "1"
+      expect(Utils).to receive(:safe_popen_read).with(
+        {}, "/usr/bin/foo", err: :err
+      ).and_return("output")
+
+      described_class.generate_completion_output(["/usr/bin/foo"], nil, {}, print_stderr: false)
     end
   end
 end

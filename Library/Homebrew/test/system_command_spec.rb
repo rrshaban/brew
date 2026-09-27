@@ -1,9 +1,108 @@
 # typed: false
 # frozen_string_literal: true
 
+require "pty"
 require "system_command"
 
 RSpec.describe SystemCommand do
+  describe ".safe_system" do
+    include Context
+
+    it "raises when the command fails" do
+      expect { described_class.safe_system("false") }.to raise_error(ErrorDuringExecution)
+    end
+
+    it "raises for a nil argument" do
+      expect { described_class.safe_system("true", nil) }.to raise_error(ArgumentError)
+    end
+
+    it "exits with 127 when the command cannot be run" do
+      expect { described_class.safe_system("brew-missing-command") }
+        .to raise_error(ErrorDuringExecution, /exited with 127\./)
+    end
+
+    it "keeps running when the command handles an interrupt" do
+      expect do
+        described_class.safe_system("sh", "-c", 'trap "" INT; kill -INT $PPID; sleep 0.2; kill -INT $$')
+      end.not_to raise_error
+    end
+
+    it "raises Interrupt when the command is interrupted" do
+      expect { described_class.safe_system("sh", "-c", "kill -INT $$") }.to raise_error(Interrupt)
+    end
+
+    it "runs the command attached to the terminal" do
+      PTY.open do |_control, terminal|
+        $stdin.reopen(terminal)
+
+        expect { described_class.safe_system("sh", "-c", "test -t 0") }.not_to raise_error
+      end
+    end
+
+    it "sets the given environment" do
+      expect do
+        described_class.safe_system("sh", "-c", 'test "$BREW_TEST_VARIABLE" = value',
+                                    env: { "BREW_TEST_VARIABLE" => "value" })
+      end.not_to raise_error
+    end
+
+    it "redirects standard output to standard error" do
+      expect { described_class.safe_system("echo", "redirected", out: :err) }
+        .to output("redirected\n").to_stderr_from_any_process
+    end
+
+    it "prints the command when verbose" do
+      with_context(verbose: true) do
+        expect { described_class.safe_system("true", "--version") }.to output("true --version\n").to_stdout
+      end
+    end
+
+    it "redacts secrets when verbose" do
+      ENV["HOMEBREW_TEST_TOKEN"] = "hunter2"
+
+      with_context(verbose: true) do
+        expect { described_class.safe_system("true", "hunter2") }.to output("true ******\n").to_stdout
+      end
+    end
+  end
+
+  describe ".quiet_system" do
+    it "returns the command status" do
+      expect(described_class.quiet_system("true")).to be true
+      expect(described_class.quiet_system("false")).to be false
+    end
+
+    it "returns false for a nil executable" do
+      expect(described_class.quiet_system(nil)).to be false
+    end
+
+    it "sets the child status" do
+      described_class.quiet_system("sh", "-c", "exit 3")
+
+      expect($CHILD_STATUS.exitstatus).to eq(3)
+    end
+
+    it "discards the command output" do
+      reader, writer = IO.pipe
+      Utils::Output.redirect_stdout(writer) { described_class.quiet_system("echo", "discarded") }
+      writer.close
+
+      expect(reader.read).to be_empty
+    end
+  end
+
+  describe SystemCommand::Helpers do
+    subject(:helpers) { Class.new { include SystemCommand::Helpers }.new }
+
+    it "provides positional system helpers" do
+      expect(SystemCommand).to receive(:safe_system).with("true")
+      expect(SystemCommand).to receive(:quiet_system).with("true").and_return(true)
+
+      helpers.safe_system("true")
+      expect(helpers.quiet_system("true")).to be true
+    end
+  end
+
   describe "#initialize" do
     subject(:command) do
       described_class.new(
@@ -46,7 +145,7 @@ RSpec.describe SystemCommand do
       it "unsets them" do
         expect do
           command.run!
-        end.to raise_error(/C: parameter (null or )?not set/)
+        end.to raise_error(/C: parameter (?:null or )?not set/)
       end
     end
 
@@ -260,6 +359,23 @@ RSpec.describe SystemCommand do
     end
   end
 
+  context "when the timeout expires" do
+    it "kills the whole process group, including descendants ignoring TERM" do
+      pid_file = mktmpdir/"pid"
+      script = "(trap '' TERM; exec sleep 30) & echo $! > #{pid_file}; wait"
+      expect { described_class.run("/bin/sh", args: ["-c", script], timeout: 0.5) }.to raise_error(Timeout::Error)
+
+      grandchild_pid = pid_file.read.to_i
+      # The orphaned grandchild is reaped by `init`/`launchd` asynchronously.
+      expect do
+        10.times do
+          Process.kill(0, grandchild_pid)
+          sleep(0.1)
+        end
+      end.to raise_error(Errno::ESRCH)
+    end
+  end
+
   context "when given an invalid variable name" do
     it "raises an ArgumentError" do
       expect { described_class.run("true", env: { "1ABC" => true }) }
@@ -287,7 +403,7 @@ RSpec.describe SystemCommand do
       end.not_to raise_error
     end
 
-    it "uses `Process.spawn` rather than `fork` when no privilege change is required" do
+    it "uses `Process.spawn` rather than `fork`" do
       command = described_class.new("true")
       expect(command).not_to receive(:fork)
       expect(Process).to receive(:spawn).and_call_original

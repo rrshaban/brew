@@ -39,13 +39,13 @@ module OS
         end
       end
 
-      sig { params(id: String, file: MachOShim).returns(T::Boolean) }
-      def change_dylib_id(id, file)
+      sig { params(id: String, file: MachOShim, write: T::Boolean).returns(T::Boolean) }
+      def change_dylib_id(id, file, write: true)
         return false if file.dylib_id == id
 
         require_relocation!
         odebug "Changing dylib ID of #{file}\n  from #{file.dylib_id}\n    to #{id}"
-        file.change_dylib_id(id, strict: false)
+        file.change_dylib_id(id, strict: false, write:)
         true
       rescue MachO::MachOError
         onoe <<~EOS
@@ -56,13 +56,13 @@ module OS
         raise
       end
 
-      sig { params(old: String, new: String, file: MachOShim).returns(T::Boolean) }
-      def change_install_name(old, new, file)
+      sig { params(old: String, new: String, file: MachOShim, write: T::Boolean).returns(T::Boolean) }
+      def change_install_name(old, new, file, write: true)
         return false if old == new
 
         require_relocation!
         odebug "Changing install name in #{file}\n  from #{old}\n    to #{new}"
-        file.change_install_name(old, new, strict: false)
+        file.change_install_name(old, new, strict: false, write:)
         true
       rescue MachO::MachOError
         onoe <<~EOS
@@ -73,13 +73,13 @@ module OS
         raise
       end
 
-      sig { params(old: String, new: String, file: MachOShim).returns(T::Boolean) }
-      def change_rpath(old, new, file)
+      sig { params(old: String, new: String, file: MachOShim, write: T::Boolean).returns(T::Boolean) }
+      def change_rpath(old, new, file, write: true)
         return false if old == new
 
         require_relocation!
         odebug "Changing rpath in #{file}\n  from #{old}\n    to #{new}"
-        file.change_rpath(old, new, strict: false)
+        file.change_rpath(old, new, strict: false, write:)
         true
       rescue MachO::MachOError
         onoe <<~EOS
@@ -90,11 +90,10 @@ module OS
         raise
       end
 
-      sig { params(rpath: String, file: MachOShim).returns(T::Boolean) }
-      def delete_rpath(rpath, file)
+      sig { params(rpath: String, file: MachOShim, write: T::Boolean).returns(T::Boolean) }
+      def delete_rpath(rpath, file, write: true)
         odebug "Deleting rpath #{rpath} in #{file}"
-        file.delete_rpath(rpath, strict: false)
-        true
+        !file.delete_rpath(rpath, strict: false, write:).nil?
       rescue MachO::MachOError
         onoe <<~EOS
           Failed deleting rpath #{rpath} in #{file}
@@ -107,32 +106,28 @@ module OS
 
       sig { params(file: String).void }
       def codesign_patched_binary(file)
-        return if MacOS.version < :big_sur
-
         unless ::Hardware::CPU.arm?
+          # Intel macOS rejects ruby-macho's ad-hoc signatures on larger
+          # binaries and does not require unsigned binaries to be signed,
+          # so use `codesign` to re-sign only the binaries whose existing
+          # signature our modifications have just broken:
+          # https://github.com/Homebrew/brew/issues/23418
           result = system_command("codesign", args: ["--verify", file], print_stderr: false)
           return unless result.stderr.match?(/invalid signature/i)
-        end
 
-        odebug "Codesigning #{file}"
-        prepare_codesign_writable_files(file) do
-          # Use quiet_system to squash notifications about resigning binaries
-          # which already have valid signatures.
-          return if quiet_system("codesign", "--sign", "-", "--force",
-                                 "--preserve-metadata=entitlements,requirements,flags,runtime",
-                                 file)
+          odebug "Codesigning #{file}"
+          return if SystemCommand.quiet_system("codesign", "--sign", "-", "--force",
+                                               "--preserve-metadata=entitlements,requirements,flags,runtime",
+                                               file)
 
-          # If the codesigning fails, it may be a bug in Apple's codesign utility
+          # If the codesigning fails, it may be a bug in Apple's codesign utility.
           # A known workaround is to copy the file to another inode, then move it back
           # erasing the previous file. Then sign again.
-          #
-          # TODO: remove this once the bug in Apple's codesign utility is fixed
           Dir::Tmpname.create("workaround") do |tmppath|
             FileUtils.cp file, tmppath
             FileUtils.mv tmppath, file, force: true
           end
 
-          # Try signing again
           odebug "Codesigning (2nd try) #{file}"
           result = system_command("codesign", args: [
             "--sign", "-", "--force",
@@ -141,34 +136,41 @@ module OS
           ], print_stderr: false)
           return if result.success?
 
-          # If it fails again, error out
           onoe <<~EOS
             Failed applying an ad-hoc signature to #{file}:
             #{result.stderr}
           EOS
+          return
         end
+
+        require "macho"
+
+        odebug "Codesigning #{file}"
+        MachO.codesign! file
+      rescue MachO::CodeSigningError => e
+        onoe <<~EOS
+          Failed applying an ad-hoc signature to #{file}:
+          #{e.message}
+        EOS
       end
 
-      sig { params(file: String, _block: T.proc.void).void }
-      def prepare_codesign_writable_files(file, &_block)
-        result = system_command("codesign", args: [
-          "--display", "--file-list", "-", file
-        ], print_stderr: false)
-        return unless result.success?
+      sig { params(files: T::Array[::Pathname]).void }
+      def codesign_patched_binaries(files)
+        return if files.empty?
 
-        files = result.stdout.lines.map { |f| Pathname(f.chomp) }
-        saved_perms = {}
-        files.each do |f|
-          unless f.writable?
-            saved_perms[f] = f.stat.mode
-            FileUtils.chmod "u+rw", f.to_path
+        # Codesigning shells out on Intel and hashes every page of the file on
+        # Apple Silicon, so parallelise it across files.
+        queue = Queue.new
+        files.each { queue << it }
+        queue.close
+        Array.new([files.length, ::Hardware::CPU.cores].min) do
+          Thread.new do
+            while (file = queue.pop)
+              # Signing rewrites the file, which may not be user-writable.
+              Utils::Path.ensure_writable(file) { codesign_patched_binary(file.to_s) }
+            end
           end
-        end
-        yield
-      ensure
-        saved_perms&.each do |f, p|
-          f.chmod p if p
-        end
+        end.each(&:join)
       end
 
       sig { void }

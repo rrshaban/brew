@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 require "cmd/link"
@@ -15,7 +15,7 @@ RSpec.describe Homebrew::Cmd::Link do
     keg = instance_double(Keg, rack: HOMEBREW_CELLAR/"testball", linked?: false, name: "testball")
 
     cmd = described_class.new(["testball"])
-    allow(cmd.args.named).to receive(:to_latest_kegs).and_return([keg])
+    allow(cmd.args.named).to receive(:to_kegs_to_casks).and_return([[keg], []])
     allow(Formulary).to receive(:keg_only?).with(keg.rack).and_return(false)
     allow(keg).to receive(:to_formula).and_return(formula)
     expect(Homebrew::Unlink).to receive(:unlink_link_overwrite_formulae).with(formula, verbose: false)
@@ -25,9 +25,30 @@ RSpec.describe Homebrew::Cmd::Link do
     expect { cmd.run }.to output(/Linking .*1 symlinks created\./).to_stdout
   end
 
+  it "links a given Cask's symlinked artifacts", :cask do
+    cask = Cask::CaskLoader.load(cask_path("with-binary"))
+    InstallHelper.install_without_artifacts_with_caskfile(cask)
+    cmd = described_class.new(["--cask", "with-binary"])
+    allow(cmd.args.named).to receive(:to_kegs_to_casks).and_return([[], [cask]])
+
+    expect { cmd.run }.to output(/Linking Binary 'binary'/).to_stdout
+    expect(cask.config.binarydir/"binary").to be_a_symlink
+  end
+
+  it "refuses to link a Cask over an existing file before linking anything", :cask do
+    cask = Cask::CaskLoader.load(cask_path("with-binary"))
+    InstallHelper.install_without_artifacts_with_caskfile(cask)
+    cask.config.binarydir.mkpath
+    FileUtils.touch cask.config.binarydir/"binary"
+    cmd = described_class.new(["--cask", "with-binary"])
+    allow(cmd.args.named).to receive(:to_kegs_to_casks).and_return([[], [cask]])
+
+    expect { cmd.run }.to raise_error(Cask::CaskError, /brew link --cask --overwrite with-binary/)
+  end
+
   it "links a given Formula", :integration_test do
     setup_test_formula "testball", tab_attributes: { installed_on_request: true }
-    Formula["testball"].any_installed_keg.unlink
+    Formula["testball"].any_installed_keg&.unlink
     Formula["testball"].bin.mkpath
     FileUtils.touch Formula["testball"].bin/"testfile"
 
@@ -38,10 +59,10 @@ RSpec.describe Homebrew::Cmd::Link do
     expect(HOMEBREW_PREFIX/"bin/testfile").to be_a_file
   end
 
-  {
+  test_each_hash({
     "@-versioned" => "testball-link-output@1.0",
     "-full"       => "testball-link-output-full",
-  }.each do |formula_type, formula_name|
+  }) do |formula_type, formula_name|
     it "does not print keg-only output when linking a #{formula_type} formula" do
       test_formula = formula(formula_name) do
         T.bind(self, T.class_of(Formula))
@@ -64,7 +85,7 @@ RSpec.describe Homebrew::Cmd::Link do
       )
       cmd = described_class.new([formula_name])
 
-      allow(cmd.args.named).to receive(:to_latest_kegs).and_return([keg])
+      allow(cmd.args.named).to receive(:to_kegs_to_casks).and_return([[keg], []])
       allow(Formulary).to receive(:keg_only?).with(keg.rack).and_return(true)
       allow(Homebrew::Unlink).to receive(:unlink_link_overwrite_formulae)
       allow(keg).to receive(:lock).and_yield

@@ -4,15 +4,36 @@
 require "cask/caskroom"
 
 RSpec.describe Cask::Caskroom do
-  before { described_class.instance_variable_set(:@expected_caskroom_group, nil) }
+  before { described_class.expected_caskroom_group = nil }
 
   describe ".ensure_caskroom_exists" do
+    test_each([
+      [true, "staff", false, 0],
+      [true, "staff", true, 0020],
+      [true, "admin", true, 0020],
+      [true, "brew-users", false, 0020],
+      [false, "staff", false, 0020],
+    ]) do |(macos, group, admin, group_write)|
+      it "sets group write permissions for #{[macos, group, admin]}" do
+        path = mktmpdir/"Caskroom"
+        allow(described_class).to receive_messages(path:, expected_caskroom_group: group,
+                                                   shared_caskroom_group: macos ? "staff" : nil,
+                                                   caskroom_group_correct?: true)
+        allow(Etc).to receive(:getgrnam).with("admin").and_return(instance_double(Etc::Group, gid: 80))
+        allow(Process).to receive(:groups).and_return(admin ? [80] : [])
+
+        described_class.ensure_caskroom_exists
+
+        expect(path.stat.mode & 0022).to eq(group_write)
+      end
+    end
+
     it "changes the group when sudo is unnecessary and the group is wrong" do
       Dir.mktmpdir do |dir|
         path = Pathname(dir)/"Caskroom"
         allow(described_class).to receive(:path).and_return(path)
         allow(described_class).to receive(:caskroom_group_correct?).with(path).and_return(false)
-        expect(described_class).to receive(:chgrp_path).with(path, false)
+        expect(described_class).to receive(:chgrp_path).with(path, nil)
 
         described_class.ensure_caskroom_exists
       end
@@ -38,7 +59,7 @@ RSpec.describe Cask::Caskroom do
         allow(parent).to receive(:writable?).and_return(false)
         allow(SystemCommand).to receive(:run)
 
-        expect(described_class).to receive(:chgrp_path).with(path, true)
+        expect(described_class).to receive(:chgrp_path).with(path, nil)
 
         described_class.ensure_caskroom_exists
       end
@@ -75,7 +96,25 @@ RSpec.describe Cask::Caskroom do
   end
 
   describe ".caskroom_group_correct?" do
+    it "uses the effective group for a non-admin account" do
+      ENV.delete("HOMEBREW_NO_SUDO")
+      allow(Process).to receive(:groups).and_return([Process.egid])
+      allow(Etc).to receive(:getgrnam).with("admin").and_return(instance_double(Etc::Group, gid: Process.egid + 1))
+      allow(Etc).to receive(:getgrgid).with(Process.egid).and_return(instance_double(Etc::Group, name: "brewer"))
+
+      expect(described_class.expected_caskroom_group).to eq("brewer")
+    end
+
+    it "uses the effective group when sudo is disabled" do
+      ENV["HOMEBREW_NO_SUDO"] = "1"
+      allow(Etc).to receive(:getgrgid).with(Process.egid).and_return(instance_double(Etc::Group, name: "brewer"))
+
+      expect(described_class.expected_caskroom_group).to eq("brewer")
+    end
+
     it "checks the admin group on macOS", :needs_macos do
+      ENV.delete("HOMEBREW_NO_SUDO")
+      allow(Process).to receive(:groups).and_return([1])
       path = Pathname("/tmp/Caskroom")
       allow(path).to receive(:stat).and_return(instance_double(File::Stat, gid: 1))
       allow(Etc).to receive(:getgrnam).with("admin").and_return(instance_double(Etc::Group, gid: 1))
@@ -150,6 +189,15 @@ RSpec.describe Cask::Caskroom do
       })
     end
 
+    it "does not load the cask loader when no casks are installed" do
+      Dir.mktmpdir do |dir|
+        allow(described_class).to receive(:path).and_return(Pathname(dir))
+        expect(described_class).not_to receive(:require)
+
+        described_class.casks
+      end
+    end
+
     it "includes casks installed from untrusted taps without loading cask files" do
       token = "untrusted-cask"
       tap = Tap.fetch("thirdparty", "foo")
@@ -164,14 +212,37 @@ RSpec.describe Cask::Caskroom do
 
         setup_cask_metadata(Pathname(dir), token, tap:, version: "1.0")
 
-        with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-          casks = described_class.casks
-          expect(casks.map(&:token)).to eq([token])
+        casks = described_class.casks
+        expect(casks.map(&:token)).to eq([token])
 
-          cask = casks.first
-          expect(cask&.installed_version).to eq("1.0")
-          expect(cask&.tap).to eq(tap)
+        cask = casks.first
+        expect(cask&.installed_version).to eq("1.0")
+        expect(cask&.tap).to eq(tap)
+      end
+    ensure
+      FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
+    end
+
+    it "does not list a cask twice when it is also installed under an old token", :trust_store do
+      tap = Tap.fetch("thirdparty", "foo")
+      cask_path = tap.cask_dir/"new-cask.rb"
+      cask_path.dirname.mkpath
+      cask_path.write <<~RUBY
+        cask "new-cask" do
+          version "2.0"
         end
+      RUBY
+      (tap.path/"cask_renames.json").write JSON.generate("old-cask" => "new-cask")
+      tap.clear_cache
+      Homebrew::Trust.trust!(:tap, tap.name)
+
+      Dir.mktmpdir do |dir|
+        allow(described_class).to receive(:path).and_return(Pathname(dir))
+
+        setup_cask_metadata(Pathname(dir), "new-cask", tap:, version: "2.0")
+        setup_cask_metadata(Pathname(dir), "old-cask", tap:, version: "1.0")
+
+        expect(described_class.casks.map(&:token)).to eq(["new-cask"])
       end
     ensure
       FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
@@ -194,14 +265,250 @@ RSpec.describe Cask::Caskroom do
 
         setup_cask_metadata(Pathname(dir), token, version: "1.0")
 
-        with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1") do
-          casks = described_class.casks
-          expect(casks.map(&:token)).to eq([token])
-          expect(casks.first&.installed_version).to eq("1.0")
-        end
+        casks = described_class.casks
+        expect(casks.map(&:token)).to eq([token])
+        expect(casks.first&.installed_version).to eq("1.0")
       end
     ensure
       FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
+    end
+  end
+
+  describe ".migrate_caskfile_to_json" do
+    sig { returns(Pathname) }
+    let(:caskroom) { mktmpdir/"Caskroom" }
+
+    before { allow(described_class).to receive(:path).and_return(caskroom) }
+
+    sig { params(token: String, contents: String, extension: String).returns(Pathname) }
+    def write_installed_caskfile(token, contents, extension: "rb")
+      caskfile = caskroom/token/".metadata/1.0/20250101000000.000/Casks/#{token}.#{extension}"
+      caskfile.dirname.mkpath
+      caskfile.write(contents)
+      caskfile
+    end
+
+    sig { params(token: String, artifacts: T::Array[T::Hash[String, T.untyped]]).void }
+    def write_receipt(token, artifacts)
+      (caskroom/token/".metadata/INSTALL_RECEIPT.json").write JSON.pretty_generate({
+        "source"              => { "version" => "1.0" },
+        "uninstall_artifacts" => artifacts,
+      })
+    end
+
+    it "uses receipt metadata when a Ruby caskfile is unreadable" do
+      token = "unreadable"
+      caskfile = write_installed_caskfile(token, "this is not Ruby")
+      write_receipt(token, [{ "app" => ["Unreadable.app"] }])
+
+      described_class.migrate_caskfile_to_json(caskfile)
+
+      json_caskfile = caskfile.sub_ext(".json")
+      migrated_cask = Cask::CaskLoader.load_from_installed_caskfile(json_caskfile)
+      expect([
+        caskfile.exist?,
+        JSON.parse(json_caskfile.read),
+        migrated_cask.version.to_s,
+        migrated_cask.artifacts_list(uninstall_only: true),
+      ]).to eq([
+        false,
+        {},
+        "1.0",
+        [{ app: ["Unreadable.app"] }],
+      ])
+    end
+
+    it "treats reordered receipt artifacts as equivalent" do
+      token = "reordered-artifacts"
+      caskfile = write_installed_caskfile(token, <<~RUBY)
+        cask "#{token}" do
+          version "1.0"
+          font "Font0.ttf"
+          font "Font1.ttf"
+          font "Font2.ttf"
+          font "Font3.ttf"
+          font "Font4.ttf"
+          font "Font5.ttf"
+          font "Font6.ttf"
+          font "Font7.ttf"
+        end
+      RUBY
+      artifacts = Array.new(8) { |i| { "font" => ["Font#{i}.ttf"] } }
+      write_receipt(token, artifacts)
+
+      described_class.migrate_caskfile_to_json(caskfile)
+
+      json_caskfile = caskfile.sub_ext(".json")
+      expect([caskfile.exist?, JSON.parse(json_caskfile.read)]).to eq([false, {}])
+    end
+
+    it "restores original metadata when migrated artifact multiplicity differs" do
+      token = "changed-artifacts"
+      caskfile = write_installed_caskfile(token, <<~RUBY)
+        cask "#{token}" do
+          version "1.0"
+          font "Duplicate.ttf"
+          font "Duplicate.ttf"
+        end
+      RUBY
+      original_contents = caskfile.read
+      json_caskfile = caskfile.sub_ext(".json")
+      migrated_cask = instance_double(
+        Cask::Cask,
+        version:        "1.0",
+        artifacts_list: [{ font: ["Duplicate.ttf"] }],
+      )
+      allow(Cask::CaskLoader).to receive(:load_from_installed_caskfile)
+        .with(json_caskfile, api_fallback: false)
+        .and_return(migrated_cask)
+
+      error = T.let(nil, T.nilable(RuntimeError))
+      begin
+        described_class.migrate_caskfile_to_json(caskfile)
+      rescue RuntimeError => e
+        error = e
+      end
+
+      expect([error&.message, caskfile.read, json_caskfile.exist?]).to eq([
+        "migrated Cask metadata differs from the original after preserving version and artifacts",
+        original_contents,
+        false,
+      ])
+    end
+
+    it "uses API metadata when a Ruby caskfile contains a removed method" do
+      token = "removed-method"
+      caskfile = write_installed_caskfile(token, <<~RUBY)
+        cask "#{token}" do
+          version "1.0"
+          appcast "https://example.com/appcast.xml"
+          app "Old.app"
+        end
+      RUBY
+      allow(Cask::CaskLoader::FromAPILoader).to receive(:try_new).and_call_original
+      allow(Cask::CaskLoader::FromAPILoader).to receive(:try_new).with(token).and_return(
+        Cask::CaskLoader::FromInstanceLoader.new(Cask::Cask.new(token) { app "Current.app" }),
+      )
+
+      described_class.migrate_caskfile_to_json(caskfile)
+
+      expect(JSON.parse(caskfile.sub_ext(".json").read)).to eq({
+        "artifacts" => [{ "app" => ["Current.app"] }],
+      })
+    end
+
+    it "uses API metadata when a Ruby caskfile contains a deprecated method" do
+      token = "deprecated-method"
+      caskfile = write_installed_caskfile(token, <<~RUBY)
+        cask "#{token}" do
+          version "1.0"
+          app "Old.app"
+        end
+      RUBY
+      allow(Cask::CaskLoader).to receive(:load)
+        .with(caskfile, warn: false)
+        .and_raise(MethodDeprecatedError.new)
+      allow(Cask::CaskLoader::FromAPILoader).to receive(:try_new).and_call_original
+      allow(Cask::CaskLoader::FromAPILoader).to receive(:try_new).with(token).and_return(
+        Cask::CaskLoader::FromInstanceLoader.new(Cask::Cask.new(token) { app "Current.app" }),
+      )
+
+      described_class.migrate_caskfile_to_json(caskfile)
+
+      expect(JSON.parse(caskfile.sub_ext(".json").read)).to eq({
+        "artifacts" => [{ "app" => ["Current.app"] }],
+      })
+    end
+
+    it "uses tap metadata instead of the API for a receipt-less third-party cask", :trust_store do
+      token = "third-party"
+      tap = Tap.fetch("thirdparty", "foo")
+      caskfile = write_installed_caskfile(token, "{}", extension: "json")
+      cask_path = tap.cask_dir/"#{token}.rb"
+      cask_path.dirname.mkpath
+      cask_path.write <<~RUBY
+        cask "#{token}" do
+          version "2.0"
+          app "Third Party.app"
+        end
+      RUBY
+      Homebrew::Trust.trust!(:tap, tap.name)
+      allow(Homebrew::EnvConfig).to receive(:no_install_from_api?).and_return(false)
+      allow(Homebrew::API).to receive_messages(cask_token?: false, cask_renames: {})
+
+      described_class.migrate_caskfile_to_json(caskfile)
+
+      expect(JSON.parse(caskfile.read)).to eq({
+        "artifacts" => [{ "app" => ["Third Party.app"] }],
+      })
+    ensure
+      FileUtils.rm_rf HOMEBREW_TAP_DIRECTORY/"thirdparty"
+    end
+
+    it "preserves artifacts when the install receipt is empty" do
+      token = "empty-receipt"
+      caskfile = write_installed_caskfile(token, <<~RUBY)
+        cask "#{token}" do
+          version "1.0"
+          app "Empty Receipt.app"
+        end
+      RUBY
+      (caskroom/token/".metadata/INSTALL_RECEIPT.json").write("")
+
+      described_class.migrate_caskfile_to_json(caskfile)
+
+      expect(JSON.parse(caskfile.sub_ext(".json").read)).to eq({
+        "artifacts" => [{ "app" => ["Empty Receipt.app"] }],
+      })
+    end
+
+    it "replaces malformed installed JSON using API metadata" do
+      token = "malformed-json"
+      caskfile = write_installed_caskfile(token, "{", extension: "json")
+      allow(Cask::CaskLoader::FromAPILoader).to receive(:try_new).and_call_original
+      allow(Cask::CaskLoader::FromAPILoader).to receive(:try_new).with(token).and_return(
+        Cask::CaskLoader::FromInstanceLoader.new(Cask::Cask.new(token) { app "Current.app" }),
+      )
+
+      described_class.migrate_caskfile_to_json(caskfile)
+
+      expect(JSON.parse(caskfile.read)).to eq({
+        "artifacts" => [{ "app" => ["Current.app"] }],
+      })
+    end
+
+    it "replaces invalid artifact data in installed JSON using API metadata" do
+      token = "invalid-artifacts"
+      caskfile = write_installed_caskfile(token, JSON.generate({ "artifacts" => ["invalid"] }), extension: "json")
+      allow(Cask::CaskLoader::FromAPILoader).to receive(:try_new).and_call_original
+      allow(Cask::CaskLoader::FromAPILoader).to receive(:try_new).with(token).and_return(
+        Cask::CaskLoader::FromInstanceLoader.new(Cask::Cask.new(token) { app "Current.app" }),
+      )
+
+      described_class.migrate_caskfile_to_json(caskfile)
+
+      expect(JSON.parse(caskfile.read)).to eq({
+        "artifacts" => [{ "app" => ["Current.app"] }],
+      })
+    end
+
+    it "keeps intentional empty artifacts in installed JSON" do
+      caskfile = write_installed_caskfile("stage-only", JSON.generate({ "artifacts" => [] }), extension: "json")
+      expect(Cask::CaskLoader::FromAPILoader).not_to receive(:try_new)
+
+      described_class.migrate_caskfile_to_json(caskfile)
+
+      expect(JSON.parse(caskfile.read)).to eq({ "artifacts" => [] })
+    end
+
+    it "does not mark unavailable artifacts as intentionally empty" do
+      token = "removed-cask"
+      caskfile = write_installed_caskfile(token, "{}", extension: "json")
+      allow(Homebrew::API).to receive_messages(cask_token?: false, cask_renames: {})
+
+      described_class.migrate_caskfile_to_json(caskfile)
+
+      expect(JSON.parse(caskfile.read)).to eq({})
     end
   end
 

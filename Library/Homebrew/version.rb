@@ -9,7 +9,7 @@ class Version
 
   sig { params(name: T.any(String, Symbol), full: T::Boolean).returns(Regexp) }
   def self.formula_optionally_versioned_regex(name, full: true)
-    /#{"^" if full}#{Regexp.escape(name)}(@\d[\d.]*)?#{"$" if full}/
+    /#{"^" if full}#{Regexp.escape(name)}(?:@\d[\d.]*)?#{"$" if full}/
   end
 
   # A part of a {Version}.
@@ -162,8 +162,13 @@ class Version
       case other
       when StringToken
         value <=> other.value
-      when NumericToken, NullToken
-        -T.must(other <=> self)
+      when NumericToken
+        -1
+      when NullToken
+        comparison = other <=> self
+        raise ArgumentError, "Cannot compare #{inspect} with #{other.inspect}" if comparison.nil?
+
+        -comparison
       end
     end
   end
@@ -190,7 +195,7 @@ class Version
       when StringToken
         1
       when NullToken
-        -T.must(other <=> self)
+        value.zero? ? 0 : 1
       end
     end
 
@@ -388,6 +393,10 @@ class Version
     # e.g. `https://github.com/petdance/ack/tarball/1.93_02`
     UrlParser.new(%r{github\.com/.+/(?:zip|tar)ball/(?:v|\w+-)?((?:\d+[._-])+\d*)$}),
 
+    # GitHub releases
+    # e.g. `https://github.com/foo/bar/releases/download/v1.2/foo-1.2.0.tar.gz`
+    UrlParser.new(%r{github\.com/.+/releases/download/(?:[rvV]_?)?(#{NUMERIC_WITH_DOTS})/}),
+
     # e.g. `https://github.com/erlang/otp/tarball/OTP_R15B01 (erlang style)`
     UrlParser.new(/[_-]([Rr]\d+[AaBb]\d*(?:-\d+)?)/),
 
@@ -419,7 +428,7 @@ class Version
     StemParser.new(/-(#{NUMERIC_WITH_OPTIONAL_DOTS})$/),
 
     # e.g. `foobar-4.5.1.post1`
-    StemParser.new(/-(#{NUMERIC_WITH_OPTIONAL_DOTS}(.post\d+)?)$/),
+    StemParser.new(/-(#{NUMERIC_WITH_OPTIONAL_DOTS}(?:.post\d+)?)$/),
 
     # e.g. `foobar-4.5.1b`
     StemParser.new(/-(#{NUMERIC_WITH_OPTIONAL_DOTS}(?:[abc]|rc|RC)\d*)$/),
@@ -682,7 +691,7 @@ class Version
   def major_minor
     return self if null?
 
-    major_minor = T.must(tokens[0..1])
+    major_minor = tokens.first(2)
     major_minor.empty? ? NULL : self.class.new(major_minor.join("."))
   end
 
@@ -693,7 +702,7 @@ class Version
   def major_minor_patch
     return self if null?
 
-    major_minor_patch = T.must(tokens[0..2])
+    major_minor_patch = tokens.first(3)
     major_minor_patch.empty? ? NULL : self.class.new(major_minor_patch.join("."))
   end
 
@@ -726,9 +735,10 @@ class Version
   # @api public
   sig { returns(String) }
   def to_str
-    raise NoMethodError, "undefined method `to_str` for #{self.class}:NULL" if null?
+    version = self.version
+    raise NoMethodError, "undefined method `to_str` for #{self.class}:NULL" if version.nil?
 
-    T.must(version).to_str
+    version
   end
 
   # The string representation of this {Version}.

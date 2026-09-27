@@ -1,7 +1,7 @@
 # typed: strict
 # frozen_string_literal: true
 
-# Strategy for downloading a file from an GitHub Packages URL.
+# Strategy for downloading a file from a GitHub Packages URL.
 #
 # @api public
 class CurlGitHubPackagesDownloadStrategy < CurlDownloadStrategy
@@ -27,12 +27,14 @@ class CurlGitHubPackagesDownloadStrategy < CurlDownloadStrategy
 
   sig { override.returns(Pathname) }
   def cached_location
-    return super unless immutable_bottle_blob?
-
     cached_location = @cached_location
     return cached_location unless cached_location.nil?
+    return super if @resolved_basename.blank?
 
-    @cached_location = HOMEBREW_CACHE/"downloads/#{Digest::SHA256.hexdigest(url)}--#{Utils.safe_filename(@resolved_basename.to_s)}"
+    cached_location = HOMEBREW_CACHE/"downloads/#{Digest::SHA256.hexdigest(url)}--#{Utils.safe_filename(@resolved_basename.to_s)}"
+    return super if !immutable_bottle_blob? && (!mirrors.empty? || !cached_location.exist?)
+
+    @cached_location = cached_location
   end
 
   sig { returns(T::Boolean) }

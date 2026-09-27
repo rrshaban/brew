@@ -1,14 +1,16 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "digest"
 require "extend/object/deep_dup"
 require "env_config"
+require "json"
 require "sandbox"
-require "tempfile"
 require "tmpdir"
 require "utils/output"
 
 module Cask
+  # Module containing all cask artifact classes.
   module Artifact
     # Abstract superclass for all artifacts.
     class AbstractArtifact
@@ -25,7 +27,7 @@ module Cask
       DirectivesType = T.type_alias { Object }
       sig { overridable.returns(String) }
       def self.english_name
-        @english_name ||= T.let(T.must(name).sub(/^.*:/, "").gsub(/(.)([A-Z])/, '\1 \2'), T.nilable(String))
+        @english_name ||= T.let(to_s.sub(/^.*:/, "").gsub(/(.)([A-Z])/, '\1 \2'), T.nilable(String))
       end
 
       sig { returns(String) }
@@ -35,8 +37,7 @@ module Cask
 
       sig { overridable.returns(Symbol) }
       def self.dsl_key
-        @dsl_key ||= T.let(T.must(name).sub(/^.*:/, "").gsub(/(.)([A-Z])/, '\1_\2').downcase.to_sym,
-                           T.nilable(Symbol))
+        @dsl_key ||= T.let(to_s.sub(/^.*:/, "").gsub(/(.)([A-Z])/, '\1_\2').downcase.to_sym, T.nilable(Symbol))
       end
 
       sig { overridable.returns(Symbol) }
@@ -46,6 +47,10 @@ module Cask
 
       sig { abstract.returns(String) }
       def summarize; end
+
+      # Whether installation always requires elevated privileges.
+      sig { overridable.returns(T::Boolean) }
+      def requires_sudo? = false
 
       sig { params(path: T.any(String, Pathname)).returns(Pathname) }
       def staged_path_join_executable(path)
@@ -71,12 +76,13 @@ module Cask
       def sort_order
         @sort_order ||= T.let(
           [
-            PreflightBlock,
             PreflightSteps,
             UninstallPreflightSteps,
+            PreflightBlock,
             # The `uninstall` stanza should be run first, as it may
             # depend on other artifacts still being installed.
             Uninstall,
+            GeneratedScript,
             Installer,
             # `pkg` should be run before `binary`, so
             # targets are created prior to linking.
@@ -85,6 +91,7 @@ module Cask
             Pkg,
             [
               App,
+              AppImage,
               Suite,
               Artifact,
               Colorpicker,
@@ -102,13 +109,18 @@ module Cask
               Vst3Plugin,
               ScreenSaver,
             ],
-            Binary,
+            [
+              Binary,
+              CommandWrapper,
+            ],
             Manpage,
             [
               BashCompletion,
-              FishCompletion,
               ZshCompletion,
+              FishCompletion,
+              PwshCompletion,
             ],
+            GeneratedCompletion,
             PostflightSteps,
             UninstallPostflightSteps,
             PostflightBlock,
@@ -195,53 +207,53 @@ module Cask
         cask.config
       end
 
-      sig { returns(T.nilable(Sandbox)) }
-      def cask_sandbox
-        Sandbox.ensure_sandbox_installed!
-        return unless Sandbox.available?
+      sig { params(network_access_allowed: T::Boolean).returns(T.nilable(Sandbox)) }
+      def cask_sandbox(network_access_allowed: false)
+        return unless Sandbox.use_for?("running cask artifact operations")
 
         Sandbox.new.tap do |sandbox|
           sandbox.allow_read(path: cask.staged_path, type: :subpath)
-          sandbox.allow_write_temp_and_cache
-          sandbox.deny_read_home
-          sandbox.deny_all_network
+          sandbox.add_install_hook_rules(network_access_allowed:)
         end
       end
 
       sig {
         params(
-          env:  T::Hash[String, T.any(String, T::Boolean, PATH)],
-          args: T::Array[T.any(String, Pathname)],
-          home: String,
-        ).returns(T::Array[T.any(String, Pathname)])
-      }
-      def cask_sandbox_command(env, args, home:)
-        env = { "HOME" => home }.merge(env)
-        ["/usr/bin/env", *env.map { |key, value| "#{key}=#{value}" }, *args]
-      end
-
-      sig {
-        params(
-          sandbox: Sandbox,
-          args:    T::Array[T.any(String, Pathname)],
-          input:   T.any(String, T::Array[String]),
+          sandbox:               Sandbox,
+          payload:               T::Hash[String, T.untyped],
+          passthrough_stdin:     T::Boolean,
+          child_message_handler: T.nilable(T.proc.params(message: String).returns(T.nilable(String))),
         ).void
       }
-      def run_cask_sandbox(sandbox, args, input: [])
-        return sandbox.run(*args) if Array(input).empty?
+      def run_cask_sandbox(sandbox, payload, passthrough_stdin: true, child_message_handler: nil)
+        # Formulae sandbox the complete `postinstall.rb` process. Do the same
+        # for cask operations so Ruby file changes and every command share one
+        # profile, instead of forwarding command input and output through files.
+        sandbox_root = HOMEBREW_PREFIX/"var/homebrew/sandbox"
+        sandbox_root.mkpath
+        Dir.mktmpdir("cask-", sandbox_root) do |temporary_directory|
+          temporary_path = Pathname(temporary_directory)
+          home = temporary_path/"home"
+          home.mkpath
+          sandbox.allow_write_path(home)
+          payload_json = JSON.generate(payload)
+          payload_path = temporary_path/"payload.json"
+          payload_path.write(payload_json, mode: "wx")
+          sandbox.allow_read(path: payload_path)
 
-        Tempfile.create("homebrew-cask-script-input", HOMEBREW_TEMP) do |input_file|
-          input_file.write(Array(input).join)
-          input_file.close
-          sandbox.allow_read(path: input_file.path)
-          sandbox.run(
-            "/bin/sh",
-            "-c",
-            "input=$1; shift; exec \"$@\" < \"$input\"",
-            "sh",
-            input_file.path,
-            *args,
-          )
+          # The payload carries only structured data, not a cask `.rb` file.
+          # Set HOME before starting this child so its boot process and any
+          # commands it runs cannot discover the user's real home directory.
+          Sandbox.with_preserved_brew_file do
+            sandbox.run(
+              "/usr/bin/env",
+              "HOME=#{home}",
+              "nice",
+              *Sandbox.ruby_command("cask_artifact.rb", payload_path, Digest::SHA256.hexdigest(payload_json)),
+              passthrough_stdin:,
+              child_message_handler:,
+            )
+          end
         end
       end
 

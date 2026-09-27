@@ -17,6 +17,42 @@ RSpec.describe Utils::AST::FormulaAST do
     RUBY
   end
 
+  describe "#remove_patches" do
+    let(:patch) do
+      <<~RUBY.chomp
+        patch do
+          url "https://github.com/example/project/commit/#{"a" * 40}.patch"
+          sha256 "#{"b" * 64}"
+        end
+      RUBY
+    end
+
+    it "preserves surrounding comments and removes only the selected HEAD patch" do
+      ast = described_class.new("class Foo < Formula\n# Keep this explanation\n" \
+                                "#{patch}\nhead do\n#{patch.sub("a" * 40, "c" * 40)}\nend\nend\n")
+      ast.remove_patches do |node|
+        [node].select { |patch_node| patch_node.source.include?("https://github.com/example/project/commit/#{"c" * 40}.patch") }
+      end
+
+      expect(ast.process).to eq("class Foo < Formula\n# Keep this explanation\n#{patch}\nhead do\nend\nend\n")
+    end
+
+    it "removes empty platform wrappers including comments inside removed patches" do
+      ast = described_class.new("class Foo < Formula\non_macos do\n# Platform explanation\non_arm do\n" \
+                                "#{patch.sub("patch do", "patch do\n# Patch-specific explanation")}\nend\nend\nend\n")
+      ast.remove_patches { |node| [node] }
+
+      expect(ast.process).to eq("class Foo < Formula\nend\n")
+    end
+
+    it "preserves a platform wrapper containing other declarations" do
+      ast = described_class.new("class Foo < Formula\non_macos do\n# Keep\ndepends_on 'foo'\n#{patch}\nend\nend\n")
+      ast.remove_patches { |node| [node] }
+
+      expect(ast.process).to eq("class Foo < Formula\non_macos do\n# Keep\ndepends_on 'foo'\nend\nend\n")
+    end
+  end
+
   describe "#resource" do
     it "finds resource block in a formula" do
       formula_ast = described_class.new <<~RUBY
@@ -211,6 +247,44 @@ RSpec.describe Utils::AST::FormulaAST do
           end
         end
       RUBY
+    end
+  end
+
+  describe "#replace_resource_stanza_hash_value" do
+    subject(:formula_ast) do
+      described_class.new <<~RUBY
+        class Foo < Formula
+          url "https://brew.sh/foo-1.0.tar.gz"
+
+          resource "bar" do
+            url "https://brew.sh/bar.git",
+                tag:      "v1.0",
+                revision: "#{"a" * 40}"
+          end
+        end
+      RUBY
+    end
+
+    it "replaces keyword arguments of a resource stanza" do
+      formula_ast.replace_resource_stanza_hash_value("bar", :url, :tag, "v2.0")
+      formula_ast.replace_resource_stanza_hash_value("bar", :url, :revision, "b" * 40)
+
+      expect(formula_ast.process).to eq <<~RUBY
+        class Foo < Formula
+          url "https://brew.sh/foo-1.0.tar.gz"
+
+          resource "bar" do
+            url "https://brew.sh/bar.git",
+                tag:      "v2.0",
+                revision: "#{"b" * 40}"
+          end
+        end
+      RUBY
+    end
+
+    it "raises when the keyword is missing" do
+      expect { formula_ast.replace_resource_stanza_hash_value("bar", :url, :branch, "main") }
+        .to raise_error(/Could not find 'branch' value/)
     end
   end
 

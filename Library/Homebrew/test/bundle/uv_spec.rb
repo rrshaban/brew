@@ -6,6 +6,32 @@ require "bundle/dsl"
 require "bundle/extensions/uv"
 
 RSpec.describe Homebrew::Bundle::Uv do
+  let(:uv_tool_list_args) do
+    [Pathname("uv"), "tool", "list", "--show-with", "--show-extras", "--show-version-specifiers"]
+  end
+
+  describe "entries" do
+    it "accepts a source that resolves on another machine" do
+      entry = described_class.entry("ruff", source: "git+https://github.com/astral-sh/ruff.git")
+      expect(entry.options).to eql({ source: "git+https://github.com/astral-sh/ruff.git" })
+    end
+
+    it "rejects a local path" do
+      expect { described_class.entry("probetool", source: "/Users/test/src/probetool") }
+        .to raise_error(RuntimeError, /local to this machine/)
+    end
+
+    it "rejects the file:// URL uv reports for a directory install" do
+      expect { described_class.entry("probetool", source: "file:///Users/test/src/probetool") }
+        .to raise_error(RuntimeError, /local to this machine/)
+    end
+
+    it "rejects a git+file:// URL" do
+      expect { described_class.entry("probetool", source: "git+file:///Users/test/src/probetool") }
+        .to raise_error(RuntimeError, /local to this machine/)
+    end
+  end
+
   describe "checking" do
     subject(:checker) { described_class.new }
 
@@ -88,16 +114,6 @@ RSpec.describe Homebrew::Bundle::Uv do
   describe "dumping" do
     subject(:dumper) { described_class }
 
-    let(:uv_tool_list_command) do
-      [
-        "uv tool list",
-        "--show-with",
-        "--show-extras",
-        "--show-version-specifiers",
-        "2>/dev/null",
-      ].join(" ")
-    end
-
     context "when uv is not installed" do
       before do
         described_class.reset!
@@ -117,7 +133,7 @@ RSpec.describe Homebrew::Bundle::Uv do
       end
 
       it "returns normalized package entries sorted by package name" do
-        allow(described_class).to receive(:`).with(uv_tool_list_command).and_return(<<~OUTPUT)
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
           ruff v0.14.14
           - ruff
           mkdocs v1.6.1 [with: mkdocs-material<10]
@@ -138,8 +154,46 @@ RSpec.describe Homebrew::Bundle::Uv do
         ])
       end
 
+      it "ignores executable entries when dumping packages" do
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
+          v-example v1.2.3
+          - v-example
+          - v2
+          vulture v2.16
+          - vulture
+        OUTPUT
+
+        expect(dumper.dump).to eql(<<~BREWFILE.chomp)
+          uv "v-example"
+          uv "vulture"
+        BREWFILE
+      end
+
+      it "accepts headings with valid package-name forms and version strings" do
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
+          a v1.0
+          7zip v1!2.0rc1+local
+          my-tool.name_2 v2.0
+          Vtool v1.0
+        OUTPUT
+
+        expect(dumper.dump).to eql(<<~BREWFILE.chomp)
+          uv "7zip"
+          uv "Vtool"
+          uv "a"
+          uv "my-tool.name_2"
+        BREWFILE
+      end
+
+      it "ignores lines whose first token starts with punctuation" do
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL)
+                                                 .and_return("vulture v2.16\n-\tv2\n• v2\n_vtool v1.0\n")
+
+        expect(dumper.dump).to eql('uv "vulture"')
+      end
+
       it "parses a git source from the version specifier and dumps it" do
-        allow(described_class).to receive(:`).with(uv_tool_list_command).and_return(<<~OUTPUT)
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
           ruff v0.14.14 [required:  git+https://github.com/astral-sh/ruff.git]
           - ruff
         OUTPUT
@@ -154,8 +208,35 @@ RSpec.describe Homebrew::Bundle::Uv do
         expect(dumper.dump).to eql('uv "ruff", source: "git+https://github.com/astral-sh/ruff.git"')
       end
 
+      it "dumps a tool installed from a directory without a source" do
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
+          probetool v0.1.0 [required: file:///Users/test/src/probetool]
+          - probetool
+        OUTPUT
+
+        expect(dumper.dump).to eql('uv "probetool"')
+      end
+
+      it "dumps a tool installed from a git+file:// URL without a source" do
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
+          probetool v0.1.0 [required: git+file:///Users/test/src/probetool]
+          - probetool
+        OUTPUT
+
+        expect(dumper.dump).to eql('uv "probetool"')
+      end
+
+      it "dumps a tool installed from a directory named like a git repository without a source" do
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
+          probetool v0.1.0 [required: file:///Users/test/src/probetool.git]
+          - probetool
+        OUTPUT
+
+        expect(dumper.dump).to eql('uv "probetool"')
+      end
+
       it "ignores a bare version constraint in the version specifier" do
-        allow(described_class).to receive(:`).with(uv_tool_list_command).and_return(<<~OUTPUT)
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
           ruff v0.14.14 [required: >=0.1]
           - ruff
         OUTPUT
@@ -165,7 +246,7 @@ RSpec.describe Homebrew::Bundle::Uv do
       end
 
       it "dumps both with and source segments" do
-        allow(described_class).to receive(:`).with(uv_tool_list_command).and_return(<<~OUTPUT)
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
           ruff v0.14.14 [with: httpx>=0.27] [required: git+https://github.com/astral-sh/ruff.git]
           - ruff
         OUTPUT
@@ -176,7 +257,7 @@ RSpec.describe Homebrew::Bundle::Uv do
       end
 
       it "dumps correct Brewfile entries" do
-        allow(described_class).to receive(:`).with(uv_tool_list_command).and_return(<<~OUTPUT)
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
           ruff v0.14.14 [with: httpx>=0.27]
           - ruff
         OUTPUT
@@ -185,7 +266,7 @@ RSpec.describe Homebrew::Bundle::Uv do
       end
 
       it "handles tools with no optional metadata" do
-        allow(described_class).to receive(:`).with(uv_tool_list_command).and_return(<<~OUTPUT)
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
           ruff v0.14.14
           - ruff
         OUTPUT
@@ -194,14 +275,14 @@ RSpec.describe Homebrew::Bundle::Uv do
       end
 
       it "returns empty packages when no tools are installed" do
-        allow(described_class).to receive(:`).with(uv_tool_list_command).and_return("")
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return("")
 
         expect(dumper.packages).to be_empty
         expect(dumper.dump).to eql("")
       end
 
       it "handles multiple with dependencies" do
-        allow(described_class).to receive(:`).with(uv_tool_list_command).and_return(<<~OUTPUT)
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
           mkdocs v1.6.1 [with: mkdocs-material, mkdocs-awesome-page-plugin]
           - mkdocs
         OUTPUT
@@ -210,7 +291,7 @@ RSpec.describe Homebrew::Bundle::Uv do
       end
 
       it "keeps comma-constrained with requirements as a single requirement" do
-        allow(described_class).to receive(:`).with(uv_tool_list_command).and_return(<<~OUTPUT)
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
           ruff v0.14.14 [with: httpx>=0.27, <0.29]
           - ruff
         OUTPUT
@@ -220,7 +301,7 @@ RSpec.describe Homebrew::Bundle::Uv do
       end
 
       it "preserves extras for the main tool requirement" do
-        allow(described_class).to receive(:`).with(uv_tool_list_command).and_return(<<~OUTPUT)
+        allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
           fastapi v0.129.0 [extras: all, standard]
           - fastapi
         OUTPUT
@@ -232,6 +313,12 @@ RSpec.describe Homebrew::Bundle::Uv do
   end
 
   describe "installing" do
+    before do
+      ENV.delete("UV_PYTHON")
+      allow(Formula).to receive(:installed_formula_names).and_return([])
+      allow(Formula).to receive(:[]).and_raise("Python selection must not load formulae")
+    end
+
     context "when uv is not installed" do
       before do
         described_class.reset!
@@ -379,6 +466,50 @@ RSpec.describe Homebrew::Bundle::Uv do
           expect(described_class.install!("ruff")).to be(true)
         end
 
+        it "uses the newest installed Homebrew Python" do
+          allow(Formula).to receive(:installed_formula_names)
+            .and_return(%w[python@3.9 python@3.14 python@3.15 python-tk@3.16])
+          %w[python@3.9/bin/python3.9 python@3.14/bin/python3.14 python@3.14/bin/python3.99-config
+             python-tk@3.16/bin/python3.16].each do |path|
+            python = HOMEBREW_PREFIX/"opt"/path
+            python.dirname.mkpath
+            python.write ""
+          end
+          allow(Homebrew::Bundle).to receive(:system) do
+            expect(ENV.fetch("UV_PYTHON", nil)).to eq("#{HOMEBREW_PREFIX}/opt/python@3.14/bin/python3.14")
+            true
+          end
+
+          described_class.install!("ruff")
+        end
+
+        it "uses an installed versioned Homebrew Python" do
+          allow(Formula).to receive(:installed_formula_names).and_return(["python@3"])
+          (HOMEBREW_PREFIX/"opt/python@3/bin").mkpath
+          (HOMEBREW_PREFIX/"opt/python@3/bin/python3.12").write ""
+          allow(Homebrew::Bundle).to receive(:system) do
+            expect(ENV.fetch("UV_PYTHON", nil)).to eq("#{HOMEBREW_PREFIX}/opt/python@3/bin/python3.12")
+            true
+          end
+
+          described_class.install!("ruff")
+        end
+
+        it "includes the unversioned Python formula" do
+          allow(Formula).to receive(:installed_formula_names).and_return(%w[python python@3.13])
+          %w[python/bin/python3.14 python@3.13/bin/python3.13].each do |path|
+            python = HOMEBREW_PREFIX/"opt"/path
+            python.dirname.mkpath
+            python.write ""
+          end
+          allow(Homebrew::Bundle).to receive(:system) do
+            expect(ENV.fetch("UV_PYTHON", nil)).to eq("#{HOMEBREW_PREFIX}/opt/python/bin/python3.14")
+            true
+          end
+
+          described_class.install!("ruff")
+        end
+
         it "installs package with all supported options" do
           expect(Homebrew::Bundle).to receive(:system)
             .with("/tmp/uv/bin/uv", "tool", "install", "mkdocs",
@@ -409,6 +540,36 @@ RSpec.describe Homebrew::Bundle::Uv do
           expect(described_class.dump).to eql('uv "mkdocs", with: ["mkdocs-material<10"]')
         end
       end
+    end
+  end
+
+  describe "consumers of parsed tool lists" do
+    before do
+      described_class.reset!
+      allow(described_class).to receive(:package_manager_executable).and_return(Pathname.new("uv"))
+      allow(Utils).to receive(:popen_read_text).with(*uv_tool_list_args, err: File::NULL).and_return(<<~OUTPUT)
+        vulture v2.16 [required: git+https://example.com/vulture.git] [extras: cli] [with: httpx>=0.27]
+        - vulture
+        - v2
+        ruff v0.14.14
+        - ruff
+      OUTPUT
+    end
+
+    it "checks installed entries using parsed names and metadata" do
+      entries = [
+        Homebrew::Bundle::Dsl::Entry.new(:uv, "vulture[cli]", with:   ["httpx>=0.27"],
+                                                              source: "git+https://example.com/vulture.git"),
+        Homebrew::Bundle::Dsl::Entry.new(:uv, "-"),
+      ]
+
+      expect(described_class.check(entries)).to eql(["uv Tool - needs to be installed."])
+    end
+
+    it "selects only undeclared packages for cleanup" do
+      entries = [Homebrew::Bundle::Dsl::Entry.new(:uv, "vulture[cli]")]
+
+      expect(described_class.cleanup_items(entries)).to eql(["ruff"])
     end
   end
 

@@ -5,6 +5,7 @@ require "downloadable"
 require "concurrent/promises"
 require "concurrent/executors"
 require "concurrent/atomic/atomic_boolean"
+require "concurrent/atomic/event"
 require "retryable_download"
 require "concurrent/set"
 require "resource"
@@ -31,9 +32,11 @@ module Homebrew
       @spinner = T.let(nil, T.nilable(Spinner))
       @symlink_targets = T.let({}, T::Hash[Pathname, T::Set[Downloadable]])
       @downloads_by_location = T.let({}, T::Hash[Pathname, Concurrent::Promises::Future])
+      @staged_downloads_by_location = T.let({}, T::Hash[Pathname, Concurrent::Promises::Future])
       @cancelled = T.let(Concurrent::AtomicBoolean.new(false), Concurrent::AtomicBoolean)
-      @download_threads = T.let(Concurrent::Set.new, Concurrent::Set)
-      @fetch_failed = T.let(false, T::Boolean)
+      @active_threads = T.let(Concurrent::Set.new, Concurrent::Set)
+      @failed_downloads = T.let([], T::Array[Downloadable])
+      @deferred_failure_messages = T.let([], T::Array[T.proc.void])
     end
 
     sig {
@@ -55,10 +58,9 @@ module Homebrew
         pool, RetryableDownload.new(downloadable, tries:),
         @cancelled, force, quiet, check_attestation
       ) do |download, cancelled, force, quiet, check_attestation|
-        raise CancelledDownloadError if cancelled.true?
+        with_active_thread do
+          raise CancelledDownloadError if cancelled.true?
 
-        @download_threads.add(Thread.current)
-        begin
           download.clear_cache if force
           if !force && downloadable.downloaded_and_valid?
             check_bottle_attestation(downloadable, check_attestation:)
@@ -66,57 +68,121 @@ module Homebrew
             next cached_location
           end
 
-          download.fetch(quiet:)
+          downloaded_path = download.fetch(quiet:)
           raise CancelledDownloadError if cancelled.true?
 
           check_bottle_attestation(downloadable, check_attestation:)
-          create_symlinks_for_shared_download(cached_location)
-          cached_location
-        rescue Interrupt
-          raise CancelledDownloadError
-        ensure
-          @download_threads.delete(Thread.current)
+          if downloaded_path != cached_location
+            @symlink_targets[downloaded_path] ||= Set.new
+            @symlink_targets.fetch(downloaded_path).merge(@symlink_targets.fetch(cached_location, Set.new))
+          end
+          create_symlinks_for_shared_download(downloaded_path)
+          downloaded_path
         end
       end
 
       downloads[downloadable] = if stage
-        download.then_on(
-          pool, downloadable, pour
-        ) do |downloaded_path, queued_downloadable, queue_pour|
-          if queued_downloadable.stage_from_download_queue?(downloaded_path, pour: queue_pour)
-            queued_downloadable.extracting!
-            queued_downloadable.stage_from_download_queue(downloaded_path, pour: queue_pour)
-            queued_downloadable.downloaded!
+        stage_download = lambda do
+          download.then_on(
+            pool, downloadable, pour, @cancelled
+          ) do |downloaded_path, queued_downloadable, queue_pour, cancelled|
+            with_active_thread do
+              raise CancelledDownloadError if cancelled.true?
+
+              if queued_downloadable.stage_from_download_queue?(downloaded_path, pour: queue_pour)
+                queued_downloadable.extracting!
+                queued_downloadable.stage_from_download_queue(downloaded_path, pour: queue_pour)
+                queued_downloadable.downloaded!
+              end
+              downloaded_path
+            end
           end
-          downloaded_path
+        end
+
+        if (staged_location = downloadable.staged_path_from_download_queue)
+          @staged_downloads_by_location[staged_location] ||= stage_download.call
+        else
+          stage_download.call
         end
       else
         download
       end
     end
 
-    sig { void }
-    def fetch
-      @fetch_failed = false
-      return if downloads.empty?
+    sig { params(heading: String).void }
+    def print_heading(heading)
+      if tty
+        oh1 heading, truncate: false
+        $stdout.flush
+      else
+        # Keep the heading off parsed stdout (e.g. `brew info --json | jq`)
+        # and on the same stream as the non-TTY report lines below.
+        $stderr.puts oh1_title(heading, truncate: false)
+      end
+    end
 
+    # Waits for and reports queued downloads. With `only:`, limits that to
+    # downloadables of the given class, leaving the rest enqueued and
+    # unreported for a later fetch, e.g. so dependency resolution can wait
+    # on bottle manifests without reporting in-flight bottles before their
+    # downloads heading has been printed. A `heading:` is printed only when
+    # there is something to report, so every report gets a heading and empty
+    # fetches stay silent. With `allow_failures:`, failures are still
+    # reported with a ✘ line but neither raise nor mark the fetch or run
+    # as failed, for metadata prefetches such as the bottle manifest of a
+    # version whose bottle has not been published yet, where dependency
+    # resolution just falls back to a full install. Known-bad cached files
+    # from checksum mismatches are always removed, tolerated or not, so
+    # they can never be reused or staged.
+    sig {
+      params(only: T.nilable(T::Class[Downloadable]), heading: T.nilable(String),
+             allow_failures: T::Boolean).void
+    }
+    def fetch(only: nil, heading: nil, allow_failures: false)
+      @failed_downloads = []
+      @deferred_failure_messages = []
       context_before_fetch = Context.current
+      fetchable_downloads = if only
+        downloads.select { |downloadable, _| downloadable.is_a?(only) }
+      else
+        downloads
+      end
+      return if fetchable_downloads.empty?
+
+      print_heading(heading) if heading
 
       if concurrency == 1
-        downloads.each do |downloadable, promise|
+        fetchable_downloads.each do |downloadable, promise|
           promise.wait!
         rescue CancelledDownloadError
           next
         rescue ChecksumMismatchError => e
-          @fetch_failed = true
+          if allow_failures
+            report_tolerated_failure(downloadable)
+            # Remove the known-bad download so it cannot be reused.
+            unlink_cached_download(downloadable)
+            next
+          end
+
+          @failed_downloads << downloadable
           ofail "#{downloadable.download_queue_type} reports different checksum: #{e.expected}"
-        rescue => e
-          raise e unless bottle_manifest_error?(downloadable, e)
+          # Remove the known-bad download so it can never be staged later.
+          unlink_cached_download(downloadable)
+        rescue
+          raise unless allow_failures
+
+          report_tolerated_failure(downloadable)
         end
       else
-        message_length_max = downloads.keys.map { |download| download.download_queue_message.length }.max || 0
-        remaining_downloads = downloads.dup.to_a
+        message_length_max = fetchable_downloads.keys.map do |download|
+          download.download_queue_message.length
+        end.max || 0
+        remaining_downloads = fetchable_downloads.dup.to_a
         previous_pending_line_count = 0
+        max_lines = [concurrency, Tty.height].min
+
+        resolution = Concurrent::Event.new
+        fetchable_downloads.each_value { |future| future.on_resolution! { resolution.set } }
 
         begin
           stdout_print_and_flush_if_tty Tty.hide_cursor
@@ -125,7 +191,6 @@ module Homebrew
             status = status_from_future(future)
             exception = future.reason if future.rejected?
             next 1 if exception.is_a?(CancelledDownloadError)
-            next 1 if bottle_manifest_error?(downloadable, exception)
 
             message = downloadable.download_queue_message
             if tty_with_cursor_move_support?
@@ -135,21 +200,31 @@ module Homebrew
               $stderr.puts "#{status} #{message}"
             end
 
-            if future.rejected?
+            if future.rejected? && allow_failures
+              # Remove known-bad downloads so they cannot be reused, while
+              # staying non-fatal for tolerated metadata prefetches.
+              unlink_cached_download(downloadable) if exception.is_a?(ChecksumMismatchError)
+            elsif future.rejected?
               if exception.is_a?(ChecksumMismatchError)
-                @fetch_failed = true
-                actual = Digest::SHA256.file(downloadable.cached_download).hexdigest
+                @failed_downloads << downloadable
                 actual_message, expected_message = align_checksum_mismatch_message(downloadable.download_queue_type)
 
-                ofail "#{actual_message} #{exception.expected}"
-                puts "#{expected_message} #{actual}"
-                next 2
+                report_or_defer_failure do
+                  ofail "#{actual_message} #{exception.expected}"
+                  puts "#{expected_message} #{exception.actual}"
+                end
+                # Remove the known-bad download so it can never be staged later.
+                unlink_cached_download(downloadable)
               elsif exception.is_a?(CannotInstallFormulaError)
-                cached_download = downloadable.cached_download
-                cached_download.unlink if cached_download&.exist?
+                unlink_cached_download(downloadable)
+                raise exception
+              elsif bottle_manifest_error?(downloadable, exception)
+                # Fatal: unlike a missing blob (which then fails to stage), a
+                # stale blob would still pour without the manifest tab that
+                # drives relocation, so abort rather than stage a broken keg.
                 raise exception
               else
-                message = if exception.is_a?(DownloadError) && exception.cause.is_a?(ErrorDuringExecution)
+                failure_message = if exception.is_a?(DownloadError) && exception.cause.is_a?(ErrorDuringExecution)
                   cause = T.cast(exception.cause, ErrorDuringExecution)
                   if (stderr_output = cause.stderr.presence)
                     "#{stderr_output}#{cause.message}"
@@ -159,9 +234,8 @@ module Homebrew
                 else
                   future.reason.to_s
                 end
-                @fetch_failed = true
-                ofail message
-                next message.count("\n")
+                @failed_downloads << downloadable
+                report_or_defer_failure { ofail failure_message }
               end
             end
 
@@ -170,6 +244,8 @@ module Homebrew
 
           until remaining_downloads.empty?
             begin
+              stdout_print_and_flush_if_tty Tty.begin_synchronized_update
+
               finished_states = [:fulfilled, :rejected]
 
               finished_downloads, remaining_downloads = remaining_downloads.partition do |_, future|
@@ -183,7 +259,6 @@ module Homebrew
               end
 
               previous_pending_line_count = 0
-              max_lines = [concurrency, Tty.height].min
               remaining_downloads.each_with_index do |(downloadable, future), i|
                 break if previous_pending_line_count >= max_lines
 
@@ -200,12 +275,20 @@ module Homebrew
                 end
               end
 
-              sleep 0.05
-            # We want to catch all exceptions to ensure we can cancel any
-            # running downloads and flush the TTY.
-            rescue Exception # rubocop:disable Lint/RescueException
-              cancel
+              stdout_print_and_flush_if_tty Tty.end_synchronized_update
 
+              next if remaining_downloads.empty?
+
+              resolution.reset
+              # A download may resolve between the partition above and this
+              # reset: re-check before waiting to avoid a lost wakeup.
+              next if remaining_downloads.any? { |_, future| finished_states.include?(future.state) }
+
+              # Wake as soon as any download resolves; the timeout only sets
+              # the redraw cadence for spinner and progress bars on TTYs.
+              resolution.wait(tty_with_cursor_move_support? ? 0.05 : 1)
+            # `Interrupt` inherits from `Exception`, so rescue it to restore the TTY.
+            rescue Exception # rubocop:disable Lint/RescueException
               if previous_pending_line_count.positive?
                 stdout_print_and_flush_if_tty Tty.move_cursor_down(previous_pending_line_count - 1)
               end
@@ -214,20 +297,40 @@ module Homebrew
             end
           end
         ensure
+          stdout_print_and_flush_if_tty Tty.end_synchronized_update
           stdout_print_and_flush_if_tty Tty.show_cursor
+          @deferred_failure_messages.each(&:call)
         end
       end
+    # `Interrupt` inherits from `Exception`, so rescue it to cancel active workers
+    # even when it arrives before fetch setup completes.
+    rescue Exception # rubocop:disable Lint/RescueException
+      cancel
+      raise
+    ensure
+      # Restore the pre-parallel fetch context to avoid quiet state bleeding out
+      # from threads, and clear queue state even when a fatal download error
+      # aborts the fetch above.
+      Context.current = context_before_fetch if context_before_fetch
 
-      # Restore the pre-parallel fetch context to avoid e.g. quiet state bleeding out from threads.
-      Context.current = context_before_fetch
-
-      downloads.clear
-      @downloads_by_location.clear
-      @symlink_targets.clear
+      if only
+        # Keep unfetched downloads (and their location dedup entries) queued
+        # for the next fetch.
+        fetchable_downloads.each_key { |downloadable| downloads.delete(downloadable) }
+        fetched_staging = fetchable_downloads.each_value.to_set
+        @staged_downloads_by_location.delete_if { |_, future| fetched_staging.include?(future) }
+      else
+        downloads.clear
+        @downloads_by_location.clear
+        @staged_downloads_by_location.clear
+        @symlink_targets.clear
+      end
     end
 
-    sig { returns(T::Boolean) }
-    attr_reader :fetch_failed
+    # The downloadables that failed in the last `fetch`, so callers can retry
+    # or skip only the packages that were actually affected.
+    sig { returns(T::Array[Downloadable]) }
+    attr_reader :failed_downloads
 
     sig { params(message: String).void }
     def stdout_print_and_flush_if_tty(message)
@@ -244,6 +347,11 @@ module Homebrew
     def shutdown
       pool.shutdown
       pool.wait_for_termination
+    end
+
+    sig { returns(T::Hash[Downloadable, Concurrent::Promises::Future]) }
+    def downloads
+      @downloads ||= T.let({}, T.nilable(T::Hash[Downloadable, Concurrent::Promises::Future]))
     end
 
     private
@@ -277,13 +385,33 @@ module Homebrew
       downloadable.is_a?(Resource::BottleManifest) || exception.is_a?(Resource::BottleManifest::Error)
     end
 
+    # Deferred so a multi-row failure can't desync the redraw's one-row-per-line cursor maths.
+    sig { params(block: T.proc.void).void }
+    def report_or_defer_failure(&block)
+      if tty_with_cursor_move_support?
+        @deferred_failure_messages << block
+      else
+        yield
+      end
+    end
+
+    sig { type_parameters(:U).params(_block: T.proc.returns(T.type_parameter(:U))).returns(T.type_parameter(:U)) }
+    def with_active_thread(&_block)
+      @active_threads.add(Thread.current)
+      yield
+    rescue Interrupt
+      raise CancelledDownloadError
+    ensure
+      @active_threads.delete(Thread.current)
+    end
+
     sig { void }
     def cancel
-      # Signal cooperative cancellation and interrupt any active download threads.
+      # Signal cooperative cancellation and interrupt any active worker threads.
       # Raising Interrupt on the thread triggers the existing rescue Interrupt in
       # system_command.rb which sends SIGINT to the curl subprocess directly.
       @cancelled.make_true
-      @download_threads.each { |thread| thread.raise(Interrupt) }
+      @active_threads.each { |thread| thread.raise(Interrupt) }
     end
 
     sig { returns(Concurrent::FixedThreadPool) }
@@ -312,9 +440,22 @@ module Homebrew
       tty && !@dumb_tty
     end
 
-    sig { returns(T::Hash[Downloadable, Concurrent::Promises::Future]) }
-    def downloads
-      @downloads ||= T.let({}, T.nilable(T::Hash[Downloadable, Concurrent::Promises::Future]))
+    sig { params(downloadable: Downloadable).void }
+    def unlink_cached_download(downloadable)
+      cached_download = downloadable.cached_download
+      cached_download.unlink if cached_download.exist?
+    end
+
+    # Matches the parallel-mode ✘ report for failures the serial path
+    # tolerates instead of raising.
+    sig { params(downloadable: Downloadable).void }
+    def report_tolerated_failure(downloadable)
+      status = if tty
+        "#{Tty.red}✘#{Tty.reset}"
+      else
+        "✘"
+      end
+      $stderr.puts "#{status} #{downloadable.download_queue_message}"
     end
 
     sig { params(future: Concurrent::Promises::Future).returns(T.nilable(String)) }
@@ -361,7 +502,7 @@ module Homebrew
       tty_width = Tty.width
       return message unless tty_width.positive?
 
-      available_width = tty_width - 2
+      available_width = tty_width - 3
       fetched_size = downloadable.fetched_size
       return message[0, available_width].to_s if fetched_size.blank?
 
@@ -432,19 +573,29 @@ module Homebrew
         FRAMES.fetch(@i)
       end
     end
-  end
 
-  sig { returns(DownloadQueue) }
-  def self.default_download_queue
-    @default_download_queue ||= T.let(DownloadQueue.new, T.nilable(DownloadQueue))
-  end
+    class << self
+      sig { returns(DownloadQueue) }
+      def default
+        @default ||= T.let(DownloadQueue.new, T.nilable(DownloadQueue))
+      end
 
-  sig { void }
-  def self.shutdown_default_download_queue
-    @default_download_queue&.shutdown
-  end
+      sig { void }
+      def reset_default
+        # Skip `shutdown` for a leaked RSpec double, which cannot receive
+        # messages outside the per-example rspec-mocks lifecycle.
+        @default.shutdown if @default.is_a?(DownloadQueue)
+        @default = nil
+      end
 
-  at_exit do
-    Homebrew.shutdown_default_download_queue
+      sig { void }
+      def shutdown_default
+        @default&.shutdown
+      end
+    end
+
+    at_exit do
+      Homebrew::DownloadQueue.shutdown_default
+    end
   end
 end

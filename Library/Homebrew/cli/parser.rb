@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/ruby"
+
 require "abstract_command"
 require "env_config"
 require "cask/config"
@@ -38,7 +40,7 @@ module Homebrew
         prop :max_named_args, T.nilable(Integer), default: nil
         prop :min_named_args, T.nilable(Integer), default: nil
         prop :named_args_without_api, T::Boolean, default: false
-        const :hidden, T::Boolean, default: false
+        prop :hidden, T::Boolean, default: false
         const :replacement, T.nilable(T.any(String, Symbol)), default: nil
         const :odeprecated, T::Boolean, default: false
         const :odisabled, T::Boolean, default: false
@@ -56,13 +58,16 @@ module Homebrew
       sig { returns(T::Array[Subcommand]) }
       attr_reader :subcommands
 
+      sig { returns(T.nilable(Integer)) }
+      attr_reader :min_named_args
+
       sig { params(cmd_path: Pathname).returns(T.nilable(CLI::Parser)) }
       def self.from_cmd_path(cmd_path)
         cmd_args_method_name = Commands.args_method_name(cmd_path)
         cmd_name = cmd_args_method_name.to_s.delete_suffix("_args").tr("_", "-")
 
         begin
-          if ENV.clear_sensitive_environment! { Homebrew.require?(cmd_path) }
+          if ENV.clear_sensitive_environment! { Utils::Ruby.require?(cmd_path) }
             cmd = Homebrew::AbstractCommand.command(cmd_name)
             if cmd
               cmd.parser
@@ -165,7 +170,7 @@ module Homebrew
 
       sig { params(option: String).returns(String) }
       def self.option_to_name(option)
-        option.sub(/\A--?(\[no-\])?/, "").tr("-", "_").delete("=")
+        option.sub(/\A--?(?:\[no-\])?/, "").tr("-", "_").delete("=")
       end
 
       sig {
@@ -248,7 +253,7 @@ module Homebrew
           end
           description += " Enabled by default if `$HOMEBREW_#{env.upcase}` is set#{affix}"
         end
-        process_option(*names, description, type: :switch, hidden:, subcommands:) unless odisabled
+        process_option(*names, description, type: :switch, hidden:, subcommands:)
 
         @parser.public_send(method, *names, *wrap_option_desc(description)) do |value|
           # This odeprecated should stick around indefinitely.
@@ -524,7 +529,7 @@ module Homebrew
         remaining_args = if non_options.empty?
           remaining
         else
-          [*remaining, "--", non_options]
+          [*remaining, "--", *non_options]
         end
         @args.freeze_remaining_args!(remaining_args)
         @args.freeze_processed_options!(@processed_options)
@@ -589,8 +594,8 @@ module Homebrew
                  .gsub(/\n.*?@@HIDDEN@@.*?(?=\n)/, "")
                  .sub(/^/, "#{Tty.bold}Usage: brew#{Tty.reset} ")
                  .gsub(/`(.*?)`/m, "#{Tty.bold}\\1#{Tty.reset}")
-                 .gsub(%r{<([^\s]+?://[^\s]+?)>}) { |url| Formatter.url(url) }
-                 .gsub(/\*(.*?)\*|<(.*?)>/m) do |underlined|
+                 .gsub(%r{<[^\s]+?://[^\s]+?>}) { |url| Formatter.url(url) }
+                 .gsub(/\*.*?\*|<.*?>/m) do |underlined|
                    underlined[1...-1].to_s.gsub(/^(\s*)(.*?)$/, "\\1#{Tty.underline}\\2#{Tty.reset}")
                  end
       end
@@ -661,6 +666,16 @@ module Homebrew
 
       sig { void }
       def hide_from_man_page!
+        if @current_subcommands.present?
+          @current_subcommands.each do |subcommand_name|
+            subcommand = subcommand_for_name(subcommand_name)
+            raise ArgumentError, "unknown subcommand: #{subcommand_name}" if subcommand.nil?
+
+            subcommand.hidden = true
+          end
+          return
+        end
+
         @hide_from_man_page = true
       end
 
@@ -989,6 +1004,8 @@ module Homebrew
         parts = T.let([], T::Array[String])
         parts << @description if @description.present?
         @subcommands.each do |subcommand|
+          next if subcommand.hidden
+
           usage_banner = subcommand.usage_banner
           parts << usage_banner if usage_banner.present?
         end
@@ -1131,12 +1148,35 @@ module Homebrew
         else
           :stable
         end
+        # homebrew/core formulae cannot define options, so defer their inflation until command execution.
+        install_from_api = !Homebrew::EnvConfig.no_install_from_api?
+        api_formula_cache_contents = if install_from_api && named_args.any?
+          %w[formula_names.txt formula_aliases.txt].filter_map do |file|
+            path = Homebrew::API::HOMEBREW_CACHE_API/file
+            path.read if path.file?
+          end
+        else
+          []
+        end
 
         # Only lowercase names, not paths, bottle filenames or URLs
         named_args.filter_map do |arg|
           next if arg.match?(HOMEBREW_CASK_TAP_CASK_REGEX)
 
           begin
+            api_formula_name = arg[HOMEBREW_DEFAULT_TAP_FORMULA_REGEX, :name]
+            if install_from_api && api_formula_name
+              api_formula_pattern = /^#{Regexp.escape(api_formula_name)}(?:\||$)/
+              cached_api_formula = arg != api_formula_name || api_formula_cache_contents.any? do |contents|
+                contents.match?(api_formula_pattern)
+              end
+              cached_api_formula ||= Homebrew::API::Internal.formula_hashes_cached? &&
+                                     (Homebrew::API.formula_name?(api_formula_name) ||
+                                      Homebrew::API.formula_aliases.key?(api_formula_name) ||
+                                      Homebrew::API.formula_renames.key?(api_formula_name))
+              next if cached_api_formula
+            end
+
             Formulary.factory(arg, spec, flags: argv.select { |a| a.start_with?("--") })
           rescue FormulaUnavailableError, FormulaSpecificationError
             nil

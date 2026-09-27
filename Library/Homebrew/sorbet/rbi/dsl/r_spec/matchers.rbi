@@ -91,9 +91,6 @@ module RSpec::Matchers
   def be_directory(*args, &block); end
 
   sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
-  def be_ds_store(*args, &block); end
-
-  sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
   def be_dylib(*args, &block); end
 
   sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
@@ -116,6 +113,9 @@ module RSpec::Matchers
 
   sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
   def be_fatal(*args, &block); end
+
+  sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
+  def be_fetch_defined(*args, &block); end
 
   sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
   def be_follow_installed_alias(*args, &block); end
@@ -149,6 +149,9 @@ module RSpec::Matchers
 
   sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
   def be_installed_on_request(*args, &block); end
+
+  sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
+  def be_installed_on_request_present(*args, &block); end
 
   sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
   def be_latest_version_installed(*args, &block); end
@@ -292,9 +295,6 @@ module RSpec::Matchers
   def be_test_defined(*args, &block); end
 
   sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
-  def be_text_executable(*args, &block); end
-
-  sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
   def be_the_chinese_version(*args, &block); end
 
   sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
@@ -371,6 +371,9 @@ module RSpec::Matchers
 
   sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
   def have_failed(*args, &block); end
+
+  sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
+  def have_fetch_defined(*args, &block); end
 
   sig { params(args: T.untyped, block: T.untyped).returns(T.untyped) }
   def have_formula_file(*args, &block); end

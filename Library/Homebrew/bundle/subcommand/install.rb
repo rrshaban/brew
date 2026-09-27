@@ -35,17 +35,16 @@ module Homebrew
           flag   "--upgrade-formulae=", "--upgrade-formula=",
                  description: "Run `brew upgrade` on any of these comma-separated formulae, " \
                               "even if `$HOMEBREW_BUNDLE_NO_UPGRADE` is set."
-          # odeprecated: change default for 5.2 and document HOMEBREW_BUNDLE_JOBS
           flag "--jobs=",
-               description: "Run up to this many formula installations in parallel. " \
-                            "Defaults to 1 (sequential). Use `auto` for the number of CPU cores (max 4)."
+               replacement: "the default behaviour",
+               odeprecated: true
           switch "-f", "--force",
                  description: "Run with `--force`/`--overwrite`."
           switch "--cleanup",
                  description: "Ask to perform cleanup after installing dependencies. Requires `--force`, " \
                               "`--force-cleanup` or `$HOMEBREW_ASK`.",
                  env:         [:bundle_install_cleanup, "--global"],
-                 odeprecated: true
+                 odisabled:   true
           switch "--force-cleanup",
                  description: "Perform cleanup after installing dependencies without asking.",
                  env:         [:bundle_force_install_cleanup, "--global"]
@@ -56,13 +55,22 @@ module Homebrew
 
         sig { override.void }
         def run
-          if args.zap? && !args.cleanup? && !args.force_cleanup?
-            raise UsageError, "`--zap` cannot be passed without `--cleanup` or `--force-cleanup`."
+          cleanup_requested = false
+          if cleanup
+            cleanup_requested = args.force_cleanup? || Homebrew::EnvConfig.bundle_install_cleanup?
+            if args.zap? && !cleanup_requested
+              raise UsageError,
+                    "`--zap` cannot be passed without `--force-cleanup` or `$HOMEBREW_BUNDLE_INSTALL_CLEANUP`."
+            end
+
+            if cleanup_requested && !context.force && !args.force_cleanup? && !context.ask
+              raise UsageError, "`brew bundle install` cleanup requires `--force`, `--force-cleanup` " \
+                                "or `$HOMEBREW_ASK`."
+            end
           end
 
-          if args.cleanup? && !context.force && !args.force_cleanup? && !context.ask
-            raise UsageError, "`brew bundle install --cleanup` requires `--force`, `--force-cleanup` " \
-                              "or `$HOMEBREW_ASK`."
+          if args.jobs.present?
+            opoo "`--jobs` is ignored: installations use package managers' native batching."
           end
 
           @dsl = Homebrew::Bundle::Brewfile.read(global: context.global, file: context.file)
@@ -74,7 +82,6 @@ module Homebrew
             no_upgrade: context.no_upgrade,
             verbose:    context.verbose,
             force:      context.force,
-            jobs:       context.jobs,
             quiet:      quiet || args.quiet?,
           )
 
@@ -86,7 +93,6 @@ module Homebrew
 
           return unless cleanup
 
-          cleanup_requested = args.force_cleanup? || args.cleanup?
           return unless cleanup_requested
 
           require "bundle/subcommand/cleanup"

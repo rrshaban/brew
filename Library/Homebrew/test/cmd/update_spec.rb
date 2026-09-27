@@ -12,13 +12,14 @@ RSpec.describe Homebrew::Cmd::Update do
     (repository_root/"tmp").mkpath
     Pathname(Dir.mktmpdir("brew-update-", repository_root/"tmp"))
   end
-  let(:repository_root) { Pathname(T.must(__dir__)).parent.parent.parent.parent }
+  let(:repository_root) { HOMEBREW_LIBRARY_PATH.parent.parent }
 
   after do
     FileUtils.rm_rf test_root
   end
 
   it_behaves_like "parseable arguments"
+  it_behaves_like "a documented command", "update", shell: true
 
   def run_update_shell(script, env)
     Bundler.with_unbundled_env do
@@ -33,6 +34,108 @@ RSpec.describe Homebrew::Cmd::Update do
       FileUtils.ln_s repository_root/"Library/Homebrew/utils/#{name}.sh",
                      test_root/"Library/Homebrew/utils/#{name}.sh"
     end
+  end
+
+  it "installs Git when the Git wrapper cannot find an executable" do
+    setup_update_utils
+    (test_root/"Library/Homebrew/shims/shared").mkpath
+    (test_root/"Library/Homebrew/shims/shared/git").write "#!/bin/bash\nexit 1\n"
+    (test_root/"Library/Homebrew/shims/shared/git").chmod(0755)
+
+    stdout, stderr, status = run_update_shell(
+      <<~SH,
+        source "#{update_script}"
+        brew() { echo "$*"; }
+        setup_git() { echo git-ready; exit 0; }
+        homebrew-update
+      SH
+      {
+        "GIT_EXECUTABLE"                        => nil,
+        "HOMEBREW_CELLAR"                       => (test_root/"Cellar").to_s,
+        "HOMEBREW_FORCE_BREWED_CA_CERTIFICATES" => nil,
+        "HOMEBREW_FORCE_BREWED_CURL"            => nil,
+        "HOMEBREW_LIBRARY"                      => (test_root/"Library").to_s,
+        "HOMEBREW_NO_INSTALL_FROM_API"          => nil,
+        "HOMEBREW_REPOSITORY"                   => test_root.to_s,
+      },
+    )
+
+    expect([status.exitstatus, stdout, stderr]).to eq([0, "install git\ngit-ready\n", ""])
+  end
+
+  it "detects shallow clones and their linked worktrees but not full clones" do
+    setup_update_utils
+    FileUtils.ln_s repository_root/"Library/Homebrew/shims", test_root/"Library/Homebrew/shims"
+    repositories = test_root/"repositories"
+
+    stdout, stderr, status = run_update_shell(
+      <<~SH,
+        source "#{update_script}"
+        git() {
+          "#{Utils::Git.git}" -c init.defaultBranch=main -c user.name=Homebrew \\
+            -c user.email=homebrew@example.com "$@"
+        }
+        mkdir -p "#{repositories}" && cd "#{repositories}"
+        git init -q remote
+        git -C remote commit -q --allow-empty -m init
+        git clone -q remote full
+        git clone -q --depth 1 "file://#{repositories}/remote" shallow
+        git -C shallow worktree add -q --detach "#{repositories}/shallow-worktree"
+        for repository in full shallow shallow-worktree missing
+        do
+          if shallow_repository "#{repositories}/${repository}"
+          then
+            echo "${repository}: shallow"
+          else
+            echo "${repository}: full"
+          fi
+        done
+      SH
+      { "HOMEBREW_LIBRARY" => (test_root/"Library").to_s },
+    )
+
+    expect([status.success?, stdout]).to eq(
+      [true, "full: full\nshallow: shallow\nshallow-worktree: shallow\nmissing: full\n"],
+    ), stderr
+  end
+
+  it "retries a failed conditional API download without the time condition" do
+    cache_path = test_root/"cache/api/formula.jws.json"
+    requests_file = test_root/"requests.txt"
+    update_failed_file = test_root/"update_failed.txt"
+    setup_update_utils
+    cache_path.dirname.mkpath
+    cache_path.write "cached"
+
+    _stdout, stderr, status = run_update_shell(
+      <<~SH,
+        source "#{update_script}"
+        curl() {
+          if [[ "$*" == *"--time-cond"* ]]
+          then
+            echo conditional >> "#{requests_file}"
+            return 56
+          fi
+
+          echo unconditional >> "#{requests_file}"
+          printf fresh > "#{cache_path}"
+        }
+        fetch_api_file formula.jws.json "#{update_failed_file}"
+      SH
+      {
+        "HOMEBREW_API_DEFAULT_DOMAIN" => "https://formulae.example/api",
+        "HOMEBREW_API_DOMAIN"         => nil,
+        "HOMEBREW_CACHE"              => (test_root/"cache").to_s,
+        "HOMEBREW_CURL_SPEED_LIMIT"   => "100",
+        "HOMEBREW_CURL_SPEED_TIME"    => "5",
+        "HOMEBREW_LIBRARY"            => (test_root/"Library").to_s,
+        "HOMEBREW_USER_AGENT_CURL"    => "Homebrew/test",
+      },
+    )
+
+    expect([status.success?, stderr, requests_file.read, cache_path.read, update_failed_file.exist?]).to eq(
+      [true, "", "conditional\nunconditional\n", "fresh", false],
+    )
   end
 
   it "passes all arguments through to delegated upgrades" do
@@ -64,6 +167,23 @@ RSpec.describe Homebrew::Cmd::Update do
     expect(args_file.read).to eq("upgrade\ntestball\n--auto-update\n--merge\n")
   end
 
+  it "disables `--merge` in the shell implementation" do
+    setup_update_utils
+
+    _stdout, stderr, status = run_update_shell(
+      <<~SH,
+        source "#{update_script}"
+        odie() { echo "Error: $*" >&2; exit 1; }
+        homebrew-update --merge
+      SH
+      { "HOMEBREW_LIBRARY" => (test_root/"Library").to_s },
+    )
+
+    expect([status.success?, stderr]).to eq(
+      [false, "Error: Calling the `--merge` switch is disabled! There is no replacement.\n"],
+    )
+  end
+
   it "passes `--auto-update` through to `update-report`" do
     args_file = test_root/"brew-args.txt"
     setup_update_utils
@@ -91,6 +211,7 @@ RSpec.describe Homebrew::Cmd::Update do
         homebrew-update --auto-update
       SH
       {
+        "HOMEBREW_BREW_GIT_REMOTE"     => "https://github.com/Homebrew/brew",
         "HOMEBREW_CACHE"               => (test_root/"cache").to_s,
         "HOMEBREW_CELLAR"              => (test_root/"cellar").to_s,
         "HOMEBREW_LIBRARY"             => (test_root/"Library").to_s,

@@ -47,12 +47,6 @@ RSpec.describe Livecheck do
       livecheck_f.formula("other-formula")
       expect(livecheck_f.formula).to eq("other-formula")
     end
-
-    it "raises a TypeError if the argument isn't a String" do
-      expect do
-        livecheck_f.formula(123)
-      end.to raise_error TypeError
-    end
   end
 
   describe "#cask" do
@@ -80,14 +74,14 @@ RSpec.describe Livecheck do
   describe "#skip" do
     it "sets @skip to true when no argument is provided" do
       expect(livecheck_f.skip).to be true
-      expect(livecheck_f.instance_variable_get(:@skip)).to be true
-      expect(livecheck_f.instance_variable_get(:@skip_msg)).to be_nil
+      expect(livecheck_f.skip?).to be true
+      expect(livecheck_f.skip_msg).to be_nil
     end
 
     it "sets @skip to true and @skip_msg to the provided String" do
       expect(livecheck_f.skip("foo")).to be true
-      expect(livecheck_f.instance_variable_get(:@skip)).to be true
-      expect(livecheck_f.instance_variable_get(:@skip_msg)).to eq("foo")
+      expect(livecheck_f.skip?).to be true
+      expect(livecheck_f.skip_msg).to eq("foo")
     end
   end
 
@@ -185,15 +179,18 @@ RSpec.describe Livecheck do
         referer:       referer_url,
         user_agent:    :browser,
       )
-      livecheck_f.url(url_string, post_json: post_hash)
       expect(livecheck_f.options.compressed).to be(false)
       expect(livecheck_f.options.cookies).to eq(cookies)
       expect(livecheck_f.options.header).to eq(header_str)
       expect(livecheck_f.options.homebrew_curl).to be(true)
       expect(livecheck_f.options.post_form).to eq(post_hash)
-      expect(livecheck_f.options.post_json).to eq(post_hash)
       expect(livecheck_f.options.referer).to eq(referer_url)
       expect(livecheck_f.options.user_agent).to eq(:browser)
+
+      # `post_form` and `post_json` can't be set at the same time
+      livecheck_f.options.post_form = nil
+      livecheck_f.url(url_string, post_json: post_hash)
+      expect(livecheck_f.options.post_json).to eq(post_hash)
 
       header_array = ["Accept: */*", "X-Requested-With: XMLHttpRequest"]
       livecheck_f.url(url_string, header: header_array)
@@ -226,6 +223,20 @@ RSpec.describe Livecheck do
         livecheck_f.url(:stable, post_form: post_hash, post_json: post_hash)
       end.to raise_error ArgumentError
     end
+
+    it "raises an ArgumentError if `@options.post_form` is set and `post_json` is provided" do
+      livecheck_f.url(url_string, post_form: post_hash)
+      expect do
+        livecheck_f.url(url_string, post_json: post_hash)
+      end.to raise_error ArgumentError
+    end
+
+    it "raises an ArgumentError if `@options.post_json` is set and `post_form` is provided" do
+      livecheck_f.url(url_string, post_json: post_hash)
+      expect do
+        livecheck_f.url(url_string, post_form: post_hash)
+      end.to raise_error ArgumentError
+    end
   end
 
   describe "#arch" do
@@ -246,10 +257,10 @@ RSpec.describe Livecheck do
       end
     end
 
-    {
+    test_each_hash({
       needs_arm:   "arm",
       needs_intel: "intel",
-    }.each do |metadata, expected_arch|
+    }) do |metadata, expected_arch|
       it "delegates `arch` in `livecheck` block to `package_or_resource`", metadata do
         expect(c_arch.livecheck.url).to eq("https://brew.sh/#{expected_arch}")
       end
@@ -274,10 +285,10 @@ RSpec.describe Livecheck do
       end
     end
 
-    {
+    test_each_hash({
       needs_macos: "macos",
       needs_linux: "linux",
-    }.each do |metadata, expected_os|
+    }) do |metadata, expected_os|
       it "delegates `os` in `livecheck` block to `package_or_resource`", metadata do
         expect(c_os.livecheck.url).to eq("https://brew.sh/#{expected_os}")
       end

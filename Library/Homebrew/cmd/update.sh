@@ -39,10 +39,6 @@ macos_version_name() {
   then
     # odisabled: remove support for Big Sur and macOS x86_64 September (or later) 2027
     echo "big_sur"
-  elif [[ "${HOMEBREW_MACOS_VERSION_NUMERIC}" -ge "101500" ]]
-  then
-    # odisabled: remove support for Catalina September (or later) 2026
-    echo "catalina"
   fi
 }
 
@@ -82,7 +78,10 @@ git() {
       odie "Can't find a working Git!"
     fi
   fi
-  "${GIT_EXECUTABLE}" "$@"
+  # Disable Git hooks (e.g. a core.hooksPath set by `git lfs install`),
+  # which can break Homebrew's Git operations.
+  # Keep in sync with `Tap#git_command!` in Library/Homebrew/tap.rb.
+  "${GIT_EXECUTABLE}" -c core.hooksPath=/dev/null "$@"
 }
 
 git_init_if_necessary() {
@@ -96,7 +95,7 @@ git_init_if_necessary() {
     git config --bool core.symlinks true
     if [[ "${HOMEBREW_BREW_DEFAULT_GIT_REMOTE}" != "${HOMEBREW_BREW_GIT_REMOTE}" ]]
     then
-      echo "HOMEBREW_BREW_GIT_REMOTE set: using ${HOMEBREW_BREW_GIT_REMOTE} as the Homebrew/brew Git remote."
+      echo "HOMEBREW_BREW_GIT_REMOTE set: using ${HOMEBREW_BREW_GIT_REMOTE} as the Homebrew/brew Git remote." >&2
     fi
     git config remote.origin.url "${HOMEBREW_BREW_GIT_REMOTE}"
     git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
@@ -120,7 +119,7 @@ git_init_if_necessary() {
     git config --bool core.symlinks true
     if [[ "${HOMEBREW_CORE_DEFAULT_GIT_REMOTE}" != "${HOMEBREW_CORE_GIT_REMOTE}" ]]
     then
-      echo "HOMEBREW_CORE_GIT_REMOTE set: using ${HOMEBREW_CORE_GIT_REMOTE} as the Homebrew/homebrew-core Git remote."
+      echo "HOMEBREW_CORE_GIT_REMOTE set: using ${HOMEBREW_CORE_GIT_REMOTE} as the Homebrew/homebrew-core Git remote." >&2
     fi
     git config remote.origin.url "${HOMEBREW_CORE_GIT_REMOTE}"
     git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
@@ -166,6 +165,11 @@ read_current_revision() {
   git rev-parse -q --verify HEAD
 }
 
+# Keep in sync with `GitRepository#shallow?` in `git_repository.rb`.
+shallow_repository() {
+  [[ -d "$1" && "$(git -C "$1" rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]
+}
+
 pop_stash() {
   [[ -z "${STASHED}" ]] && return
   if [[ -n "${HOMEBREW_VERBOSE}" ]]
@@ -180,8 +184,8 @@ pop_stash() {
 
 pop_stash_message() {
   [[ -z "${STASHED}" ]] && return
-  echo "To restore the stashed changes to ${DIR}, run:"
-  echo "  cd ${DIR} && git stash pop"
+  echo "To restore the stashed changes to ${DIR}, run:" >&2
+  echo "  cd ${DIR} && git stash pop" >&2
   unset STASHED
 }
 
@@ -395,6 +399,21 @@ EOWARN
   trap - SIGINT
 }
 
+api_curl_download() {
+  local json_url="$1"
+  local cache_path="$2"
+  shift 2
+
+  curl \
+    "${CURL_DISABLE_CURLRC_ARGS[@]}" \
+    --fail --compressed --silent \
+    --speed-limit "${HOMEBREW_CURL_SPEED_LIMIT}" --speed-time "${HOMEBREW_CURL_SPEED_TIME}" \
+    --location --remote-time --output "${cache_path}" \
+    "$@" \
+    --user-agent "${HOMEBREW_USER_AGENT_CURL}" \
+    "${json_url}"
+}
+
 fetch_api_file() {
   local filename="$1"
   local update_failed_file="$2"
@@ -424,7 +443,8 @@ fetch_api_file() {
     echo "Checking if we need to fetch ${filename}..."
   fi
 
-  local arg json_url last_json_url
+  local arg curl_exit_code json_url last_json_url
+  local -a time_cond
   while read -r json_url
   do
     time_cond=()
@@ -432,15 +452,15 @@ fetch_api_file() {
     do
       time_cond+=("${arg}")
     done < <(api_time_cond_args "${cache_path}")
-    curl \
-      "${CURL_DISABLE_CURLRC_ARGS[@]}" \
-      --fail --compressed --silent \
-      --speed-limit "${HOMEBREW_CURL_SPEED_LIMIT}" --speed-time "${HOMEBREW_CURL_SPEED_TIME}" \
-      --location --remote-time --output "${cache_path}" \
-      "${time_cond[@]}" \
-      --user-agent "${HOMEBREW_USER_AGENT_CURL}" \
-      "${json_url}"
+    api_curl_download "${json_url}" "${cache_path}" "${time_cond[@]}"
     curl_exit_code=$?
+    # A conditional request can fail with a receive error (curl exit code 56) when
+    # an unconditional request for the same URL succeeds, so retry exactly once.
+    if [[ ${curl_exit_code} -eq 56 ]] && [[ ${#time_cond[@]} -gt 0 ]]
+    then
+      api_curl_download "${json_url}" "${cache_path}"
+      curl_exit_code=$?
+    fi
     last_json_url="${json_url}"
     [[ ${curl_exit_code} -eq 0 ]] && break
   done < <(api_urls "${filename}")
@@ -496,9 +516,9 @@ homebrew-update() {
     fi
 
     case "${option}" in
+      # Keep in sync with the `Cmd::Update` parser in `cmd/update.rb`.
       --merge)
-        shift
-        HOMEBREW_MERGE=1
+        odie "Calling the \`--merge\` switch is disabled! There is no replacement."
         ;;
       --force) HOMEBREW_UPDATE_FORCE=1 ;;
       --simulate-from-current-branch)
@@ -584,10 +604,10 @@ EOS
     setup_curl
   fi
 
-  if ! git --version &>/dev/null ||
+  if ! (git --version) &>/dev/null ||
      [[ -n "${HOMEBREW_FORCE_BREWED_GIT}" && ! -x "${HOMEBREW_PREFIX}/opt/git/bin/git" ]]
   then
-    # we cannot install a Homebrew Git if homebrew/core is unavailable.
+    # Keep Git bootstrapping in sync with utils/git.rb.
     if [[ -z "${HOMEBREW_CORE_AVAILABLE}" ]] || ! brew install git
     then
       odie "'git' must be installed and in your PATH!"
@@ -596,8 +616,8 @@ EOS
     setup_git
   fi
 
-  [[ -f "${HOMEBREW_CORE_REPOSITORY}/.git/shallow" ]] && HOMEBREW_CORE_SHALLOW=1
-  [[ -f "${HOMEBREW_CASK_REPOSITORY}/.git/shallow" ]] && HOMEBREW_CASK_SHALLOW=1
+  shallow_repository "${HOMEBREW_CORE_REPOSITORY}" && HOMEBREW_CORE_SHALLOW=1
+  shallow_repository "${HOMEBREW_CASK_REPOSITORY}" && HOMEBREW_CASK_SHALLOW=1
   if [[ -n "${HOMEBREW_CORE_SHALLOW}" && -n "${HOMEBREW_CASK_SHALLOW}" ]]
   then
     SHALLOW_COMMAND_PHRASE="These commands"
@@ -664,8 +684,8 @@ EOS
   if [[ "${HOMEBREW_BREW_DEFAULT_GIT_REMOTE}" != "${HOMEBREW_BREW_GIT_REMOTE}" ]]
   then
     safe_cd "${HOMEBREW_REPOSITORY}"
-    echo "HOMEBREW_BREW_GIT_REMOTE set: using ${HOMEBREW_BREW_GIT_REMOTE} as the Homebrew/brew Git remote."
-    git remote set-url origin "${HOMEBREW_BREW_GIT_REMOTE}"
+    echo "HOMEBREW_BREW_GIT_REMOTE set: using ${HOMEBREW_BREW_GIT_REMOTE} as the Homebrew/brew Git remote." >&2
+    git remote set-url origin --end-of-options "${HOMEBREW_BREW_GIT_REMOTE}"
     git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
     git fetch --force --tags origin
     SKIP_FETCH_BREW_REPOSITORY=1
@@ -675,8 +695,8 @@ EOS
      [[ "${HOMEBREW_CORE_DEFAULT_GIT_REMOTE}" != "${HOMEBREW_CORE_GIT_REMOTE}" ]]
   then
     safe_cd "${HOMEBREW_CORE_REPOSITORY}"
-    echo "HOMEBREW_CORE_GIT_REMOTE set: using ${HOMEBREW_CORE_GIT_REMOTE} as the Homebrew/homebrew-core Git remote."
-    git remote set-url origin "${HOMEBREW_CORE_GIT_REMOTE}"
+    echo "HOMEBREW_CORE_GIT_REMOTE set: using ${HOMEBREW_CORE_GIT_REMOTE} as the Homebrew/homebrew-core Git remote." >&2
+    git remote set-url origin --end-of-options "${HOMEBREW_CORE_GIT_REMOTE}"
     git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
     git config fetch.prune true
     git fetch --force origin
@@ -1048,11 +1068,16 @@ EOS
     rm -f "${HOMEBREW_CACHE}"/api/internal/formula.*.jws.json
     rm -f "${HOMEBREW_CACHE}"/api/internal/cask.*.jws.json
 
-    # Remove API files from previous OS versions.
-    for f in "${HOMEBREW_CACHE}"/api/internal/packages.*.jws.json
+    # Remove API files (and their `.payload` and `.payload.index` sidecars)
+    # from previous OS versions, keeping the current OS's so `brew
+    # update-report`'s API data load stays or becomes prewarmed. Keep in
+    # sync with `cache_files` in Library/Homebrew/cleanup.rb.
+    for f in "${HOMEBREW_CACHE}"/api/internal/packages.*.jws.json*
     do
       case "${f}" in
         "${HOMEBREW_CACHE}/api/internal/packages.$(bottle_tag).jws.json") ;;
+        "${HOMEBREW_CACHE}/api/internal/packages.$(bottle_tag).jws.json.payload") ;;
+        "${HOMEBREW_CACHE}/api/internal/packages.$(bottle_tag).jws.json.payload.index") ;;
         *) rm -f "${f}" ;;
       esac
     done

@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/output"
+
 class BottleSpecification
   include Utils::Output::Mixin
 
@@ -35,8 +37,8 @@ class BottleSpecification
     @root_url = T.let(nil, T.nilable(String))
   end
 
-  sig { params(val: Integer).returns(Integer) }
-  def rebuild(val = T.unsafe(nil))
+  sig { params(val: T.nilable(Integer)).returns(Integer) }
+  def rebuild(val = nil)
     val.nil? ? @rebuild : @rebuild = val
   end
 
@@ -62,7 +64,7 @@ class BottleSpecification
   sig { override.params(other: BasicObject).returns(T::Boolean) }
   def ==(other)
     case other
-    when self.class
+    when BottleSpecification
       rebuild == other.rebuild && collector == other.collector &&
         root_url == other.root_url && root_url_specs == other.root_url_specs && tap == other.tap
     else false
@@ -80,16 +82,27 @@ class BottleSpecification
     end
   end
 
-  sig { params(tag: Utils::Bottles::Tag).returns(T::Boolean) }
-  def compatible_locations?(tag: Utils::Bottles.tag)
-    cellar = tag_to_cellar(tag)
+  # Whether bottles built in the default prefix can be installed here.
+  sig { returns(T::Boolean) }
+  def self.compatible_locations? = new.compatible_locations?
+
+  sig {
+    params(tag: Utils::Bottles::Tag, built_prefix: T.nilable(String), padded_prefix: T::Boolean)
+      .returns(T::Boolean)
+  }
+  def compatible_locations?(tag: Utils::Bottles.tag, built_prefix: nil, padded_prefix: false)
+    return false if padded_prefix && built_prefix.nil?
+
+    cellar = padded_prefix ? "#{built_prefix}/Cellar" : tag_to_cellar(tag)
 
     return true if RELOCATABLE_CELLARS.include?(cellar)
 
     prefix = Pathname(cellar.to_s).parent.to_s
 
-    cellar_relocatable = cellar.size >= HOMEBREW_CELLAR.to_s.size && ENV["HOMEBREW_RELOCATE_BUILD_PREFIX"].present?
-    prefix_relocatable = prefix.size >= HOMEBREW_PREFIX.to_s.size && ENV["HOMEBREW_RELOCATE_BUILD_PREFIX"].present?
+    # Raw prefix strings are patched in place, so the byte length decides.
+    relocatable = !Homebrew::EnvConfig.no_relocate_build_prefix?
+    cellar_relocatable = relocatable && cellar.to_s.bytesize >= HOMEBREW_CELLAR.to_s.bytesize
+    prefix_relocatable = relocatable && prefix.bytesize >= HOMEBREW_PREFIX.to_s.bytesize
 
     compatible_cellar = cellar == HOMEBREW_CELLAR.to_s || cellar_relocatable
     compatible_prefix = prefix == HOMEBREW_PREFIX.to_s || prefix_relocatable
@@ -118,7 +131,7 @@ class BottleSpecification
   # Example bottle block syntax:
   # bottle do
   #  sha256 cellar: :any_skip_relocation, big_sur: "69489ae397e4645..."
-  #  sha256 cellar: :any, catalina: "449de5ea35d0e94..."
+  #  sha256 cellar: :any, monterey: "449de5ea35d0e94..."
   # end
   sig { params(hash: T::Hash[T.any(Symbol, String), T.any(String, Symbol)]).void }
   def sha256(hash)

@@ -34,7 +34,7 @@ jobs:
     steps:
       - name: Set up Homebrew
         id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
         with:
           core: false
           cask: false
@@ -50,10 +50,7 @@ jobs:
         run: brew install-bundler-gems --groups=style,typecheck
 
       - name: Install actionlint, shellcheck and shfmt
-        uses: Homebrew/actions/cache-homebrew-prefix@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
-        with:
-          install: actionlint shellcheck shfmt
-          workflow-key: tests-syntax
+        run: brew install actionlint shellcheck shfmt
 
       - name: Cache style cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -74,7 +71,7 @@ jobs:
     steps:
       - name: Set up Homebrew
         id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
         with:
           core: true
           cask: true
@@ -112,7 +109,7 @@ jobs:
     steps:
       - name: Set up Homebrew
         id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
         with:
           core: true
           cask: false
@@ -134,7 +131,7 @@ jobs:
     steps:
       - name: Set up Homebrew
         id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
         with:
           core: true
           cask: true
@@ -156,13 +153,13 @@ jobs:
     steps:
       - name: Set up Homebrew
         id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
         with:
           core: false
           cask: false
 
       - name: Configure Git user
-        uses: Homebrew/actions/git-user-config@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        uses: Homebrew/actions/git-user-config@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
         with:
           username: BrewTestBot
 
@@ -197,7 +194,7 @@ jobs:
     steps:
       - name: Set up Homebrew
         id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
         with:
           core: false
           cask: false
@@ -210,7 +207,7 @@ jobs:
 
   tests:
     name: ${{ matrix.name }}
-    needs: syntax
+    if: github.repository_owner == 'Homebrew'
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
     permissions:
@@ -221,28 +218,109 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: tests (online)
+          - name: tests (online, 1/2)
             test-flags: --online --coverage --profile 3
             runs-on: ubuntu-latest
-          - name: tests (generic OS)
+            online: true
+            load-only: false
+            shard: 1
+            shard-count: 2
+          - name: tests (online, 2/2)
+            test-flags: --online --coverage --profile 3
+            runs-on: ubuntu-latest
+            online: true
+            load-only: false
+            shard: 2
+            shard-count: 2
+          - name: tests (generic OS, 1/2)
             test-flags: --generic --coverage --profile 3
             runs-on: ubuntu-latest
-          - name: tests (Linux)
+            online: false
+            load-only: false
+            shard: 1
+            shard-count: 2
+          - name: tests (generic OS, 2/2)
+            test-flags: --generic --coverage --profile 3
+            runs-on: ubuntu-latest
+            online: false
+            load-only: false
+            shard: 2
+            shard-count: 2
+          - name: tests (Linux, 1/2)
             test-flags: --coverage --profile 3
             runs-on: ubuntu-24.04
-          - name: tests (macOS)
+            online: false
+            load-only: false
+            shard: 1
+            shard-count: 2
+          - name: tests (Linux, 2/2)
+            test-flags: --coverage --profile 3
+            runs-on: ubuntu-24.04
+            online: false
+            load-only: false
+            shard: 2
+            shard-count: 2
+          - name: tests (macOS, 1/2)
             test-flags: --coverage --profile 3
             runs-on: macos-26
+            online: false
+            load-only: false
+            shard: 1
+            shard-count: 2
+          - name: tests (macOS, 2/2)
+            test-flags: --coverage --profile 3
+            runs-on: macos-26
+            online: false
+            load-only: false
+            shard: 2
+            shard-count: 2
+          - name: tests (no Sorbet)
+            test-flags: --coverage --profile 3
+            runs-on: ubuntu-24.04
+            online: false
+            load-only: false
+            shard: 0
+            shard-count: 0
+            runtime-cache: tests-no-sorbet-linux
+            runtime-log: parallel_runtime_rspec.log
+          - name: tests (load-only Linux)
+            test-flags: --load-only
+            runs-on: ubuntu-24.04
+            online: false
+            load-only: true
+            shard: 0
+            shard-count: 0
+            runtime-cache: unused
+            runtime-log: parallel_runtime_rspec.log
+          - name: tests (load-only macOS)
+            test-flags: --load-only
+            runs-on: macos-26
+            online: false
+            load-only: true
+            shard: 0
+            shard-count: 0
+            runtime-cache: unused
+            runtime-log: parallel_runtime_rspec.log
     steps:
       - name: Set up Homebrew
         id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
         with:
           # We only test needs_homebrew_core tests on macOS because
           # homebrew/core is not available by default on GitHub-hosted Ubuntu
           # runners, and it's expensive to tap it.
-          core: ${{ runner.os == 'macOS' }}
+          # Load-only jobs never run examples, so they don't need it either.
+          core: ${{ runner.os == 'macOS' && matrix.load-only != true }}
           cask: false
+
+      - name: Untap untrusted preinstalled taps
+        if: runner.os == 'macOS' && matrix.load-only != true
+        run: |
+          while IFS= read -r tap; do
+            if [[ "$tap" != homebrew/* ]]; then
+              brew untap --force "$tap"
+            fi
+          done < <(brew tap)
 
       - name: Cache Bundler RubyGems
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -256,46 +334,76 @@ jobs:
       - name: Install Bundler RubyGems
         run: brew install-bundler-gems --groups=all
 
+      - name: Install Subversion
+        if: matrix.online || (runner.os == 'macOS' && matrix.load-only != true)
+        run: brew install subversion
+
       - name: Create parallel test log directory
         run: mkdir tests
 
-      - name: Cache parallel tests log
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore parallel tests log
+        if: matrix.shard-count == 0 && matrix.load-only != true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: tests
-          key: ${{ runner.os }}-${{ matrix.test-flags }}-parallel_runtime_rspec-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-${{ matrix.test-flags }}-parallel_runtime_rspec-
+          path: tests/${{ matrix.runtime-log }}
+          key: ${{ matrix.runtime-cache }}-parallel-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ matrix.runtime-cache }}-parallel-runtime-
+            ${{ runner.os }}-${{ matrix.test-flags }}-parallel_runtime_rspec-
 
-      - name: Install brew tests --online dependencies
-        if: matrix.name == 'tests (online)'
-        uses: Homebrew/actions/cache-homebrew-prefix@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
-        with:
-          install: curl subversion
-          workflow-key: tests-tests-online
-
-      - name: Install brew tests macOS dependencies
-        if: runner.os != 'Linux'
-        uses: Homebrew/actions/cache-homebrew-prefix@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
-        with:
-          install: subversion gnupg
-          workflow-key: tests-tests-macos
-          uninstall: true
+      - name: Stage parallel tests log
+        if: matrix.shard-count == 0 && matrix.load-only != true
+        run: |
+          mkdir -p "$TEST_RUNTIME_PATH"
+          if [[ -f "tests/$RUNTIME_LOG" ]]; then
+            cp "tests/$RUNTIME_LOG" "$TEST_RUNTIME_PATH/$RUNTIME_LOG"
+          fi
+        env:
+          RUNTIME_LOG: ${{ matrix.runtime-log }}
+          TEST_RUNTIME_PATH: ${{ steps.set-up-homebrew.outputs.repository-path }}/Library/Homebrew/tests
 
         # brew tests doesn't like world writable directories
       - name: Cleanup permissions
         if: runner.os == 'Linux'
         run: sudo chmod -R g-w,o-w /home/linuxbrew/.linuxbrew/Homebrew
 
+      - name: Disable Sorbet runtime
+        if: matrix.name == 'tests (no Sorbet)'
+        run: echo "HOMEBREW_TESTS_NO_SORBET_RUNTIME=1" >> "$GITHUB_ENV"
+
       - name: Run brew tests
-        if: github.event_name == 'pull_request' || matrix.name != 'tests (online)'
-        run: brew tests ${{ matrix.test-flags }}
+        if: github.event_name == 'pull_request' || matrix.online != true
+        run: |
+          read -ra test_flags <<< "$TEST_FLAGS"
+          if (( SHARD_COUNT > 0 )); then
+            test_flags+=("--shard=$SHARD_INDEX/$SHARD_COUNT")
+          fi
+          brew tests "${test_flags[@]}"
         env:
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # These cannot be queried at the macOS level on GitHub Actions.
           HOMEBREW_LANGUAGES: en-GB
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          TEST_FLAGS: ${{ matrix.test-flags }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_COUNT: ${{ matrix.shard-count }}
+
+      - name: Collect parallel tests log
+        if: matrix.shard-count == 0 && matrix.load-only != true && success()
+        run: cp "$TEST_RUNTIME_PATH/$RUNTIME_LOG" "tests/$RUNTIME_LOG"
+        env:
+          RUNTIME_LOG: ${{ matrix.runtime-log }}
+          TEST_RUNTIME_PATH: ${{ steps.set-up-homebrew.outputs.repository-path }}/Library/Homebrew/tests
+
+      - name: Save parallel tests log
+        if: matrix.shard-count == 0 && matrix.load-only != true && success()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/${{ matrix.runtime-log }}
+          key: ${{ matrix.runtime-cache }}-parallel-runtime-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Get RSpec JUnit XML filenames
+        if: matrix.load-only != true
         id: junit_xml
         working-directory: ${{ steps.set-up-homebrew.outputs.repository-path }}
         run: |
@@ -303,8 +411,8 @@ jobs:
           filenames=$(find Library/Homebrew/test/junit -name 'rspec*.xml' -print | tr '\n' ',')
           echo "filenames=${filenames%,}" >> "$GITHUB_OUTPUT"
 
-      - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        if: github.event_name == 'pull_request' || matrix.name != 'tests (online)'
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        if: matrix.load-only != true && (github.event_name == 'pull_request' || matrix.online != true)
         with:
           working-directory: ${{ steps.set-up-homebrew.outputs.repository-path }}
           files: ${{ steps.junit_xml.outputs.filenames }}
@@ -312,8 +420,8 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           report_type: test_results
 
-      - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        if: github.event_name == 'pull_request' || matrix.name != 'tests (online)'
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        if: matrix.load-only != true && (github.event_name == 'pull_request' || matrix.online != true)
         with:
           working-directory: ${{ steps.set-up-homebrew.outputs.repository-path }}
           files: Library/Homebrew/test/coverage/coverage.xml
@@ -327,7 +435,6 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
     container:
       image: ${{ matrix.container }}
-      options: ${{ matrix.container != '' && '--privileged' }}
     strategy:
       fail-fast: false
       matrix:
@@ -335,7 +442,20 @@ jobs:
           - name: test-bot (Linux arm64)
             runs-on: ubuntu-24.04-arm
             container: ghcr.io/homebrew/ubuntu24.04:latest
+          - name: test-bot (Linux arm64, padded prefix)
+            runs-on: ubuntu-24.04-arm
+            container: ghcr.io/homebrew/ubuntu24.04:latest
+            padded-prefix: true
+            system-tar: true
           - name: test-bot (Linux x86_64)
+            runs-on: ubuntu-latest
+            container: ghcr.io/homebrew/ubuntu24.04:main
+          - name: test-bot (Linux x86_64, padded prefix)
+            runs-on: ubuntu-latest
+            container: ghcr.io/homebrew/ubuntu24.04:main
+            padded-prefix: true
+            system-tar: true
+          - name: test-bot (no Sorbet)
             runs-on: ubuntu-latest
             container: ghcr.io/homebrew/ubuntu24.04:main
           - name: test-bot (Linux containerless)
@@ -344,10 +464,11 @@ jobs:
           - name: test-bot (Linux Homebrew glibc)
             runs-on: ubuntu-latest
             container: ubuntu:22.04
-          - name: test-bot (macOS x86_64)
-            runs-on: macos-15-intel
           - name: test-bot (macOS arm64)
             runs-on: macos-26
+          - name: test-bot (macOS arm64, padded prefix)
+            runs-on: macos-26
+            padded-prefix: true
     env:
       HOMEBREW_TEST_BOT_ANALYTICS: 1
     steps:
@@ -388,16 +509,29 @@ jobs:
 
       - name: Set up Homebrew
         id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
         with:
           core: true
           cask: false
 
-      - uses: Homebrew/actions/cache-homebrew-prefix@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
-        with:
-          install: gnu-tar
-          workflow-key: test-bot
-          uninstall: true
+      - name: Set up padded bottle prefix
+        if: matrix.padded-prefix
+        run: |
+          padded_prefix="$(brew test-bot --print-padded-prefix)"
+          test "${#padded_prefix}" -eq 64
+          mkdir -p "${padded_prefix}/bin"
+          ln -s "$(brew --repository)/bin/brew" "${padded_prefix}/bin/brew"
+          test "$("${padded_prefix}/bin/brew" --prefix)" = "${padded_prefix}"
+          echo "${padded_prefix}/bin" >> "${GITHUB_PATH}"
+
+      - run: brew test-bot --only-cleanup-before
+
+      - run: brew install gnu-tar
+        if: matrix.system-tar != true
+
+      - name: Disable Sorbet runtime
+        if: matrix.name == 'test-bot (no Sorbet)'
+        run: echo "HOMEBREW_TESTS_NO_SORBET_RUNTIME=1" >> "$GITHUB_ENV"
 
       - name: Setup environment variables
         if: matrix.name == 'test-bot (Linux Homebrew glibc)'
@@ -407,11 +541,19 @@ jobs:
           echo "HOMEBREW_GLIBC_TESTING=1" >> "$GITHUB_ENV"
           echo "HOMEBREW_SORBET_RECURSIVE=0" >> "$GITHUB_ENV"
 
-      - run: brew test-bot --only-cleanup-before
-
       - run: brew test-bot --only-setup
+        env:
+          HOMEBREW_TEST_BOT_IGNORE_DOCTOR_FAILURE: ${{ matrix.padded-prefix && '1' || null }}
 
-      - run: brew test-bot --only-formulae --only-json-tab --test-default-formula
+      - name: Run brew test-bot formulae
+        run: |
+          test_bot_args=(--only-formulae)
+          if [[ -n "${JSON_TAB}" ]]; then
+            test_bot_args+=(--only-json-tab)
+          fi
+          brew test-bot "${test_bot_args[@]}" --test-default-formula
+        env:
+          JSON_TAB: ${{ matrix.system-tar != true && '1' || '' }}
 
   bundle-and-services:
     name: ${{ matrix.name }}
@@ -429,7 +571,7 @@ jobs:
     steps:
       - name: Set up Homebrew
         id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
         with:
           core: false
           cask: false
@@ -481,12 +623,7 @@ jobs:
     steps:
       - name: Set up Homebrew
         id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
-
-      - name: Setup Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version-file: ${{ steps.set-up-homebrew.outputs.repository-path }}/Library/Homebrew/formula-analytics/.python-version
+        uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
 
       - name: Cache Homebrew Bundler RubyGems
         id: cache
@@ -499,6 +636,9 @@ jobs:
       - name: Install Homebrew Bundler RubyGems
         if: steps.cache.outputs.cache-hit != 'true'
         run: brew install-bundler-gems
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       - run: brew formula-analytics --setup
 

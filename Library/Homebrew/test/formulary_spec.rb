@@ -56,6 +56,42 @@ RSpec.describe Formulary do
   end
 
   describe "::load_formula" do
+    it "continues evaluation after ignorable errors with ignore_errors" do
+      formula_class = described_class.load_formula(
+        "ignorable-error",
+        mktmpdir/"ignorable-error.rb",
+        <<~RUBY,
+          class IgnorableError < Formula
+            raise ArgumentError, "should be ignored"
+            url "https://brew.sh/ignorable-error-1.0.tar.gz"
+          end
+        RUBY
+        "IgnorableErrorNamespace",
+        flags:         [],
+        ignore_errors: true,
+      )
+
+      expect(formula_class.stable.url).to eq("https://brew.sh/ignorable-error-1.0.tar.gz")
+    end
+
+    it "raises FormulaUnreadableError for errors it cannot resume despite ignore_errors" do
+      expect do
+        described_class.load_formula(
+          "unreadable-error",
+          mktmpdir/"unreadable-error.rb",
+          <<~RUBY,
+            class UnreadableError < Formula
+              nonexistent_dsl_method "foo"
+              url "https://brew.sh/unreadable-error-1.0.tar.gz"
+            end
+          RUBY
+          "UnreadableErrorNamespace",
+          flags:         [],
+          ignore_errors: true,
+        )
+      end.to raise_error(FormulaUnreadableError)
+    end
+
     it "masks sensitive environment variables while evaluating formulae" do
       with_env(HOMEBREW_SECRET_TOKEN: "password") do
         formula_class = described_class.load_formula(
@@ -108,7 +144,7 @@ RSpec.describe Formulary do
       RUBY
       full_name = "#{tap.name}/sensitive-env"
 
-      with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1", HOMEBREW_USER_CONFIG_HOME: mktmpdir) do
+      with_env(HOMEBREW_USER_CONFIG_HOME: mktmpdir) do
         expect { described_class.factory(formula_path) }
           .to raise_error(Homebrew::UntrustedTapError, /#{tap.name}/)
 
@@ -239,6 +275,95 @@ RSpec.describe Formulary do
         end
       end
 
+      context "with a disabled no_autobump! reason" do
+        before do
+          stub_const("HOMEBREW_CACHE_FORMULA", HOMEBREW_CACHE/"Formula")
+        end
+
+        let(:formula_content) do
+          super().sub("\n", "\n  no_autobump! because: :requires_manual_review\n")
+        end
+
+        it "rejects the reason in a current formula" do
+          expect { described_class.factory(formula_name) }
+            .to raise_error(TapFormulaUnreadableError, /'because' argument/)
+        end
+
+        it "rejects the reason in a cached current formula" do
+          cached_formula = HOMEBREW_CACHE_FORMULA/"#{formula_name}.rb"
+          cached_formula.dirname.mkpath
+          cached_formula.write(formula_content)
+
+          expect do
+            described_class.factory(cached_formula)
+          end.to raise_error(FormulaUnreadableError, /'because' argument/)
+        end
+
+        it "rejects the reason through the cached-name loader" do
+          cached_formula = HOMEBREW_CACHE_FORMULA/"#{formula_name}.rb"
+          cached_formula.dirname.mkpath
+          cached_formula.write(formula_content)
+
+          expect { described_class::FromCacheLoader.new(formula_name, cached_formula).get_formula(:stable) }
+            .to raise_error(FormulaUnreadableError, /'because' argument/)
+        end
+
+        it "rejects the reason in a current formula loaded from a URI", :needs_utils_curl do
+          expect { described_class.factory("file://#{formula_path}") }
+            .to raise_error(FormulaUnreadableError, /'because' argument/)
+        end
+
+        it "rejects the reason in a current formula loaded while evaluating metadata" do
+          expect do
+            described_class.from_contents("legacy", mktmpdir/".brew/legacy.rb", <<~RUBY, from_metadata: true)
+              class Legacy < Formula
+                Formulary.factory(#{formula_path.to_s.inspect})
+                url "https://brew.sh/legacy-1.0.tar.gz"
+              end
+            RUBY
+          end.to raise_error(FormulaUnreadableError, /'because' argument/)
+        end
+
+        it "loads the reason from a bottle" do
+          allow(Utils::Bottles).to receive(:formula_contents).with(bottle.realpath, name: formula_name)
+                                                             .and_return(formula_content)
+
+          expect(described_class.factory(bottle).no_autobump_message).to eq(:requires_manual_review)
+        end
+
+        it "loads the reason from a keg formula path for post-install hooks" do
+          keg_formula = HOMEBREW_CELLAR/formula_name/"0.1/.brew/#{formula_name}.rb"
+          keg_formula.dirname.mkpath
+          keg_formula.write(formula_content)
+
+          expect(described_class.factory(keg_formula).no_autobump_message).to eq(:requires_manual_review)
+        end
+
+        it "rejects the reason in a current formula under a .brew directory" do
+          current_formula = mktmpdir/".brew/#{formula_name}.rb"
+          current_formula.dirname.mkpath
+          current_formula.write(formula_content)
+
+          expect { described_class.factory(current_formula) }
+            .to raise_error(FormulaUnreadableError, /'because' argument/)
+        end
+
+        it "loads the reason from an installed keg after the formula is removed" do
+          keg_path = HOMEBREW_CELLAR/formula_name/"0.1"
+          (keg_path/".brew/#{formula_name}.rb").tap do |keg_formula|
+            keg_formula.dirname.mkpath
+            keg_formula.write(formula_content)
+          end
+          tab = Tab.empty
+          tab.tabfile = keg_path/AbstractTab::FILENAME
+          tab.write
+          (HOMEBREW_PREFIX/"opt/#{formula_name}").make_relative_symlink(keg_path)
+          formula_path.unlink
+
+          expect(described_class.factory(formula_name).no_autobump_message).to eq(:requires_manual_review)
+        end
+      end
+
       context "when given an alias" do
         subject(:formula) { described_class.factory("foo") }
 
@@ -280,6 +405,21 @@ RSpec.describe Formulary do
           keg = Keg.new(installed_formula.prefix)
           f = described_class.from_keg(keg)
           expect(f).to be_a(Formula)
+        end
+
+        it "does not load a Formula using a removed alias" do
+          keg_path = HOMEBREW_CELLAR/formula_name/"0.1"
+          (keg_path/".brew/#{formula_name}.rb").tap do |keg_formula|
+            keg_formula.dirname.mkpath
+            keg_formula.write(formula_content)
+          end
+          tab = Tab.empty
+          tab.tabfile = keg_path/AbstractTab::FILENAME
+          tab.write
+          (HOMEBREW_PREFIX/"opt/removed-alias").make_relative_symlink(keg_path)
+          described_class.clear_cache
+
+          expect { described_class.factory("removed-alias") }.to raise_error(FormulaUnavailableError)
         end
       end
 
@@ -356,12 +496,9 @@ RSpec.describe Formulary do
           expect(described_class.factory(formula_name)).to be_a(Formula)
         end
 
-        it "returns a Formula from an Alias path" do
-          expect(described_class.factory(alias_name)).to be_a(Formula)
-        end
-
-        it "returns a Formula from a fully qualified Alias path" do
-          expect(described_class.factory("#{tap.name}/#{alias_name}")).to be_a(Formula)
+        it "returns a Formula with the correct alias path from a bare or fully qualified Alias name" do
+          expect(described_class.factory(alias_name).alias_path).to eq(alias_path)
+          expect(described_class.factory("#{tap.name}/#{alias_name}").alias_path).to eq(alias_path)
         end
 
         it "raises an error when the Formula cannot be found" do
@@ -552,13 +689,17 @@ RSpec.describe Formulary do
         allow(Homebrew::API).to receive_messages(formula_names: [formula_name], formula_aliases: {},
                                                  formula_renames: {})
         allow(Homebrew::API::Internal).to receive(:formula_hashes) { Homebrew::API::Formula.all_formulae }
+        allow(Homebrew::API::Internal).to receive(:formula_hash) { |name| Homebrew::API::Formula.all_formulae[name] }
+        allow(Homebrew::API::Internal).to receive(:formula_name?) do |name|
+          Homebrew::API::Formula.all_formulae.key?(name)
+        end
         allow(Homebrew::API::Internal).to receive(:formula_struct) do |name|
           Homebrew::API::Formula::FormulaStructGenerator.generate_formula_struct_hash(
             Homebrew::API::Formula.all_formulae.fetch(name),
           )
         end
         allow(Homebrew::API::Internal).to receive(:formula_tap_git_head).and_return("")
-        allow(Homebrew::API::Formula).to receive_messages(all_aliases: {}, all_renames: {})
+        allow(Homebrew::API::Formula).to receive(:all_aliases).and_return({})
         allow(CoreTap.instance).to receive(:tap_migrations).and_return({})
         allow(CoreCaskTap.instance).to receive(:tap_migrations).and_return({})
 
@@ -615,20 +756,40 @@ RSpec.describe Formulary do
         expect(formula.loaded_from_internal_api?).to be true
       end
 
+      it "runs post-install steps loaded from the internal API without source Ruby" do
+        step = { "type" => "warn", "message" => "loaded from internal API" }
+        allow(Homebrew::API::Formula).to receive(:all_formulae)
+          .and_return formula_json_contents("post_install_steps" => [step])
+        expect(Homebrew::API::Formula).not_to receive(:source_download_formula)
+
+        formula = described_class.factory(formula_name)
+        runner = Homebrew::InstallSteps::Runner.new(context: formula)
+        expect(runner).to receive(:opoo).with("loaded from internal API")
+
+        runner.run(formula.post_install_steps)
+      end
+
       it "loads patches from API JSON" do
         allow(Homebrew::API::Formula).to receive(:all_formulae).and_return formula_json_contents(
           "patches" => [
             {
-              "strip"  => "p1",
-              "url"    => "https://example.com/test.patch",
-              "sha256" => TEST_SHA256,
+              "strip"    => "p1",
+              "url"      => "https://example.com/test.patch",
+              "sha256"   => TEST_SHA256,
+              "resolves" => [
+                { "type" => "security", "id" => "CVE-2024-1234" },
+                { "type" => "defect", "id" => "https://github.com/foo/bar/issues/1" },
+              ],
             },
           ],
         )
 
         formula = described_class.factory(formula_name)
 
-        expect(formula.patchlist.first).to be_a(ExternalPatch)
+        expect(formula.patchlist.first).to be_a(ExternalPatch).and have_attributes(resolves: [
+          "CVE-2024-1234",
+          "https://github.com/foo/bar/issues/1",
+        ])
       end
 
       it "returns a deprecated Formula when given a name" do
@@ -775,7 +936,7 @@ RSpec.describe Formulary do
 
       it "raises an error when given a bottle URL" do
         expect do
-          described_class.factory("https://brew.sh/foo-1.0.arm64_catalina.bottle.tar.gz")
+          described_class.factory("https://brew.sh/foo-1.0.arm64_big_sur.bottle.tar.gz")
         end.to raise_error(UnsupportedInstallationMethod)
       end
 
@@ -851,7 +1012,7 @@ RSpec.describe Formulary do
       RUBY
       rack_path.mkpath
 
-      with_env(HOMEBREW_REQUIRE_TAP_TRUST: "1", HOMEBREW_USER_CONFIG_HOME: mktmpdir) do
+      with_env(HOMEBREW_USER_CONFIG_HOME: mktmpdir) do
         expect(described_class.to_rack("#{tap.name}/#{formula_name}")).to eq(rack_path)
         expect(eval_marker).not_to exist
       end
@@ -866,9 +1027,26 @@ RSpec.describe Formulary do
       expect(described_class.core_path(name))
         .to eq(Pathname.new("#{HOMEBREW_LIBRARY}/Taps/homebrew/homebrew-core/Formula/#{name}.rb"))
     end
+
+    it "returns the sharded path directly for API-known formulae" do
+      ENV.delete("HOMEBREW_NO_INSTALL_FROM_API")
+      name = "foo-bar"
+      allow(Homebrew::API::Internal).to receive(:formula_hashes_cached?).and_return(true)
+      allow(Homebrew::API).to receive(:formula_name?).with(name).and_return(true)
+      expect(described_class.core_path(name))
+        .to eq(Pathname.new("#{HOMEBREW_LIBRARY}/Taps/homebrew/homebrew-core/Formula/f/#{name}.rb"))
+    end
   end
 
   describe "::loader_for" do
+    it "does not select formulae from the download cache by name" do
+      stub_const("HOMEBREW_CACHE_FORMULA", HOMEBREW_CACHE/"Formula")
+      HOMEBREW_CACHE_FORMULA.mkpath
+      (HOMEBREW_CACHE_FORMULA/"cached-only.rb").write("# cache data")
+
+      expect(described_class.loader_for("cached-only")).to be_a(described_class::NullLoader)
+    end
+
     context "when given a relative path with two slashes" do
       it "returns a `FromPathLoader`" do
         mktmpdir.cd do

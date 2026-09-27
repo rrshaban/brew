@@ -8,7 +8,7 @@ RSpec.describe Language::Node do
 
   describe "#setup_npm_environment" do
     before do
-      described_class.instance_variable_set(:@env_set, false)
+      described_class.env_set = false
     end
 
     it "calls prepend_path when node formula exists only during the first call" do
@@ -22,7 +22,7 @@ RSpec.describe Language::Node do
       end
       described_class.setup_npm_environment
 
-      expect(described_class.instance_variable_get(:@env_set)).to be(true)
+      expect(described_class.env_set).to be(true)
       without_partial_double_verification do
         expect(ENV).not_to receive(:prepend_path)
       end
@@ -43,7 +43,8 @@ RSpec.describe Language::Node do
       mktmpdir.cd do
         path = Pathname("package.json")
         path.atomic_write("{\"scripts\":{\"prepare\": \"ls\", \"prepack\": \"ls\", \"test\": \"ls\"}}")
-        allow(Utils).to receive(:popen_read).with(*npm_pack_cmd).and_return(`echo pack.tgz`)
+        system "true"
+        allow(Utils).to receive(:popen_read).with(*npm_pack_cmd).and_return("pack.tgz\n")
         described_class.pack_for_installation
         expect(path.read).not_to include("prepare")
         expect(path.read).not_to include("prepack")
@@ -60,17 +61,20 @@ RSpec.describe Language::Node do
     end
 
     it "raises error with non zero exitstatus" do
-      allow(Utils).to receive(:popen_read).with(*npm_pack_cmd).and_return(`false`)
+      system "false"
+      allow(Utils).to receive(:popen_read).with(*npm_pack_cmd).and_return("")
       expect { described_class.std_npm_install_args(npm_install_arg) }.to raise_error("npm failed to pack #{Dir.pwd}")
     end
 
     it "raises error with empty npm pack output" do
-      allow(Utils).to receive(:popen_read).with(*npm_pack_cmd).and_return(`true`)
+      system "true"
+      allow(Utils).to receive(:popen_read).with(*npm_pack_cmd).and_return("")
       expect { described_class.std_npm_install_args(npm_install_arg) }.to raise_error("npm failed to pack #{Dir.pwd}")
     end
 
     it "does not raise error with a zero exitstatus" do
-      allow(Utils).to receive(:popen_read).with(*npm_pack_cmd).and_return(`echo pack.tgz`)
+      system "true"
+      allow(Utils).to receive(:popen_read).with(*npm_pack_cmd).and_return("pack.tgz\n")
       resp = described_class.std_npm_install_args(npm_install_arg)
       expect(resp).to include("--min-release-age=1", "--prefix=#{npm_install_arg}", "#{Dir.pwd}/pack.tgz")
     end

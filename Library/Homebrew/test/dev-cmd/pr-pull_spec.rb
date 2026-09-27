@@ -1,6 +1,8 @@
 # typed: true
 # frozen_string_literal: true
 
+require "system_command"
+
 require "dev-cmd/pr-pull"
 require "utils/git"
 require "tap"
@@ -85,6 +87,12 @@ RSpec.describe Homebrew::DevCmd::PrPull do
 
   it_behaves_like "parseable arguments"
 
+  it "loads the cask loader itself" do
+    script = 'require "global"; require "dev-cmd/pr-pull"; print Cask::CaskLoader.name'
+    expect(Utils.popen_read(RUBY_PATH, "-I", HOMEBREW_LIBRARY_PATH.to_s, "-e", script, err: :out))
+      .to eq("Cask::CaskLoader")
+  end
+
   describe "#check_pull_request_head_sha!" do
     it "outputs the pull request head SHA" do
       allow(GitHub).to receive(:pull_request_commits).with("Homebrew", "foo", "1").and_return(["actual"])
@@ -95,20 +103,63 @@ RSpec.describe Homebrew::DevCmd::PrPull do
     end
   end
 
+  describe "#run" do
+    let(:third_party_tap) { Tap.fetch("someone", "foo") }
+
+    after { FileUtils.rm_rf(third_party_tap.path.parent) }
+
+    it "reports an invalid changed formula in a third-party tap" do
+      third_party_formula = third_party_tap.formula_dir/"foo.rb"
+      third_party_formula.dirname.mkpath
+      third_party_formula.write(formula)
+
+      cd third_party_tap.path do
+        SystemCommand.safe_system Utils::Git.git, "init"
+        SystemCommand.safe_system Utils::Git.git, "add", third_party_formula
+        SystemCommand.safe_system Utils::Git.git, "commit", "-m", "foo 1.0 (new formula)"
+        original_hash = Utils.safe_popen_read("git", "rev-parse", "HEAD").chomp
+        third_party_formula.write <<~RUBY
+          class Foo < Formula
+            url "https://brew.sh/foo-2.0.tgz"
+            no_autobump! because: "some reason"
+          end
+        RUBY
+        SystemCommand.safe_system Utils::Git.git, "commit", third_party_formula, "-m", "foo 2.0"
+        Formulary.clear_cache
+
+        allow(Homebrew::Trust).to receive(:trusted_tap?).with(third_party_tap).and_return(true)
+        allow(Tap).to receive(:from_path).and_return(third_party_tap)
+        allow(Utils::Git).to receive(:set_name_email!)
+        allow(Utils::Git).to receive(:setup_gpg!)
+        allow(GitHub).to receive_messages(pull_request_labels: [], issues: [], get_workflow_run: [],
+                                          get_artifact_urls: [])
+        ENV["GITHUB_SHA"] = original_hash
+
+        expect do
+          described_class.new([
+            "1", "--tap=#{third_party_tap.name}", "--head-sha=#{third_party_tap.git_head}",
+            "--no-commit", "--no-upload"
+          ]).run
+        end.to raise_error(TapFormulaUnreadableError, /no_autobump! can only be used in official Homebrew taps/)
+      end
+    end
+  end
+
   describe "#autosquash!" do
     it "squashes a formula or cask correctly" do
       secondary_author = "Someone Else <me@example.com>"
       (tap.path/"Formula").mkpath
       formula_file.write(formula)
       cd tap.path do
-        safe_system Utils::Git.git, "init"
-        safe_system Utils::Git.git, "add", formula_file
-        safe_system Utils::Git.git, "commit", "-m", "foo 1.0 (new formula)"
-        original_hash = `git rev-parse HEAD`.chomp
+        SystemCommand.safe_system Utils::Git.git, "init"
+        SystemCommand.safe_system Utils::Git.git, "add", formula_file
+        SystemCommand.safe_system Utils::Git.git, "commit", "-m", "foo 1.0 (new formula)"
+        original_hash = Utils.popen_read("git", "rev-parse", "HEAD", err: :err).chomp
         File.write(formula_file, formula_revision)
-        safe_system Utils::Git.git, "commit", formula_file, "-m", "revision"
+        SystemCommand.safe_system Utils::Git.git, "commit", formula_file, "-m", "revision"
         File.write(formula_file, formula_version)
-        safe_system Utils::Git.git, "commit", formula_file, "-m", "version", "--author=#{secondary_author}"
+        SystemCommand.safe_system Utils::Git.git, "commit", formula_file, "-m", "version",
+                                  "--author=#{secondary_author}"
         pr_pull.autosquash!(original_hash, tap:)
         expect(tap.git_repository.commit_message).to include("foo 2.0")
         expect(tap.git_repository.commit_message).to include("Co-authored-by: #{secondary_author}")
@@ -117,13 +168,13 @@ RSpec.describe Homebrew::DevCmd::PrPull do
       (path/"Casks").mkpath
       cask_file.write(cask)
       cd path do
-        safe_system Utils::Git.git, "add", cask_file
-        safe_system Utils::Git.git, "commit", "-m", "food 1.0 (new cask)"
-        original_hash = `git rev-parse HEAD`.chomp
+        SystemCommand.safe_system Utils::Git.git, "add", cask_file
+        SystemCommand.safe_system Utils::Git.git, "commit", "-m", "food 1.0 (new cask)"
+        original_hash = Utils.popen_read("git", "rev-parse", "HEAD", err: :err).chomp
         File.write(cask_file, cask_rebuild)
-        safe_system Utils::Git.git, "commit", cask_file, "-m", "rebuild"
+        SystemCommand.safe_system Utils::Git.git, "commit", cask_file, "-m", "rebuild"
         File.write(cask_file, cask_version)
-        safe_system Utils::Git.git, "commit", cask_file, "-m", "version", "--author=#{secondary_author}"
+        SystemCommand.safe_system Utils::Git.git, "commit", cask_file, "-m", "version", "--author=#{secondary_author}"
         pr_pull.autosquash!(original_hash, tap:)
         git_repo = GitRepository.new(path)
         expect(git_repo.commit_message).to include("food 2.0")
@@ -136,17 +187,17 @@ RSpec.describe Homebrew::DevCmd::PrPull do
         (tap.path/"Formula").mkpath
         formula_file.write(formula)
         cd(tap.path) do
-          safe_system Utils::Git.git, "init"
-          safe_system Utils::Git.git, "add", formula_file
-          safe_system Utils::Git.git, "commit", "-m", "foo 1.0 (new formula)"
-          `git rev-parse HEAD`.chomp
+          SystemCommand.safe_system Utils::Git.git, "init"
+          SystemCommand.safe_system Utils::Git.git, "add", formula_file
+          SystemCommand.safe_system Utils::Git.git, "commit", "-m", "foo 1.0 (new formula)"
+          Utils.popen_read("git", "rev-parse", "HEAD", err: :err).chomp
         end
       end
 
       before do
         cd tap.path do
           File.write(formula_file, formula_revision)
-          safe_system Utils::Git.git, "commit", formula_file, "-m", "revision"
+          SystemCommand.safe_system Utils::Git.git, "commit", formula_file, "-m", "revision"
         end
         allow(Utils::Git).to receive(:cherry_pick!).and_raise(
           ErrorDuringExecution.new(["git", "cherry-pick"], status: 1),
@@ -180,9 +231,9 @@ RSpec.describe Homebrew::DevCmd::PrPull do
       (tap.path/"Formula").mkpath
       formula_file.write(formula)
       cd tap.path do
-        safe_system Utils::Git.git, "init"
-        safe_system Utils::Git.git, "add", formula_file
-        safe_system Utils::Git.git, "commit", "-m", "foo 1.0 (new formula)"
+        SystemCommand.safe_system Utils::Git.git, "init"
+        SystemCommand.safe_system Utils::Git.git, "add", formula_file
+        SystemCommand.safe_system Utils::Git.git, "commit", "-m", "foo 1.0 (new formula)"
       end
       pr_pull.signoff!(tap.git_repository)
       expect(tap.git_repository.commit_message).to include("Signed-off-by:")
@@ -190,8 +241,8 @@ RSpec.describe Homebrew::DevCmd::PrPull do
       (path/"Casks").mkpath
       cask_file.write(cask)
       cd path do
-        safe_system Utils::Git.git, "add", cask_file
-        safe_system Utils::Git.git, "commit", "-m", "food 1.0 (new cask)"
+        SystemCommand.safe_system Utils::Git.git, "add", cask_file
+        SystemCommand.safe_system Utils::Git.git, "commit", "-m", "food 1.0 (new cask)"
       end
       pr_pull.signoff!(tap.git_repository)
       expect(tap.git_repository.commit_message).to include("Signed-off-by:")

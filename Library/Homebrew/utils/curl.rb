@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/output"
+
 require "open3"
 
 require "utils/timer"
@@ -24,9 +26,22 @@ module Utils
     # code that is >= 400.
     CURL_HTTP_RETURNED_ERROR_EXIT_CODE = 22
 
+    # Error returned when an operation took longer than the given timeout.
+    CURL_OPERATION_TIMEOUT_EXIT_CODE = 28
+
+    # Error returned when the server closed the connection without replying.
+    CURL_GOT_NOTHING_EXIT_CODE = 52
+
     # Error returned when curl gets an error from the lowest networking layers
     # that the receiving of data failed.
     CURL_RECV_ERROR_EXIT_CODE = 56
+
+    # Failures that can occur after the request has been sent.
+    CURL_REQUEST_SENT_EXIT_CODES = T.let([
+      CURL_OPERATION_TIMEOUT_EXIT_CODE,
+      CURL_GOT_NOTHING_EXIT_CODE,
+      CURL_RECV_ERROR_EXIT_CODE,
+    ].freeze, T::Array[Integer])
 
     # This regex is used to extract the part of an ETag within quotation marks,
     # ignoring any leading weak validator indicator (`W/`). This simplifies
@@ -44,12 +59,19 @@ module Utils
 
     HTTPS_REDIRECT_CURL_ARGS = ["--proto-redir", "=https"].freeze
 
+    # A `--progress-bar` percentage (e.g. "50.0%"); may belong to an earlier,
+    # unrelated request, so it's stripped rather than kept.
+    PROGRESS_BAR_REGEX = /\A#*\s*\d{1,3}\.\d%\s*/
+
     private_constant :CURL_WEIRD_SERVER_REPLY_EXIT_CODE,
                      :CURL_HTTP_RETURNED_ERROR_EXIT_CODE,
                      :CURL_RECV_ERROR_EXIT_CODE,
+                     :CURL_OPERATION_TIMEOUT_EXIT_CODE,
+                     :CURL_GOT_NOTHING_EXIT_CODE,
+                     :CURL_REQUEST_SENT_EXIT_CODES,
                      :ETAG_VALUE_REGEX, :HTTP_RESPONSE_BODY_SEPARATOR,
                      :HTTP_STATUS_LINE_REGEX,
-                     :HTTPS_REDIRECT_CURL_ARGS
+                     :HTTPS_REDIRECT_CURL_ARGS, :PROGRESS_BAR_REGEX
 
     module_function
 
@@ -258,7 +280,7 @@ module Utils
         return result unless out.include?("HTTP2")
 
         # The bug is fixed in `curl` >= 7.60.0.
-        curl_version = out[/curl (\d+(\.\d+)+)/, 1]
+        curl_version = out[/curl (\d+(?:\.\d+)+)/, 1]
         return result if Gem::Version.new(curl_version) >= Gem::Version.new("7.60.0")
 
         return curl_with_workarounds(*args, "--http1.1", **command_options, **options)
@@ -319,6 +341,12 @@ module Utils
       args = ["--remote-time", "--output", destination.to_s, *args]
 
       curl(*args, **options)
+    end
+
+    # Run after `Tty.collapse_carriage_returns`; a bar-only line becomes empty.
+    sig { params(string: String).returns(String) }
+    def strip_progress_bar(string)
+      string.split("\n", -1).map { |line| line.sub(PROGRESS_BAR_REGEX, "") }.join("\n")
     end
 
     sig { overridable.params(args: String, options: T.untyped).returns(SystemCommand::Result) }
@@ -447,16 +475,32 @@ module Utils
 
       details = T.let({}, T::Hash[Symbol, T.untyped])
       attempts = 0
+      # The body is only read to compare an HTTP URL with its HTTPS counterpart.
+      head_only = T.let(url == secure_url, T::Boolean)
       user_agents.each do |user_agent|
         loop do
           details = curl_http_content_headers_and_checksum(
             url,
             specs:,
             hash_needed:,
+            head_only:,
             use_homebrew_curl:,
             user_agent:,
             referer:,
           )
+
+          # Some servers reject `HEAD` but serve `GET`.
+          # DNS and connection failures happen before the request is sent.
+          head_rejected = if (status_code = details[:status_code])
+            !http_status_ok?(status_code)
+          else
+            CURL_REQUEST_SENT_EXIT_CODES.include?(details[:exit_status])
+          end
+
+          if head_only && head_rejected
+            head_only = false
+            next
+          end
 
           # Retry on network issues
           break if details[:exit_status] != 52 && details[:exit_status] != 56
@@ -475,6 +519,9 @@ module Utils
           url_protected_by_cloudflare?(response) || url_protected_by_incapsula?(response)
         end
 
+        # TODO: `utils/shared_audits` requires this file in turn.
+        require "utils/shared_audits"
+
         # https://github.com/Homebrew/brew/issues/13789
         # If the `:homepage` of a formula is private, it will fail an `audit`
         # since there's no way to specify a `strategy` with `using:` and
@@ -483,17 +530,15 @@ module Utils
         # Strategy:
         # If the `:homepage` 404s, it's a GitHub link and we have a token then
         # check the API (which does use tokens) for the repository
-        repo_details = url.match(%r{https?://github\.com/(?<user>[^/]+)/(?<repo>[^/]+)/?.*})
-        check_github_api = url_type == SharedAudits::URL_TYPE_HOMEPAGE &&
-                           details[:status_code] == "404" &&
-                           repo_details &&
-                           Homebrew::EnvConfig.github_api_token.present?
-
-        unless check_github_api
+        github_repo_regex = %r{https?://github\.com/(?<user>[^/]+)/(?<repo>[^/]+)/?.*}
+        user = url[github_repo_regex, :user]
+        repo = url[github_repo_regex, :repo]
+        if url_type != SharedAudits::URL_TYPE_HOMEPAGE || details[:status_code] != "404" ||
+           user.nil? || repo.nil? || Homebrew::EnvConfig.github_api_token.blank?
           return "The #{url_type} #{url} is not reachable (HTTP status code #{details[:status_code]})"
         end
 
-        if SharedAudits.github_repo_data(T.must(repo_details[:user]), T.must(repo_details[:repo])).nil?
+        if SharedAudits.github_repo_data(user, repo).nil?
           "Unable to find homepage"
         end
       end
@@ -551,13 +596,14 @@ module Utils
         url:               String,
         specs:             T::Hash[Symbol, String],
         hash_needed:       T::Boolean,
+        head_only:         T::Boolean,
         use_homebrew_curl: T::Boolean,
         user_agent:        T.any(String, Symbol),
         referer:           T.nilable(String),
       ).returns(T::Hash[Symbol, T.untyped])
     }
     def curl_http_content_headers_and_checksum(
-      url, specs: {}, hash_needed: false,
+      url, specs: {}, hash_needed: false, head_only: false,
       use_homebrew_curl: false, user_agent: :default, referer: nil
     )
       file = Tempfile.new.tap(&:close)
@@ -573,8 +619,14 @@ module Utils
       end
 
       max_time = hash_needed ? 600 : 25
+      # `--head` prints the headers itself, so `--dump-header` would duplicate them.
+      output_args = if head_only
+        ["--head"]
+      else
+        ["--dump-header", "-", "--output", file.path]
+      end
       output, _, status = curl_output(
-        *specs, "--dump-header", "-", "--output", file.path, "--location", url,
+        *specs, *output_args, "--location", url,
         use_homebrew_curl:,
         connect_timeout:   15,
         max_time:,
@@ -593,10 +645,11 @@ module Utils
       else
         {}
       end
-      etag = headers["etag"][ETAG_VALUE_REGEX, 1] if headers["etag"].present?
+      etag_header = Array(headers["etag"]).last
+      etag = etag_header[ETAG_VALUE_REGEX, 1] if etag_header.present?
       content_length = headers["content-length"]
 
-      if status.success? && (file_path = file.path)
+      if !head_only && status.success? && (file_path = file.path)
         file_hash = Digest::SHA256.file(file_path).hexdigest if hash_needed
 
         # Only load file contents for text-based content comparison on small files.
@@ -604,11 +657,7 @@ module Utils
         max_read_size = 100 * 1024 * 1024
         if File.size(file_path) <= max_read_size
           open_args = {}
-          content_type = headers["content-type"]
-
-          # Use the last `Content-Type` header if there is more than one instance
-          # in the response
-          content_type = content_type.last if content_type.is_a?(Array)
+          content_type = Array(headers["content-type"]).last
 
           # Try to get encoding from Content-Type header
           # TODO: add guessing encoding by <meta http-equiv="Content-Type" ...> tag
@@ -639,18 +688,17 @@ module Utils
         responses:,
       }
     ensure
-      T.must(file).unlink
+      file&.unlink
     end
 
     sig { returns(Version) }
     def curl_version
       @curl_version ||= T.let({}, T.nilable(T::Hash[String, Version]))
-      curl_v_stdout = curl_output("-V").stdout
-      version = curl_v_stdout[/curl (\d+(?:\.\d+)+)/, 1]
-      if version
-        @curl_version[curl_path] ||= Version.new(version)
-      else
-        odie("Failed to parse curl version from #{curl_v_stdout}")
+      @curl_version[curl_path] ||= begin
+        curl_v_stdout = curl_output("-V").stdout
+        version = curl_v_stdout[/curl (\d+(?:\.\d+)+)/, 1]
+        odie("Failed to parse curl version from #{curl_v_stdout}") if version.nil?
+        Version.new(version)
       end
     end
 
@@ -665,7 +713,7 @@ module Utils
     sig { returns(T::Boolean) }
     def curl_supports_tls13?
       @curl_supports_tls13 ||= T.let(Hash.new do |h, key|
-        h[key] = quiet_system(curl_executable, "--tlsv1.3", "--head", "https://brew.sh/")
+        h[key] = SystemCommand.quiet_system(curl_executable, "--tlsv1.3", "--head", "https://brew.sh/")
       end, T.nilable(T::Hash[T.any(Pathname, String), T::Boolean]))
       @curl_supports_tls13[curl_path]
     end
@@ -731,7 +779,7 @@ module Utils
       responses.reverse_each do |response|
         next if response[:headers].blank?
 
-        location = response[:headers]["location"]
+        location = Array(response[:headers]["location"]).last
         next if location.blank?
 
         absolute_url = URI.join(base_url, location).to_s if absolutize && base_url.present?
@@ -756,7 +804,7 @@ module Utils
       responses.each do |response|
         next if response[:headers].blank?
 
-        location = response[:headers]["location"]
+        location = Array(response[:headers]["location"]).last
         next if location.blank?
 
         base_url = URI.join(base_url, location).to_s
@@ -764,8 +812,6 @@ module Utils
 
       base_url
     end
-
-    private
 
     # Parses HTTP response text from `curl` output into a hash containing the
     # information from the status line (status code and, optionally,
@@ -782,7 +828,7 @@ module Utils
       # Parse the status line and remove it
       response[:status_code] = match["code"]
       response[:status_text] = match["text"] if match["text"].present?
-      response_text = response_text.sub(%r{^HTTP/.* (\d+).*$\s*}, "")
+      response_text = response_text.sub(%r{^HTTP/.* \d+.*$\s*}, "")
 
       # Create a hash from the header lines
       response[:headers] = {}

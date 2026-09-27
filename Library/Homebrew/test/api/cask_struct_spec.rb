@@ -16,9 +16,9 @@ RSpec.describe Homebrew::API::CaskStruct do
         "auto_updates"         => true,
         "languages"            => ["en"],
         "url_args"             => ["https://example.com/file.dmg"],
-        "url_kwargs"           => { verified: "example.com/" },
+        "url_kwargs"           => { user_agent: ":fake" },
         "conflicts_with_args"  => { cask: ["other-cask"] },
-        "depends_on_args"      => { macos: ">= :catalina" },
+        "depends_on_args"      => { macos: ">= :big_sur" },
         "container_args"       => { type: :zip },
         "deprecate_args"       => { date: "2025-01-01", because: :discontinued },
         "raw_artifacts"        => [[:app, ["Test.app"], {}, nil]],
@@ -58,8 +58,8 @@ RSpec.describe Homebrew::API::CaskStruct do
       )
 
       Homebrew::API::CaskStruct::PREDICATES.each do |predicate|
-        expect(struct.send(:"#{predicate}?")).to be(false),
-                                                 "expected #{predicate}? to default to false"
+        expect(struct.public_send(:"#{predicate}?")).to be(false),
+                                                        "expected #{predicate}? to default to false"
       end
     end
 
@@ -76,8 +76,8 @@ RSpec.describe Homebrew::API::CaskStruct do
       )
 
       Homebrew::API::CaskStruct::PREDICATES.each do |predicate|
-        expect(struct.send(:"#{predicate}?")).to be(true),
-                                                 "expected #{predicate}? to be true"
+        expect(struct.public_send(:"#{predicate}?")).to be(true),
+                                                        "expected #{predicate}? to be true"
       end
     end
   end
@@ -122,6 +122,39 @@ RSpec.describe Homebrew::API::CaskStruct do
     end
   end
 
+  describe "#localise" do
+    it "selects matching locale groups and falls back to the default" do
+      struct = described_class.new(
+        sha256:              "english",
+        version:             "1.0.0",
+        url_args:            ["https://example.com/en.dmg"],
+        language_variations: [
+          {
+            languages: ["zh", "CN"],
+            value:     "zh-CN",
+            overrides: {
+              "sha256"   => "chinese",
+              "url_args" => ["https://example.com/zh.dmg"],
+              "names"    => [":Chinese"],
+            },
+          },
+          { languages: ["en"], default: true, value: "en-US", overrides: {} },
+        ],
+      )
+
+      chinese = struct.localise(["zh-Hans-CN"])
+      default = struct.localise(["fr"])
+
+      expect([
+        [chinese.sha256, chinese.url_args, chinese.names, struct.language(["zh-Hans-CN"])],
+        [default.sha256, default.url_args, struct.language(["fr"])],
+      ]).to eq([
+        ["chinese", ["https://example.com/zh.dmg"], [":Chinese"], "zh-CN"],
+        ["english", ["https://example.com/en.dmg"], "en-US"],
+      ])
+    end
+  end
+
   specify "#serialize_artifact_args", :aggregate_failures do
     struct = described_class.new(
       sha256:               "abc123",
@@ -158,6 +191,30 @@ RSpec.describe Homebrew::API::CaskStruct do
           ["Test.pkg"],
           { ":choices" => [{ ":choiceIdentifier" => "choice1", ":choiceAttribute" => "selected",
                              ":attributeSetting" => 0 }] },
+        ],
+      ])
+  end
+
+  it "preserves false values in serialized artifact arguments" do
+    struct = described_class.new(
+      sha256:               "abc123",
+      version:              "1.0.0",
+      ruby_source_checksum: { sha256: "def456" },
+      raw_artifacts:        [
+        [
+          :uninstall,
+          [],
+          { script: { executable: "/usr/bin/pkill", must_succeed: false } },
+          nil,
+        ],
+      ],
+    )
+
+    expect(struct.serialize.fetch("raw_artifacts"))
+      .to eq([
+        [
+          ":uninstall",
+          { ":script" => { ":executable" => "/usr/bin/pkill", ":must_succeed" => false } },
         ],
       ])
   end
@@ -199,7 +256,7 @@ RSpec.describe Homebrew::API::CaskStruct do
       struct = described_class.deserialize(hash)
 
       Homebrew::API::CaskStruct::PREDICATES.each do |predicate|
-        expect(struct.send(:"#{predicate}?")).to be false
+        expect(struct.public_send(:"#{predicate}?")).to be false
       end
     end
 
@@ -209,7 +266,7 @@ RSpec.describe Homebrew::API::CaskStruct do
         "raw_caveats"          => "Some caveats",
         "conflicts_with_args"  => { cask: ["other-cask"] },
         "container_args"       => { type: :zip },
-        "depends_on_args"      => { macos: ">= :catalina" },
+        "depends_on_args"      => { macos: ">= :big_sur" },
         "deprecate_args"       => { date: "2025-01-01", because: :unmaintained },
         "desc"                 => "A description",
         "disable_args"         => { date: "2025-01-01", because: :unmaintained },
@@ -222,7 +279,7 @@ RSpec.describe Homebrew::API::CaskStruct do
       struct = described_class.deserialize(hash)
 
       Homebrew::API::CaskStruct::PREDICATES.each do |predicate|
-        expect(struct.send(:"#{predicate}?")).to be true
+        expect(struct.public_send(:"#{predicate}?")).to be true
       end
     end
   end
@@ -233,7 +290,7 @@ RSpec.describe Homebrew::API::CaskStruct do
         auto_updates:         true,
         conflicts_with_args:  { cask: ["other-cask"] },
         container_args:       { nested: nil, type: :zip },
-        depends_on_args:      { macos: ">= :catalina" },
+        depends_on_args:      { macos: ">= :big_sur" },
         deprecate_args:       { date: "2025-01-01", because: :unmaintained },
         desc:                 "A description",
         disable_args:         { date: "2025-01-01", because: :unmaintained },
@@ -248,7 +305,7 @@ RSpec.describe Homebrew::API::CaskStruct do
         sha256:               "abc123",
         tap_string:           "homebrew/cask",
         url_args:             ["https://example.com/file.dmg"],
-        url_kwargs:           { verified: "example.com/" },
+        url_kwargs:           { user_agent: ":fake" },
         version:              "1.0.0",
       )
 

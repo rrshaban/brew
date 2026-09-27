@@ -4,27 +4,22 @@
 if ENV["HOMEBREW_TESTS_COVERAGE"]
   require "simplecov"
   require "simplecov-cobertura"
+  SimpleCov.start
+  require_relative "support/helper/integration_coverage"
+  Homebrew::TestIntegrationCoverage.prepare!
 
   formatters = [
     SimpleCov::Formatter::HTMLFormatter,
     SimpleCov::Formatter::CoberturaFormatter,
   ]
   SimpleCov.formatters = SimpleCov::Formatter::MultiFormatter.new(formatters)
-
-  # Needed for outputting coverage reporting only once for parallel_tests.
-  # Otherwise, "Coverage report generated" will get spammed for each process.
-  if ENV["TEST_ENV_NUMBER"]
-    SimpleCov.at_exit do
-      result = SimpleCov.result
-      # `SimpleCov.result` calls `ParallelTests.wait_for_other_processes_to_finish`
-      # internally for you on the last process.
-      result.format! if ParallelTests.last_process?
-    end
-  end
 end
 
 require_relative "../standalone"
 require_relative "../warnings"
+
+Warnings.fail_on(/circular require considered harmful/)
+Warnings.ignore(/CGI library is removed from Ruby 4\.0\./) { require "cgi" }
 
 require "test-prof"
 
@@ -41,19 +36,24 @@ require "timeout"
 
 $LOAD_PATH.unshift(File.expand_path("#{ENV.fetch("HOMEBREW_LIBRARY")}/Homebrew/test/support/lib"))
 
-require_relative "support/extend/cachable"
+require_relative "support/extend/cacheable"
 
 require_relative "../global"
+
+require "system_command"
+require "sandbox"
 
 require "debug" if ENV["HOMEBREW_DEBUG"]
 
 require "test/support/quiet_progress_formatter"
+require "test/support/helper/api_hashable"
 require "test/support/helper/cask"
 require "test/support/helper/files"
 require "test/support/helper/fixtures"
 require "test/support/helper/formula"
 require "test/support/helper/mktmpdir"
 require "test/support/helper/subcommand"
+require "test/support/helper/test_each"
 
 require "test/support/helper/spec/shared_context/homebrew_cask" if OS.mac?
 require "test/support/helper/spec/shared_context/integration_test"
@@ -72,6 +72,28 @@ TEST_DIRECTORIES = [
   HOMEBREW_TEMP_CELLAR,
   HOMEBREW_ALIASES,
 ].freeze
+
+module Test
+  module Helper
+    module Dependencies
+      extend T::Helpers
+
+      requires_ancestor { RSpec::Core::Pending }
+
+      # Skip missing tools locally, but fail on CI so runner dependency
+      # regressions cannot silently reduce coverage. `brew test-bot`'s
+      # portable-ruby validation runs this suite in homebrew-core build
+      # containers that intentionally lack some tools, so skip there too.
+      def ensure_test_dependency!(available, message)
+        return if available
+
+        raise message if ENV["CI"] && !ENV["HOMEBREW_TEST_BOT"]
+
+        skip message
+      end
+    end
+  end
+end
 
 # Make `instance_double` and `class_double`
 # work when type-checking is active.
@@ -150,6 +172,9 @@ RSpec.configure do |config|
   config.include(Test::Helper::Formula)
   config.include(Test::Helper::MkTmpDir)
   config.include(Test::Helper::Subcommand)
+  config.include(Test::Helper::Dependencies)
+
+  config.extend(Test::Helper::TestEach)
 
   # Enable aggregate failures by default
   config.define_derived_metadata do |metadata|
@@ -169,11 +194,15 @@ RSpec.configure do |config|
   end
 
   config.before(:each, :needs_java) do
-    skip "Java is not installed." unless which("java")
+    ensure_test_dependency!(which("java"), "Java is not installed.")
+  end
+
+  config.before(:each, :needs_jq) do
+    ensure_test_dependency!(which("jq"), "jq is not installed.")
   end
 
   config.before(:each, :needs_python) do
-    skip "Python is not installed." if !which("python3") && !which("python")
+    ensure_test_dependency!(which("python3") || which("python"), "Python is not installed.")
   end
 
   config.before(:each, :needs_network) do
@@ -182,15 +211,15 @@ RSpec.configure do |config|
 
   config.before(:each, :needs_homebrew_core) do
     core_tap_path = "#{ENV.fetch("HOMEBREW_LIBRARY")}/Taps/homebrew/homebrew-core"
-    skip "Requires homebrew/core to be tapped." unless Dir.exist?(core_tap_path)
+    ensure_test_dependency!(Dir.exist?(core_tap_path), "Requires homebrew/core to be tapped.")
   end
 
   config.before(:each, :needs_systemd) do
-    skip "No SystemD found." unless which("systemctl")
+    ensure_test_dependency!(which("systemctl"), "No SystemD found.")
   end
 
   config.before(:each, :needs_daemon_manager) do
-    skip "No LaunchCTL or SystemD found." if !which("systemctl") && !which("launchctl")
+    ensure_test_dependency!(which("systemctl") || which("launchctl"), "No LaunchCTL or SystemD found.")
   end
 
   config.before do |example|
@@ -200,6 +229,13 @@ RSpec.configure do |config|
     allow(Utils::Curl).to receive(:curl_executable).and_raise(<<~ERROR)
       Unexpected call to Utils::Curl.curl_executable without setting :needs_network or :needs_utils_curl.
     ERROR
+  end
+
+  config.before do
+    allow(Utils).to receive(:sleep)
+    allow(DevelopmentTools).to receive_messages(needs_build_formulae?: false, needs_libc_formula?: false)
+    # Worker boundaries are exercised separately in sandbox_operation_spec.rb.
+    allow(Sandbox).to receive(:isolate_operation?).and_return(false)
   end
 
   config.before(:each, :no_api) do
@@ -216,7 +252,7 @@ RSpec.configure do |config|
   end
 
   config.before(:each, :needs_svn) do
-    skip svn_client_skip_reason if svn_client_skip_reason
+    ensure_test_dependency!(false, svn_client_skip_reason) if svn_client_skip_reason
     if svn_client_path_dirs
       ENV["PATH"] = PATH.new(ENV.fetch("PATH")).append(svn_client_path_dirs)
       next
@@ -224,15 +260,10 @@ RSpec.configure do |config|
 
     svn_paths = PATH.new(ENV.fetch("PATH"))
 
-    if OS.mac?
-      xcrun_svn = Utils.popen_read("xcrun", "-f", "svn")
-      svn_paths.append(File.dirname(xcrun_svn)) if $CHILD_STATUS.success? && xcrun_svn.present?
-    end
-
     svn_shim = HOMEBREW_SHIMS_PATH/"shared/svn"
-    unless quiet_system svn_shim, "--version"
+    unless SystemCommand.quiet_system svn_shim, "--version"
       svn_client_skip_reason = "Subversion is not installed."
-      skip svn_client_skip_reason
+      ensure_test_dependency!(false, svn_client_skip_reason)
     end
 
     svn_shim_path = Pathname(Utils.popen_read(svn_shim, "--homebrew=print-path").chomp.presence)
@@ -241,7 +272,7 @@ RSpec.configure do |config|
     svn = which("svn", svn_paths)
     unless svn
       svn_client_skip_reason = "svn is not installed."
-      skip svn_client_skip_reason
+      ensure_test_dependency!(false, svn_client_skip_reason)
     end
 
     svn_client_path_dirs = [svn.dirname]
@@ -249,7 +280,7 @@ RSpec.configure do |config|
   end
 
   config.before(:each, :needs_svnadmin) do
-    skip svn_skip_reason if svn_skip_reason
+    ensure_test_dependency!(false, svn_skip_reason) if svn_skip_reason
     if svn_path_dirs
       ENV["PATH"] = PATH.new(ENV.fetch("PATH")).append(svn_path_dirs)
       next
@@ -258,7 +289,7 @@ RSpec.configure do |config|
     svnadmin = which("svnadmin")
     unless svnadmin
       svn_skip_reason = "svnadmin is not installed."
-      skip svn_skip_reason
+      ensure_test_dependency!(false, svn_skip_reason)
     end
 
     svn_path_dirs = [svnadmin.dirname]
@@ -267,23 +298,24 @@ RSpec.configure do |config|
 
   config.before(:each, :needs_homebrew_curl) do
     ENV["HOMEBREW_CURL"] = HOMEBREW_BREWED_CURL_PATH
-    skip "A `curl` with TLS 1.3 support is required." unless Utils::Curl.curl_supports_tls13?
+    ensure_test_dependency!(Utils::Curl.curl_supports_tls13?, "A `curl` with TLS 1.3 support is required.")
   rescue FormulaUnavailableError
-    skip "No `curl` formula is available."
+    ensure_test_dependency!(false, "No `curl` formula is available.")
   end
 
   config.before(:each, :needs_unzip) do
-    skip "Unzip is not installed." unless which("unzip")
+    ensure_test_dependency!(which("unzip"), "Unzip is not installed.")
   end
 
   config.around do |example|
     Homebrew.raise_deprecation_exceptions = true
+    Homebrew.auditing = false
 
     Tap.installed.each(&:clear_cache)
-    Cachable::Registry.clear_all_caches
-    FormulaInstaller.clear_attempted
-    FormulaInstaller.clear_installed
-    FormulaInstaller.clear_fetched
+    Cacheable::Registry.clear_all_caches
+    FormulaInstaller.attempted.clear
+    FormulaInstaller.installed.clear
+    FormulaInstaller.fetched.clear
     Utils::Curl.clear_path_cache
 
     TEST_DIRECTORIES.each(&:mkpath)
@@ -333,8 +365,6 @@ RSpec.configure do |config|
     if package_path
       [:generic, :linux, :macos, *MacOSVersion::SYMBOLS.keys].product([:arm, :intel]).each do |system, arch|
         tag = Utils::Bottles::Tag.new(system:, arch:)
-        next unless tag.valid_combination?
-
         target = target_api_internal_cache/"packages.#{tag}.jws.json"
         FileUtils.ln package_path, target unless target.exist?
       end
@@ -364,6 +394,10 @@ RSpec.configure do |config|
       ENV.replace(@__env)
       Homebrew::SimulateSystem.clear
       Context.current = Context::ContextStruct.new
+      # Shut down and drop any memoized download queue so an example that
+      # stubbed `DownloadQueue.new` cannot leak a double into later examples
+      # or the `at_exit` shutdown hook.
+      Homebrew::DownloadQueue.reset_default if defined?(Homebrew::DownloadQueue)
 
       $stdout.reopen(@__stdout)
       $stderr.reopen(@__stderr)
@@ -373,7 +407,7 @@ RSpec.configure do |config|
       @__stdin.close
 
       Tap.all.each(&:clear_cache)
-      Cachable::Registry.clear_all_caches
+      Cacheable::Registry.clear_all_caches
 
       # Refuse to clean a config home outside the sandboxed `HOME`, else this deletes the user's
       # real `~/.homebrew/trust.json`; canonicalise first so `..`/symlinks can't slip past.
@@ -392,6 +426,7 @@ RSpec.configure do |config|
         HOMEBREW_PINNED_CASKS,
         user_config_home/"trust.json",
         HOMEBREW_PREFIX/"Caskroom",
+        HOMEBREW_PREFIX/"var/homebrew/sandbox",
         HOMEBREW_PREFIX/"Frameworks",
         HOMEBREW_LIBRARY/"Taps/homebrew/homebrew-cask",
         HOMEBREW_LIBRARY/"Taps/homebrew/homebrew-bar",

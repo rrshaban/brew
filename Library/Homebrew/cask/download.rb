@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/interrupts"
+
 require "downloadable"
 require "fileutils"
 require "unpack_strategy"
@@ -8,6 +10,7 @@ require "cask/cache"
 require "cask/caskroom"
 require "cask/quarantine"
 require "cask/utils"
+require "utils/path"
 
 module Cask
   # A download corresponding to a {Cask}.
@@ -22,15 +25,13 @@ module Cask
     sig {
       params(
         cask:        ::Cask::Cask,
-        quarantine:  T.nilable(T::Boolean),
         require_sha: T::Boolean,
       ).void
     }
-    def initialize(cask, quarantine: nil, require_sha: false)
+    def initialize(cask, require_sha: false)
       super()
 
       @cask = cask
-      @quarantine = quarantine
       @require_sha = require_sha
     end
 
@@ -61,7 +62,8 @@ module Cask
         .returns(Pathname)
     }
     def fetch(quiet: nil, verify_download_integrity: true, timeout: nil)
-      verify_has_sha if @require_sha
+      verify_has_sha if @require_sha ||
+                        (@cask.sha256.nil? && (@cask.on_system_blocks_exist? || @cask.loaded_from_api?))
       downloader.quiet! if quiet
 
       begin
@@ -124,9 +126,6 @@ module Cask
         container.extract_nestedly(to:, basename:, verbose:)
       end
 
-      return unless @quarantine
-      return unless Quarantine.available?
-
       Quarantine.propagate(from: container.path, to:)
     end
 
@@ -142,7 +141,7 @@ module Cask
       end
     end
 
-    sig { returns(Pathname) }
+    sig { override.returns(Pathname) }
     def staged_path_from_download_queue
       HOMEBREW_PREFIX/"var/homebrew/tmp/.caskroom"/cask.staged_path.relative_path_from(Caskroom.path)
     end
@@ -160,8 +159,8 @@ module Cask
       staged_path = staged_path_from_download_queue
       Utils.gain_permissions_remove(staged_path, command:) if staged_path.exist?
 
-      staged_path.parent.rmdir_if_possible
-      staged_path.parent.parent.rmdir_if_possible
+      ::Utils::Path.rmdir_if_possible(staged_path.parent)
+      ::Utils::Path.rmdir_if_possible(staged_path.parent.parent)
     end
 
     sig { override.params(download: Pathname, pour: T::Boolean).returns(T::Boolean) }
@@ -199,7 +198,7 @@ module Cask
       FileUtils.ln_s(staged_path_from_download_queue, staged_path_from_download_queue_marker)
     # Catch any exception type here to clean up partial queued extractions.
     rescue Exception # rubocop:disable Lint/RescueException
-      ignore_interrupts do
+      ::Utils::Interrupts.ignore do
         purge_staged_from_download_queue
       end
       raise
@@ -229,11 +228,21 @@ module Cask
     sig { override.returns(String) }
     def download_queue_type = "Cask"
 
+    sig { override.returns(String) }
+    def download_name = cask.token
+
     private
 
     sig { void }
     def verify_has_sha
-      return if @cask.sha256 != :no_check
+      return if @cask.sha256.is_a?(Checksum)
+
+      unless @require_sha
+        raise CaskError, <<~EOS
+          Cask '#{@cask}' does not have a sha256 checksum defined for this platform.
+          Add an appropriate `depends_on` stanza if the cask does not support this platform.
+        EOS
+      end
 
       raise CaskError, <<~EOS
         Cask '#{@cask}' does not have a sha256 checksum defined.
@@ -243,14 +252,7 @@ module Cask
 
     sig { params(path: Pathname).void }
     def quarantine(path)
-      return if @quarantine.nil?
-      return unless Quarantine.available?
-
-      if @quarantine
-        Quarantine.cask!(cask: @cask, download_path: path)
-      else
-        Quarantine.release!(download_path: path)
-      end
+      Quarantine.cask!(cask: @cask, download_path: path)
     end
 
     sig { returns(T::Boolean) }
@@ -280,8 +282,5 @@ module Cask
     def cache
       Cache.path
     end
-
-    sig { override.returns(String) }
-    def download_name = cask.token
   end
 end

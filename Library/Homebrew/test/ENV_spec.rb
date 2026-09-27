@@ -46,13 +46,14 @@ RSpec.describe "ENV" do
       end
 
       it "does not mutate the interface" do
-        expected = subject.methods
+        # Lazy-loaded gems may add methods to Hash without extending this object.
+        expected = subject.singleton_methods
 
         subject.with_build_environment do
-          expect(subject.methods).to eq(expected)
+          expect(subject.singleton_methods).to eq(expected)
         end
 
-        expect(subject.methods).to eq(expected)
+        expect(subject.singleton_methods).to eq(expected)
       end
     end
 
@@ -242,6 +243,15 @@ RSpec.describe "ENV" do
 
   describe Stdenv do
     include_examples EnvActivation
+
+    describe "#libxml2" do
+      it "is deprecated" do
+        expect(env).to receive(:odeprecated)
+          .with("ENV.libxml2", "`pkg-config` or explicit include paths")
+
+        env.libxml2
+      end
+    end
   end
 
   describe Superenv do

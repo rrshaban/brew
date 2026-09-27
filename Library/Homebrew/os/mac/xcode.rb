@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/output"
+
 module OS
   module Mac
     # Helper module for querying Xcode information.
@@ -17,12 +19,13 @@ module OS
       def self.latest_version(macos: MacOS.version)
         macos = macos.strip_patch
         case macos
-        when "26", "15" then "26.3"
+        when "27" then "27.0"
+        when "26" then "26.6"
+        when "15" then "26.3"
         when "14" then "16.2"
         when "13" then "15.2"
         when "12" then "14.2"
         when "11" then "13.2.1"
-        when "10.15" then "12.4"
         else
           raise "macOS '#{macos}' is invalid" unless macos.prerelease?
 
@@ -44,7 +47,6 @@ module OS
         when "13" then "14.1"
         when "12" then "13.1"
         when "11" then "12.2"
-        when "10.15" then "11.0"
         else
           "#{macos}.0"
         end
@@ -183,10 +185,11 @@ module OS
         # if return is used in the middle, which we do many times in here.
         return if !MacOS::Xcode.installed? && !MacOS::CLT.installed?
 
-        if MacOS::Xcode.installed?
+        if (xcode_prefix = prefix)
           # Fast path that will probably almost always work unless `xcode-select -p` is misconfigured
-          version_plist = T.must(prefix).parent/"version.plist"
+          version_plist = xcode_prefix.parent/"version.plist"
           if version_plist.file?
+            require "plist"
             data = Plist.parse_xml(version_plist, marshal: false)
             version = data["CFBundleShortVersionString"] if data
             return version if version
@@ -201,7 +204,7 @@ module OS
             xcodebuild_output = Utils.popen_read(xcodebuild_path, "-version")
             next unless $CHILD_STATUS.success?
 
-            xcode_version = xcodebuild_output[/Xcode (\d+(\.\d+)*)/, 1]
+            xcode_version = xcodebuild_output[/Xcode (\d+(?:\.\d+)*)/, 1]
             return xcode_version if xcode_version
           end
         end
@@ -228,7 +231,8 @@ module OS
         when "14.0.3" then "14.3.1"
         when "15.0.0" then "15.4"
         when "16.0.0" then "16.2"
-        else               "26.3"
+        when "17.0.0" then "26.3"
+        else               "27.0"
         end
       end
 
@@ -296,8 +300,6 @@ module OS
 
       sig { returns(String) }
       def self.update_instructions
-        return installation_instructions if OS::Mac.version.prerelease?
-
         software_update_location = if MacOS.version >= "13"
           "System Settings"
         else
@@ -324,13 +326,13 @@ module OS
       sig { returns(String) }
       def self.latest_clang_version
         case MacOS.version
-        when "27" then "2100.3.20.102"
-        when "26", "15" then "1700.6.4.2"
+        when "27" then "2100.3.34.2"
+        when "26" then ::Hardware::CPU.physical_cpu_arm64? ? "2100.3.34.2" : "2100.1.1.101"
+        when "15" then "1700.6.4.2"
         when "14" then "1600.0.26.6"
         when "13" then "1500.1.0.2.5"
         when "12" then "1400.0.29.202"
-        when "11" then "1300.0.29.30"
-        else           "1200.0.32.29"
+        else           "1300.0.29.30"
         end
       end
 
@@ -346,7 +348,6 @@ module OS
         when "13" then "14.0.0"
         when "12" then "13.0.0"
         when "11" then "12.5.0"
-        when "10.15" then "11.0.0"
         else
           "#{macos}.0.0"
         end
@@ -370,7 +371,7 @@ module OS
       sig { returns(T.nilable(String)) }
       def self.detect_clang_version
         version_output = Utils.popen_read("#{PKG_PATH}/usr/bin/clang", "--version")
-        version_output[/clang-(\d+(\.\d+)+)/, 1]
+        version_output[/clang-(\d+(?:\.\d+)+)/, 1]
       end
 
       sig { returns(T.nilable(String)) }

@@ -15,10 +15,24 @@ module Utils
       ).returns(T.any(T.type_parameter(:U), String))
   }
   def self.popen_read(*args, safe: false, **options, &block)
+    options[:in] ||= File::NULL
     output = popen(args, "rb", options, &block)
     return output if !safe || $CHILD_STATUS.success?
 
     raise ErrorDuringExecution.new(args, status: $CHILD_STATUS, output: [[:stdout, T.cast(output, String)]])
+  end
+
+  sig {
+    params(
+      args:    T.nilable(T.any(String, Pathname, T::Hash[String, String])),
+      options: T.nilable(T.any(Pathname, String, Symbol)),
+    ).returns(String)
+  }
+  def self.popen_read_text(*args, **options)
+    output = popen_read(*args, **options)
+    raise TypeError, "Expected command output to be a String" unless output.is_a?(String)
+
+    output.force_encoding(Encoding.default_external)
   end
 
   sig {
@@ -81,7 +95,7 @@ module Utils
       .params(
         args:    T::Array[T.nilable(T.any(Pathname, String, T::Hash[String, String]))],
         mode:    String,
-        options: T::Hash[Symbol, T.nilable(T.any(Pathname, String, Symbol))],
+        options: T::Hash[Symbol, T.nilable(T.any(Pathname, String, Symbol, T::Array[Symbol]))],
         _block:  T.nilable(T.proc.params(arg0: IO).returns(T.type_parameter(:U))),
       ).returns(T.any(T.type_parameter(:U), String))
   }
@@ -89,11 +103,16 @@ module Utils
     # `brew prof --vernier` uses this to avoid inheriting Vernier's active
     # native collector state through `IO.popen("-")` fork paths.
     if ENV["HOMEBREW_SPAWN_SYSTEM"] == "1"
+      options[:err] = [:child, :out] if options[:err] == :out
       options[:err] ||= File::NULL unless ENV["HOMEBREW_STDERR"]
-      IO.popen(args, mode, options) do |pipe|
+      IO.popen(args, mode, options.merge(pgroup: true)) do |pipe|
         return pipe.read unless block_given?
 
         return yield pipe
+      # Include Timeout's internal exception so IO.popen cannot block its delivery.
+      rescue Exception # rubocop:disable Lint/RescueException
+        terminate_popen_child(pipe)
+        raise
       end
     end
 
@@ -110,6 +129,7 @@ module Utils
           args[0]
         end
         begin
+          Process.setpgid(0, 0)
           exec(*args, options)
         rescue Errno::ENOENT
           $stderr.puts "brew: command not found: #{cmd}" if options[:err] != :close
@@ -122,6 +142,28 @@ module Utils
           exit! 1
         end
       end
+    # Include Timeout's internal exception so IO.popen cannot block its delivery.
+    rescue Exception # rubocop:disable Lint/RescueException
+      terminate_popen_child(pipe) if pipe
+      raise
     end
+  end
+
+  sig { params(pipe: IO).void }
+  private_class_method def self.terminate_popen_child(pipe)
+    return if pipe.closed?
+
+    pid = pipe.pid
+    # The forked child may not have set its group yet; exec'd or exited children already have.
+    begin
+      Process.setpgid(pid, pid)
+    rescue Errno::EACCES, Errno::ESRCH
+      nil
+    end
+
+    # IO.popen waits for the child before propagating exceptions, including timeouts.
+    Process.kill("KILL", -pid)
+  rescue Errno::ESRCH
+    nil
   end
 end

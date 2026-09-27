@@ -97,6 +97,95 @@ RSpec.describe Homebrew::FormulaAuditor do
     end
   end
 
+  describe "#audit_homepage" do
+    before do
+      allow(Date).to receive(:today).and_return(Date.new(2026, 7, 26))
+      allow(DevelopmentTools).to receive(:curl_handles_most_https_certificates?).and_return(true)
+    end
+
+    it "skips homepages browsed by a human less than a year ago" do
+      fa = formula_auditor "foo", <<~RUBY, online: true
+        class Foo < Formula
+          homepage "https://brew.sh", browsed: "2025-07-27"
+          url "https://brew.sh/foo-1.0.tar.gz"
+        end
+      RUBY
+
+      expect(fa).not_to receive(:curl_check_http_content)
+      fa.audit_homepage
+    end
+
+    it "audits homepages browsed by a human a year ago" do
+      fa = formula_auditor "foo", <<~RUBY, online: true
+        class Foo < Formula
+          homepage "https://brew.sh", browsed: "2025-07-26"
+          url "https://brew.sh/foo-1.0.tar.gz"
+        end
+      RUBY
+
+      expect(fa).to receive(:curl_check_http_content)
+      fa.audit_homepage
+    end
+
+    it "audits homepages with a future browser check date" do
+      fa = formula_auditor "foo", <<~RUBY, online: true
+        class Foo < Formula
+          homepage "https://brew.sh", browsed: "2026-07-27"
+          url "https://brew.sh/foo-1.0.tar.gz"
+        end
+      RUBY
+
+      expect(fa).to receive(:curl_check_http_content)
+      fa.audit_homepage
+    end
+  end
+
+  describe "#audit_homepage_domain_age" do
+    let(:domain_problem) { "`homepage` domain `brew.sh` was registered on 2026-07-01" }
+
+    def homepage_auditor(**options)
+      formula_auditor "foo", <<~RUBY, { core_tap: true, new_formula: true }.merge(options)
+        class Foo < Formula
+          homepage "https://brew.sh"
+          url "https://brew.sh/foo-1.0.tar.gz"
+        end
+      RUBY
+    end
+
+    it "reports newly registered homepage domains" do
+      allow(SharedAudits).to receive(:new_domain_problem)
+        .with("https://brew.sh").and_return(domain_problem)
+
+      fa = homepage_auditor
+      fa.audit_homepage_domain_age
+
+      expect(fa.problems.first[:message]).to eq(domain_problem)
+    end
+
+    it "accepts established homepage domains" do
+      allow(SharedAudits).to receive(:new_domain_problem).and_return(nil)
+
+      fa = homepage_auditor
+      fa.audit_homepage_domain_age
+
+      expect(fa.problems).to be_empty
+    end
+
+    it "does not check existing formulae" do
+      fa = homepage_auditor new_formula: false
+
+      expect(SharedAudits).not_to receive(:new_domain_problem)
+      fa.audit_homepage_domain_age
+    end
+
+    it "does not check formulae outside homebrew/core" do
+      fa = homepage_auditor core_tap: false
+
+      expect(SharedAudits).not_to receive(:new_domain_problem)
+      fa.audit_homepage_domain_age
+    end
+  end
+
   describe "#audit_license" do
     let(:spdx_license_data) { SPDX.license_data }
     let(:spdx_exception_data) { SPDX.exception_data }
@@ -891,13 +980,19 @@ RSpec.describe Homebrew::FormulaAuditor do
     end
 
     it "requires `branch:` to be specified for Git head URLs" do
+      head_url = "https://github.com/Homebrew/homebrew-test-bot.git"
       fa = formula_auditor "foo", <<~RUBY, online: true
         class Foo < Formula
           url "https://brew.sh/foo-1.0.tgz"
           sha256 "31cccfc6630528db1c8e3a06f6decf2a370060b982841cfab2b8677400a5092e"
-          head "https://github.com/Homebrew/homebrew-test-bot.git"
+          head "#{head_url}"
         end
       RUBY
+      allow(Utils::Git).to receive(:remote_exists?).and_return(true)
+      allow(Utils).to receive(:popen_read).and_call_original
+      expect(Utils).to receive(:popen_read)
+        .with("git", "ls-remote", "--symref", "--end-of-options", head_url, "HEAD")
+        .and_return("ref: refs/heads/main\tHEAD\n")
 
       fa.audit_specs
       # This is `.last` because the first problem is the unreachable stable URL.
@@ -1343,6 +1438,42 @@ RSpec.describe Homebrew::FormulaAuditor do
         end
       end
     end
+
+    describe "when a core formula has a libomp dependency" do
+      subject do
+        fa.audit_deps
+        fa.problems.first&.fetch(:message)
+      end
+
+      let(:fa) do
+        formula_auditor "foo", <<~RUBY, core_tap: true
+          class Foo < Formula
+            url "https://brew.sh/foo-1.0.tgz"
+            homepage "https://brew.sh"
+
+            depends_on "libomp"
+          end
+        RUBY
+      end
+
+      around do |example|
+        Homebrew::SimulateSystem.with(os:) do
+          example.run
+        end
+      end
+
+      describe "on Linux" do
+        let(:os) { :linux }
+
+        it { is_expected.to include("should not use 'libomp' on Linux") }
+      end
+
+      describe "on macOS" do
+        let(:os) { :macos }
+
+        it { is_expected.to be_nil }
+      end
+    end
   end
 
   describe "#audit_stable_version" do
@@ -1378,6 +1509,12 @@ RSpec.describe Homebrew::FormulaAuditor do
     end
 
     describe "versions" do
+      context "when uncommitted should not change formatting" do
+        before { formula_gsub "foo-1.0.tar.gz", "foo-1.0.0.tar.gz" }
+
+        it { is_expected.to match("Stable: version should not change from 1.0 to 1.0.0") }
+      end
+
       context "when uncommitted should not decrease" do
         before { formula_gsub "foo-1.0.tar.gz", "foo-0.9.tar.gz" }
 
@@ -1488,7 +1625,7 @@ RSpec.describe Homebrew::FormulaAuditor do
         it { is_expected.to match("`revision 2` should be removed") }
       end
 
-      describe "should not warn on an newer version revision removal" do
+      describe "should not warn on a newer version revision removal" do
         before do
           formula_gsub_origin_commit "revision 2", ""
           formula_gsub_origin_commit "foo-1.0.tar.gz", "foo-1.1.tar.gz"
@@ -1599,7 +1736,7 @@ RSpec.describe Homebrew::FormulaAuditor do
                                           .and_return("merge-base-sha\n")
       allow(Utils).to receive(:safe_popen_read).and_return("Formula/f/foo.rb\n")
 
-      paths = auditor.send(:changed_formulae_paths, tap, only_names: ["foo"])
+      paths = auditor.changed_formulae_paths(tap, only_names: ["foo"])
 
       expect(paths).to eq([foo_path])
     end
@@ -1615,7 +1752,7 @@ RSpec.describe Homebrew::FormulaAuditor do
                                                       "merge-base-sha")
                                                 .and_return("Formula/f/foo.rb\n")
 
-      expect(auditor.send(:changed_formulae_paths, tap, only_names: ["foo"])).to eq([foo_path])
+      expect(auditor.changed_formulae_paths(tap, only_names: ["foo"])).to eq([foo_path])
     end
   end
 
@@ -1648,7 +1785,7 @@ RSpec.describe Homebrew::FormulaAuditor do
       allow(FormulaVersions).to receive(:new).with(target_formula).and_return(formula_versions)
       expect(formula_versions).to receive(:rev_list).with("merge-base-sha")
 
-      auditor.send(:committed_version_info)
+      auditor.committed_version_info
     end
   end
 

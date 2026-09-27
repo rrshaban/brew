@@ -3,10 +3,10 @@
 
 require "cask/artifact/abstract_artifact"
 require "cask/artifact/bashcompletion"
-require "cask/artifact/fishcompletion"
 require "cask/artifact/zshcompletion"
+require "cask/artifact/fishcompletion"
+require "cask/artifact/pwshcompletion"
 require "extend/hash/keys"
-require "tempfile"
 require "utils/shell_completion"
 
 module Cask
@@ -89,26 +89,62 @@ module Cask
         "#{commands.join(" ")} (base_name: #{resolved_base_name}, shells: #{shells.join(", ")})"
       end
 
-      sig { params(_options: T.untyped).void }
-      def install_phase(**_options)
-        executable = staged_path_join_executable(T.must(commands.first))
-
-        shells.each do |shell|
+      sig {
+        params(
+          adopt:        T::Boolean,
+          auto_updates: T.nilable(T::Boolean),
+          force:        T::Boolean,
+          verbose:      T::Boolean,
+          predecessor:  T.nilable(Cask),
+          command:      T.class_of(SystemCommand),
+        ).void
+      }
+      def install_phase(adopt: false, auto_updates: false, force: false, verbose: false, predecessor: nil,
+                        command: SystemCommand)
+        executable = staged_path_join_executable(commands.fetch(0))
+        completion_commands = [executable, *commands[1..]]
+        completions = shells.map do |shell|
           popen_read_env = { "SHELL" => shell.to_s }
-          shell_parameter = ::Utils::ShellCompletion.completion_shell_parameter(
-            shell_parameter_format, shell, executable.to_s, popen_read_env
-          )
-
-          script_path = completion_script_path(shell)
-          script_path.dirname.mkpath
-          script_path.write(generate_completion_output([executable, *commands[1..]], shell_parameter, popen_read_env))
-        rescue => e
-          opoo "Failed to generate #{shell} completions from #{executable}: #{e}"
+          {
+            "shell"           => shell.to_s,
+            "commands"        => completion_commands.map(&:to_s),
+            "shell_parameter" => ::Utils::ShellCompletion.completion_shell_parameter(
+              shell_parameter_format, shell, executable.to_s, popen_read_env
+            ),
+            "env"             => popen_read_env,
+            "output_path"     => completion_script_path(shell).to_s,
+            "print_stderr"    => false,
+          }
         end
+
+        if (sandbox = cask_sandbox)
+          completions.map { |completion| Pathname(completion.fetch("output_path")).dirname }.uniq.each do |directory|
+            sandbox.allow_write_path directory
+          end
+          begin
+            run_cask_sandbox(sandbox, { "action" => "generated_completions", "completions" => completions })
+          rescue => e
+            opoo e
+          end
+          return
+        end
+
+        completions.each { |completion| write_completion(completion, executable) }
       end
 
-      sig { params(command: T.class_of(SystemCommand), _options: T.untyped).void }
-      def uninstall_phase(command: SystemCommand, **_options)
+      sig {
+        params(
+          skip:      T::Boolean,
+          force:     T::Boolean,
+          verbose:   T::Boolean,
+          successor: T.nilable(Cask),
+          upgrade:   T::Boolean,
+          reinstall: T::Boolean,
+          command:   T.class_of(SystemCommand),
+        ).void
+      }
+      def uninstall_phase(skip: false, force: false, verbose: false, successor: nil, upgrade: false,
+                          reinstall: false, command: SystemCommand)
         shells.each do |shell|
           path = completion_script_path(shell)
           next unless path.exist?
@@ -121,45 +157,26 @@ module Cask
 
       private
 
-      sig {
-        params(
-          completion_commands: T::Array[T.any(Pathname, String)],
-          shell_parameter:     T.nilable(T.any(String, T::Array[String])),
-          env:                 T::Hash[String, String],
-        ).returns(String)
-      }
-      def generate_completion_output(completion_commands, shell_parameter, env)
-        sandbox = cask_sandbox
-        unless sandbox
-          return ::Utils::ShellCompletion.generate_completion_output(completion_commands, shell_parameter,
-                                                                     env)
-        end
-
-        Tempfile.create("homebrew-cask-completions", HOMEBREW_TEMP) do |output|
-          Dir.mktmpdir("homebrew-cask-home") do |home|
-            sandbox.run(
-              *cask_sandbox_command(
-                env,
-                [
-                  "/bin/sh",
-                  "-c",
-                  "output=$1; shift; exec \"$@\" > \"$output\"#{" 2>/dev/null" unless ENV["HOMEBREW_STDERR"]}",
-                  "sh",
-                  output.path,
-                  *(completion_commands + Array(shell_parameter)),
-                ],
-                home:,
-              ),
-            )
-          end
-          output.read
-        end
+      sig { params(completion: T::Hash[String, T.untyped], executable: Pathname).void }
+      def write_completion(completion, executable)
+        output_path = Pathname(completion.fetch("output_path"))
+        output_path.dirname.mkpath
+        output_path.write(
+          ::Utils::ShellCompletion.generate_completion_output(
+            completion.fetch("commands"),
+            completion["shell_parameter"],
+            completion.fetch("env"),
+            print_stderr: completion.fetch("print_stderr"),
+          ),
+        )
+      rescue => e
+        opoo "Failed to generate #{completion.fetch("shell")} completions from #{executable}: #{e}"
       end
 
       sig { returns(String) }
       def resolved_base_name
         @resolved_base_name ||= T.let(begin
-          executable = staged_path_join_executable(T.must(commands.first))
+          executable = staged_path_join_executable(commands.fetch(0))
           name = base_name || File.basename(executable.to_s)
           name = cask.token if name.empty?
           name
@@ -177,7 +194,7 @@ module Cask
         when :fish
           FishCompletion.new(cask, resolved_base_name).resolve_target(resolved_base_name)
         when :pwsh
-          HOMEBREW_PREFIX/"share/pwsh/completions"/"_#{resolved_base_name}.ps1"
+          PwshCompletion.new(cask, resolved_base_name).resolve_target(resolved_base_name)
         else
           raise ArgumentError, "unsupported shell: #{shell}"
         end

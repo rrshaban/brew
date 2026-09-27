@@ -1,6 +1,9 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "api/env"
+require "utils/text"
+
 require "utils"
 
 module Homebrew
@@ -55,7 +58,7 @@ module Homebrew
       @cask_renames                                   = T.let({}, T::Hash[String, String])
       @formula_names                                  = T.let([], T::Array[String])
 
-      Homebrew.with_no_api_env do
+      Homebrew::API.with_no_api_env do
         tap.clear_cache if Homebrew::EnvConfig.automatically_set_no_install_from_api?
 
         @formula_renames = tap.formula_renames
@@ -106,12 +109,12 @@ module Homebrew
       duplicates = formula_aliases & formula_renames.keys
       return if duplicates.none?
 
-      problem "The following should either be an alias or a rename, not both: #{duplicates.to_sentence}"
+      problem "The following should either be an alias or a rename, not both: #{Utils::Text.to_sentence(duplicates)}"
     end
 
     sig { params(message: String).void }
     def problem(message)
-      @problems << ({ message:, location: nil, corrected: false })
+      @problems << { message:, location: nil, corrected: false }
     end
 
     private

@@ -8,6 +8,9 @@ module OS
 
       requires_ancestor { ::Formula }
 
+      JAVA_HEADLESS_OPTION = "-Djava.awt.headless=true"
+      private_constant :JAVA_HEADLESS_OPTION
+
       sig { returns(T::Boolean) }
       def valid_platform?
         supports_macos?
@@ -24,9 +27,17 @@ module OS
         args = super
 
         # Ensure CMake is using the same SDK we are using.
-        args << "-DCMAKE_OSX_SYSROOT=#{T.must(MacOS.sdk_for_formula(self)).path}"
+        sdk = MacOS.sdk_for_formula(self)
+        raise "No macOS SDK found. Install Xcode or the Command Line Tools." if sdk.nil?
+
+        args << "-DCMAKE_OSX_SYSROOT=#{sdk.path}"
 
         args
+      end
+
+      sig { returns(T::Array[String]) }
+      def std_swift_args
+        ["--disable-sandbox"].concat(super)
       end
 
       sig {
@@ -40,6 +51,23 @@ module OS
         args = super
         args << "-fno-rosetta" if ::Hardware::CPU.arm?
         args
+      end
+
+      # The sandbox denies `mach-lookup`, so AWT cannot reach the WindowServer and aborts
+      # the JVM. Headless AWT never connects to it and still renders images off-screen.
+      sig { params(home: ::Pathname).returns(T::Hash[Symbol, String]) }
+      def common_sandbox_env(home)
+        env = super
+        env.merge(_JAVA_OPTIONS: [env[:_JAVA_OPTIONS], JAVA_HEADLESS_OPTION].compact.join(" "))
+      end
+
+      # The `java` launcher decides from the options it parses itself, its arguments and
+      # `JDK_JAVA_OPTIONS`, whether to show a jar's `SplashScreen-Image`, which aborts under
+      # the sandbox like the rest of AWT. OpenJDK's `configure` rejects a boot JDK that reports
+      # picked-up options, so the build phase must not see this variable.
+      sig { params(testpath: ::Pathname).returns(T::Hash[Symbol, String]) }
+      def test_sandbox_env(testpath)
+        super.merge(JDK_JAVA_OPTIONS: JAVA_HEADLESS_OPTION)
       end
     end
   end

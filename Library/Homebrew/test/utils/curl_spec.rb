@@ -379,18 +379,10 @@ RSpec.describe "Utils::Curl" do
       expect(curl_args(*args, connect_timeout: 123.4567).join(" ")).to include("--connect-timeout 123.457")
     end
 
-    it "errors when `:connect_timeout` is not Numeric" do
-      expect { curl_args(*args, connect_timeout: "test") }.to raise_error(TypeError)
-    end
-
     it "uses `--max-time` when `:max_time` is Numeric" do
       expect(curl_args(*args, max_time: 123).join(" ")).to include("--max-time 123")
       expect(curl_args(*args, max_time: 123.4).join(" ")).to include("--max-time 123.4")
       expect(curl_args(*args, max_time: 123.4567).join(" ")).to include("--max-time 123.457")
-    end
-
-    it "errors when `:max_time` is not Numeric" do
-      expect { curl_args(*args, max_time: "test") }.to raise_error(TypeError)
     end
 
     it "uses `--retry 3` when HOMEBREW_CURL_RETRIES is unset" do
@@ -412,17 +404,9 @@ RSpec.describe "Utils::Curl" do
       expect(curl_args(*args, retries: -1).join(" ")).not_to include("--retry")
     end
 
-    it "errors when `:retries` is not Numeric" do
-      expect { curl_args(*args, retries: "test") }.to raise_error(TypeError)
-    end
-
     it "uses `--retry-max-time` when `:retry_max_time` is Numeric" do
       expect(curl_args(*args, retry_max_time: 123).join(" ")).to include("--retry-max-time 123")
       expect(curl_args(*args, retry_max_time: 123.4).join(" ")).to include("--retry-max-time 123")
-    end
-
-    it "errors when `:retry_max_time` is not Numeric" do
-      expect { curl_args(*args, retry_max_time: "test") }.to raise_error(TypeError)
     end
 
     it "uses `--show-error` when :show_error is `true`" do
@@ -584,7 +568,15 @@ RSpec.describe "Utils::Curl" do
 
   describe "::curl_version" do
     it "returns a curl version string" do
-      expect(curl_version).to match(/^v?(\d+(?:\.\d+)+)$/)
+      expect(curl_version).to match(/^v?\d+(?:\.\d+)+$/)
+    end
+
+    it "only runs the curl subprocess on the first call" do
+      allow(self).to receive(:curl_path).and_return("/usr/bin/curl")
+      expect(self).to receive(:curl_output).once.and_return(
+        instance_double(SystemCommand::Result, stdout: "curl 8.7.1 (x86_64-apple-darwin)"),
+      )
+      2.times { expect(curl_version).to eq(Version.new("8.7.1")) }
     end
   end
 
@@ -605,12 +597,12 @@ RSpec.describe "Utils::Curl" do
 
   describe "::curl_supports_tls13?" do
     it "returns `true` if curl command is successful" do
-      allow_any_instance_of(Kernel).to receive(:quiet_system).and_return(true)
+      allow(SystemCommand).to receive(:quiet_system).and_return(true)
       expect(curl_supports_tls13?).to be(true)
     end
 
     it "returns `false` if curl command is not successful" do
-      allow_any_instance_of(Kernel).to receive(:quiet_system).and_return(false)
+      allow(SystemCommand).to receive(:quiet_system).and_return(false)
       expect(curl_supports_tls13?).to be(false)
     end
   end
@@ -669,6 +661,126 @@ RSpec.describe "Utils::Curl" do
     end
   end
 
+  describe "::curl_http_content_headers_and_checksum" do
+    def curl_args_for(**options)
+      args = T.let([], T::Array[String])
+      allow(self).to receive(:curl_output) do |*arguments, **_options|
+        args = arguments
+        ["", "", instance_double(Process::Status, success?: false, exitstatus: 0)]
+      end
+      curl_http_content_headers_and_checksum("https://brew.sh/", **options)
+      args
+    end
+
+    it "requests headers only when `head_only` is set" do
+      expect(curl_args_for(head_only: true)).to include("--head")
+    end
+
+    it "does not write the body to a file when `head_only` is set" do
+      expect(curl_args_for(head_only: true)).not_to include("--output")
+    end
+
+    it "does not combine `--dump-header` with `--head`" do
+      expect(curl_args_for(head_only: true)).not_to include("--dump-header")
+    end
+
+    it "downloads the body when `head_only` is not set" do
+      expect(curl_args_for(head_only: false)).to include("--output")
+    end
+
+    it "uses the last value of a header that was sent more than once" do
+      output = "HTTP/1.1 301 Moved Permanently\r\n" \
+               "Location: https://brew.sh/a\r\n" \
+               "Location: https://brew.sh/b\r\n" \
+               "\r\n" \
+               "HTTP/1.1 200 OK\r\n" \
+               "ETag: \"aaa\"\r\n" \
+               "ETag: \"bbb\"\r\n" \
+               "\r\n"
+      allow(self).to receive(:curl_output)
+        .and_return([output, "", instance_double(Process::Status, success?: false, exitstatus: 0)])
+
+      response = curl_http_content_headers_and_checksum("https://brew.sh/", head_only: true)
+      expect(response[:etag]).to eq("bbb")
+      expect(response[:final_url]).to eq("https://brew.sh/b")
+    end
+  end
+
+  describe "::curl_check_http_content" do
+    let(:response) do
+      {
+        url:            "https://brew.sh/",
+        final_url:      nil,
+        exit_status:    0,
+        status_code:    "200",
+        headers:        {},
+        etag:           nil,
+        content_length: nil,
+        file:           nil,
+        file_hash:      nil,
+        responses:      [],
+      }
+    end
+
+    # Returns the recorded `head_only` of each fetch; responses are used in turn.
+    def record_head_only(*responses)
+      recorded = []
+      allow(self).to receive(:curl_http_content_headers_and_checksum) do |_url, **options|
+        recorded << options[:head_only]
+        responses[[recorded.length - 1, responses.length - 1].min]
+      end
+      recorded
+    end
+
+    it "requests headers only for an HTTPS URL" do
+      recorded = record_head_only(response)
+      curl_check_http_content("https://brew.sh/", "homepage URL")
+      expect(recorded).to eq([true])
+    end
+
+    it "downloads the body for an HTTP URL, which needs it for comparison" do
+      recorded = record_head_only(response)
+      curl_check_http_content("http://brew.sh/", "homepage URL")
+      expect(recorded).to all(be_falsey)
+    end
+
+    it "retries as a `GET` when the server rejects `HEAD`" do
+      recorded = record_head_only(response.merge(status_code: "405"), response)
+      curl_check_http_content("https://brew.sh/", "homepage URL")
+      expect(recorded).to eq([true, false])
+    end
+
+    it "reports the problem from the `GET` when the server rejects `HEAD`" do
+      record_head_only(response.merge(status_code: "405"), response.merge(status_code: "500"))
+      expect(curl_check_http_content("https://brew.sh/", "homepage URL"))
+        .to include("HTTP status code 500")
+    end
+
+    # The request may have reached the server, so `HEAD` could be why it failed.
+    test_each([28, 52, 56]) do |exit_status|
+      it "retries as a `GET` when `HEAD` failed with exit status #{exit_status}" do
+        recorded = record_head_only(response.merge(status_code: nil, exit_status:), response)
+        curl_check_http_content("https://brew.sh/", "homepage URL")
+        expect(recorded).to eq([true, false])
+      end
+    end
+
+    # These happen before the request is sent.
+    test_each([6, 7]) do |exit_status|
+      it "does not retry as a `GET` when `HEAD` failed with exit status #{exit_status}" do
+        recorded = record_head_only(response.merge(status_code: nil, exit_status:))
+        curl_check_http_content("https://brew.sh/", "homepage URL")
+        expect(recorded).to eq([true])
+      end
+    end
+
+    it "still reports an unreachable URL when the `GET` retry also fails" do
+      record_head_only(response.merge(status_code: nil, exit_status: 28))
+      expect(curl_check_http_content("https://brew.sh/", "homepage URL"))
+        .to include("is not reachable")
+    end
+  end
+
   describe "::http_status_ok?" do
     it "returns `true` when `status` is 1xx or 2xx" do
       expect(http_status_ok?("200")).to be(true)
@@ -680,6 +792,28 @@ RSpec.describe "Utils::Curl" do
 
     it "returns `false` when `status` is `nil`" do
       expect(http_status_ok?(nil)).to be(false)
+    end
+  end
+
+  describe "::strip_progress_bar" do
+    it "removes the percentage when other text is glued directly onto it" do
+      glued = "############# 100.0%curl: (7) Failed to connect to example.com port 443: Couldn't connect to server"
+      expected = "curl: (7) Failed to connect to example.com port 443: Couldn't connect to server"
+      expect(strip_progress_bar(glued)).to eq(expected)
+    end
+
+    it "reduces a completed progress bar with nothing else on the line to an empty string" do
+      expect(strip_progress_bar("############# 100.0%")).to eq("")
+    end
+
+    it "leaves plain curl diagnostics without a progress bar unchanged" do
+      message = "curl: (6) Could not resolve host: example.com"
+      expect(strip_progress_bar(message)).to eq(message)
+    end
+
+    it "only strips the line that actually has a progress bar" do
+      glued = "Warning: retrying\n### 50.0%curl: (7) timeout"
+      expect(strip_progress_bar(glued)).to eq("Warning: retrying\ncurl: (7) timeout")
     end
   end
 
@@ -815,6 +949,19 @@ RSpec.describe "Utils::Curl" do
     it "returns nil when the response hash doesn't contain a location header" do
       expect(curl_response_last_location([response_hash[:ok]])).to be_nil
     end
+
+    it "uses the last location when the header was sent more than once" do
+      duplicated = {
+        status_code: "301",
+        headers:     { "location" => ["https://brew.sh/a", "/b"] },
+      }
+
+      expect(curl_response_last_location([duplicated, response_hash[:ok]])).to eq("/b")
+      expect(
+        curl_response_last_location([duplicated, response_hash[:ok]], absolutize: true,
+                                                                      base_url:   "https://brew.sh/test"),
+      ).to eq("https://brew.sh/b")
+    end
   end
 
   describe "::curl_response_follow_redirections" do
@@ -825,6 +972,15 @@ RSpec.describe "Utils::Curl" do
           "https://brew.sh/test1/test2",
         ),
       ).to eq("https://brew.sh/test1/test2")
+    end
+
+    it "uses the last location when the header was sent more than once" do
+      expect(
+        curl_response_follow_redirections(
+          [{ status_code: "301", headers: { "location" => ["/a", "/b"] } }, response_hash[:ok]],
+          "https://brew.sh/test1/test2",
+        ),
+      ).to eq("https://brew.sh/b")
     end
 
     it "returns the URL relative to base when locations are relative" do

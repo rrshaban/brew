@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "utils/executable"
+
 require "date"
 require "json"
 require "utils/popen"
@@ -42,6 +44,11 @@ module Homebrew
     # @api private
     class InvalidAttestationError < RuntimeError; end
 
+    # Raised when bottle attestation verification is unsupported for a tap.
+    #
+    # @api private
+    class UnsupportedTapError < RuntimeError; end
+
     # Raised if attestation verification cannot continue due to missing
     # credentials.
     #
@@ -72,7 +79,7 @@ module Homebrew
       #       to prevent a cycle during bootstrapping. This can eventually be resolved
       #       by vendoring a pure-Ruby Sigstore verifier client.
       @gh_executable = with_env(HOMEBREW_NO_VERIFY_ATTESTATIONS: "1") do
-        ensure_executable!("gh", reason: "verifying attestations", latest: true)
+        Utils::Executable.ensure!("gh", reason: "verifying attestations", latest: true)
       end
     end
 
@@ -137,7 +144,11 @@ module Homebrew
           raise GhAuthInvalid, "invalid credentials"
         end
 
-        raise MissingAttestationError, "attestation not found: #{e}" if e.stderr.include?("HTTP 404: Not Found")
+        # The API used to return 404 but now can return 200 with an empty array.
+        # We match the no attestation case precisely as there are similarly worded errors.
+        if e.stderr.include?("HTTP 404: Not Found") || e.stderr.match?(/: no attestations found\R/)
+          raise MissingAttestationError, "attestation not found: #{e}"
+        end
 
         raise InvalidAttestationError, "attestation verification failed: #{e}"
       end
@@ -185,6 +196,47 @@ module Homebrew
 
     ATTESTATION_MAX_RETRIES = 5
 
+    # Verifies a bottle against the attestation model for the formula's tap.
+    #
+    # @return [Hash] the JSON-decoded response
+    # @raise [GhAuthNeeded] on any authentication failures
+    # @raise [InvalidAttestationError] on any verification failures
+    # @raise [UnsupportedTapError] when the bottle's tap cannot be attested safely
+    #
+    # @api private
+    sig { params(bottle: Bottle).returns(T::Hash[String, T.untyped]) }
+    def self.check_formula_attestation(bottle)
+      formula = bottle.resource.owner
+      formula = formula.owner if formula.is_a?(SoftwareSpec)
+      unless formula.is_a?(Formula)
+        raise UnsupportedTapError, "bottle is not associated with a formula tap."
+      end
+
+      tap = formula.tap
+      if tap.nil?
+        raise UnsupportedTapError,
+              "#{formula.full_name} is not from a tap with supported bottle attestations."
+      end
+      return check_core_attestation(bottle) if tap.core_tap?
+
+      if tap.custom_remote?
+        raise UnsupportedTapError,
+              "#{formula.full_name} is from #{tap.name}, which uses a non-default " \
+              "remote and cannot be attested safely."
+      end
+
+      signing_repo = tap.remote_repository
+      if signing_repo.blank?
+        raise UnsupportedTapError,
+              "#{formula.full_name} is from #{tap.name}, which does not resolve " \
+              "to a GitHub repository for attestation verification."
+      end
+
+      return check_core_attestation(bottle) if signing_repo == HOMEBREW_CORE_REPO
+
+      check_attestation(bottle, signing_repo)
+    end
+
     # Verifies the given bottle against a cryptographic attestation of build provenance
     # from homebrew-core's CI, falling back on a "backfill" attestation for older bottles.
     #
@@ -219,9 +271,7 @@ module Homebrew
         # This was originally unintentional, but has a virtuous side effect of further
         # limiting domain separation on the backfilled signatures (by committing them to
         # their original bottle URLs).
-        url_sha256 = if EnvConfig.bottle_domain == HOMEBREW_BOTTLE_DEFAULT_DOMAIN
-          Digest::SHA256.hexdigest(bottle.url)
-        else
+        url_sha256 = if EnvConfig.bottle_domain_custom?
           # If our bottle is coming from a mirror, we need to recompute the expected
           # non-mirror URL to make the hash match.
           checksum = bottle.resource.checksum
@@ -231,6 +281,8 @@ module Homebrew
           url = "#{HOMEBREW_BOTTLE_DEFAULT_DOMAIN}/#{path}"
 
           Digest::SHA256.hexdigest(url)
+        else
+          Digest::SHA256.hexdigest(bottle.url)
         end
         subject = "#{url_sha256}--#{bottle.filename}"
 

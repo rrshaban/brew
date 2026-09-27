@@ -5,6 +5,25 @@ require "timeout"
 require "utils"
 
 RSpec.describe Utils do
+  describe ".fully_qualified_name" do
+    [
+      [Formula, "homebrew/core", "foo", "homebrew/core/foo"],
+      [Cask::Cask, "homebrew/cask", "foo", "homebrew/cask/foo"],
+      [Formula, "thirdparty/tap", "thirdparty/tap/foo", "thirdparty/tap/foo"],
+      [Cask::Cask, "thirdparty/tap", "thirdparty/tap/foo", "thirdparty/tap/foo"],
+      [Formula, nil, "foo", "foo"],
+      [Cask::Cask, nil, "foo", "foo"],
+    ].each do |klass, tap_name, full_name, expected|
+      it "qualifies #{klass} from #{tap_name || "no tap"}" do
+        T.bind(self, RSpec::Core::ExampleGroup)
+
+        package = instance_double(klass, full_name:, tap: tap_name ? Tap.fetch(tap_name) : nil)
+
+        expect(described_class.fully_qualified_name(package)).to eq(expected)
+      end
+    end
+  end
+
   describe ".parallel_map" do
     it "runs all blocks concurrently" do
       # A barrier no block passes until every block has started: this
@@ -157,6 +176,23 @@ RSpec.describe Utils do
     end
   end
 
+  describe ".exponential_backoff_sleep" do
+    it "sleeps for 2**try seconds" do
+      expect(described_class).to receive(:sleep).with(8)
+      described_class.exponential_backoff_sleep(3)
+    end
+
+    it "sleeps for base**try seconds when a base is given" do
+      expect(described_class).to receive(:sleep).with(27)
+      described_class.exponential_backoff_sleep(3, base: 3)
+    end
+
+    it "yields the wait time before sleeping" do
+      allow(described_class).to receive(:sleep)
+      expect { |block| described_class.exponential_backoff_sleep(2, &block) }.to yield_with_args(4)
+    end
+  end
+
   describe ".underscore" do
     # commented out entries require acronyms inflections
     let(:words) do
@@ -190,6 +226,43 @@ RSpec.describe Utils do
       words.each do |camel, under|
         expect(described_class.underscore(camel)).to eq(under)
         expect(described_class.underscore(under)).to eq(under)
+      end
+    end
+  end
+
+  describe ".safe_filename?" do
+    specify(:aggregate_failures) do
+      expect(described_class.safe_filename?("formula-1.2.3.tar.gz")).to be(true)
+      expect(described_class.safe_filename?("")).to be(true)
+
+      expect(described_class.safe_filename?("etc/passwd")).to be(false)
+      expect(described_class.safe_filename?("with\nnewline")).to be(false)
+      expect(described_class.safe_filename?("with\0null")).to be(false)
+      expect(described_class.safe_filename?("with\ttab")).to be(false)
+    end
+
+    # A basename is only unsafe here if it can escape its directory or smuggle a
+    # control character; a relative traversal has to survive as a separate
+    # component to matter, and the separator is what this rejects.
+    specify "relative components are not separators", :aggregate_failures do
+      expect(described_class.safe_filename?("..")).to be(true)
+      expect(described_class.safe_filename?("../etc")).to be(false)
+    end
+  end
+
+  describe ".safe_filename" do
+    specify(:aggregate_failures) do
+      expect(described_class.safe_filename("formula-1.2.3.tar.gz")).to eq("formula-1.2.3.tar.gz")
+
+      expect(described_class.safe_filename("etc/passwd")).to eq("etcpasswd")
+      expect(described_class.safe_filename("../../etc/passwd")).to eq("....etcpasswd")
+      expect(described_class.safe_filename("with\nnewline")).to eq("withnewline")
+      expect(described_class.safe_filename("with\0null")).to eq("withnull")
+    end
+
+    specify "the result is always safe", :aggregate_failures do
+      ["a/b", "a\nb", "..", "", "\0"].each do |basename|
+        expect(described_class.safe_filename?(described_class.safe_filename(basename))).to be(true)
       end
     end
   end
@@ -268,6 +341,12 @@ RSpec.describe Utils do
       }
 
       expect(described_class.deep_compact_blank(input)).to eq(expected_output)
+    end
+
+    it "preserves false when compact_false is disabled" do
+      input = { a: false, b: [false], c: { d: false } }
+
+      expect(described_class.deep_compact_blank(input, compact_false: false)).to eq(input)
     end
   end
 end

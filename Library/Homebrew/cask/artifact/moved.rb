@@ -56,6 +56,11 @@ module Cask
         end
       end
 
+      sig { overridable.params(target: Pathname, source: Pathname).returns(T::Array[T.any(String, Pathname)]) }
+      def backup_copy_args(target, source)
+        ["-pR", target, source]
+      end
+
       private
 
       sig {
@@ -150,7 +155,7 @@ module Cask
             source.children.each { |child| FileUtils.move(child, target/child.basename) }
           else
             command.run!("/bin/cp", args: ["-pR", *source.children, target],
-                                    sudo: true)
+                                    sudo: nil)
           end
           Quarantine.copy_xattrs(source, target, command:)
           FileUtils.rm_r(source)
@@ -159,7 +164,7 @@ module Cask
         else
           # default sudo user isn't necessarily able to write to Homebrew's locations
           # e.g. with runas_default set in the sudoers (5) file.
-          command.run!("/bin/cp", args: ["-pR", source, target], sudo: true)
+          command.run!("/bin/cp", args: ["-pR", source, target], sudo: nil)
           FileUtils.rm_r(source)
         end
 
@@ -215,15 +220,7 @@ module Cask
 
         # We need to preserve extended attributes between copies.
         # This may fail and need sudo if the source has files with restricted permissions.
-        [!source.parent.writable?, true].uniq.each do |sudo|
-          result = command.run(
-            "/bin/cp",
-            args:         backup_copy_args(target, source),
-            must_succeed: sudo,
-            sudo:,
-          )
-          break if result.success?
-        end
+        command.run!("/bin/cp", args: backup_copy_args(target, source), sudo: nil)
 
         delete(target, force:, successor:, command:)
       end
@@ -258,11 +255,6 @@ module Cask
       sig { params(target: Pathname).returns(T::Boolean) }
       def undeletable?(target)
         !target.parent.writable?
-      end
-
-      sig { overridable.params(target: Pathname, source: Pathname).returns(T::Array[T.any(String, Pathname)]) }
-      def backup_copy_args(target, source)
-        ["-pR", target, source]
       end
     end
   end

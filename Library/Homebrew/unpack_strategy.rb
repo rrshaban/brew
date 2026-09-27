@@ -2,7 +2,9 @@
 # frozen_string_literal: true
 
 require "mktemp"
+require "sandbox"
 require "system_command"
+require "unpack_strategy/path"
 require "utils/output"
 require "utils/path"
 
@@ -19,6 +21,19 @@ module UnpackStrategy
 
   UnpackStrategyType = T.type_alias { T.all(T::Class[UnpackStrategy], UnpackStrategy::ClassMethods) }
 
+  DEPRECATED_STRATEGY_REPLACEMENTS = T.let({
+    "UnpackStrategy::Air"    => "an `app` or `pkg` Cask artifact",
+    "UnpackStrategy::Bazaar" => "UnpackStrategy::Git or a stable archive URL",
+    "UnpackStrategy::Cab"    => "UnpackStrategy::GenericUnar",
+    "UnpackStrategy::Lha"    => "UnpackStrategy::GenericUnar",
+    "UnpackStrategy::Lzma"   => "UnpackStrategy::Xz",
+    "UnpackStrategy::Pax"    => "UnpackStrategy::Tar",
+    "UnpackStrategy::Rar"    => "UnpackStrategy::GenericUnar",
+    "UnpackStrategy::Sit"    => "UnpackStrategy::GenericUnar",
+    "UnpackStrategy::Xar"    => "UnpackStrategy::GenericUnar",
+  }.freeze, T::Hash[String, String])
+  private_constant :DEPRECATED_STRATEGY_REPLACEMENTS
+
   module ClassMethods
     extend T::Helpers
 
@@ -27,7 +42,7 @@ module UnpackStrategy
     sig { abstract.returns(T::Array[String]) }
     def extensions; end
 
-    sig { abstract.params(path: Pathname).returns(T::Boolean) }
+    sig { abstract.params(path: Path).returns(T::Boolean) }
     def can_extract?(path); end
   end
 
@@ -72,8 +87,16 @@ module UnpackStrategy
   end
   private_class_method :strategies
 
+  sig { params(name: String).returns(UnpackStrategyType) }
+  def self.from_name(name)
+    [*strategies, Directory, Dmg::Mount, Uncompressed].find { |strategy| strategy.name == name } ||
+      raise(ArgumentError, "Unknown unpack strategy: #{name}")
+  end
+
   sig { params(type: Symbol).returns(T.nilable(UnpackStrategyType)) }
   def self.from_type(type)
+    odeprecated "the `:seven_zip` container type", ":p7zip" if type == :seven_zip
+
     type = {
       naked:     :uncompressed,
       nounzip:   :uncompressed,
@@ -96,16 +119,18 @@ module UnpackStrategy
               .find { |s| extension.end_with?(*s.extensions) }
   end
 
-  sig { params(path: Pathname).returns(T.nilable(UnpackStrategyType)) }
+  sig { params(path: Path).returns(T.nilable(UnpackStrategyType)) }
   def self.from_magic(path)
     strategies.find { |s| s.can_extract?(path) }
   end
 
   sig {
     params(path: Pathname, prioritize_extension: T::Boolean, type: T.nilable(Symbol), ref_type: T.nilable(Symbol),
-           ref: T.nilable(String), merge_xattrs: T::Boolean).returns(UnpackStrategy)
+           ref: T.nilable(String), merge_xattrs: T::Boolean, temporary_directory: Pathname).returns(UnpackStrategy)
   }
-  def self.detect(path, prioritize_extension: false, type: nil, ref_type: nil, ref: nil, merge_xattrs: false)
+  def self.detect(path, prioritize_extension: false, type: nil, ref_type: nil, ref: nil, merge_xattrs: false,
+                  temporary_directory: HOMEBREW_TEMP)
+    path = Path.new(path)
     strategy = from_type(type) if type
 
     if prioritize_extension && path.extname.present?
@@ -118,25 +143,33 @@ module UnpackStrategy
     end
 
     strategy ||= Uncompressed
+    if (replacement = DEPRECATED_STRATEGY_REPLACEMENTS[strategy.to_s])
+      odeprecated strategy.to_s, replacement
+    end
 
-    strategy.new(path, ref_type:, ref:, merge_xattrs:)
+    strategy.new(path, ref_type:, ref:, merge_xattrs:, temporary_directory:)
   end
 
-  sig { returns(Pathname) }
+  sig { returns(Path) }
   attr_reader :path
 
   sig { returns(T::Boolean) }
   attr_reader :merge_xattrs
 
+  # Parent directory for nested archive staging and tar decompression.
+  sig { returns(Pathname) }
+  attr_reader :temporary_directory
+
   sig {
     params(path: T.any(String, Pathname), ref_type: T.nilable(Symbol), ref: T.nilable(String),
-           merge_xattrs: T::Boolean).void
+           merge_xattrs: T::Boolean, temporary_directory: Pathname).void
   }
-  def initialize(path, ref_type: nil, ref: nil, merge_xattrs: false)
-    @path = T.let(Pathname(path).expand_path, Pathname)
+  def initialize(path, ref_type: nil, ref: nil, merge_xattrs: false, temporary_directory: HOMEBREW_TEMP)
+    @path = T.let(Path.new(Pathname(path).expand_path), Path)
     @ref_type = ref_type
     @ref = ref
     @merge_xattrs = merge_xattrs
+    @temporary_directory = temporary_directory
   end
 
   sig { abstract.params(unpack_dir: Pathname, basename: Pathname, verbose: T::Boolean).void }
@@ -152,6 +185,18 @@ module UnpackStrategy
     basename ||= path.basename
     unpack_dir = Pathname(to || Dir.pwd).expand_path
     unpack_dir.mkpath
+    # Mount disk images outside the extraction sandbox; Dmg::Mount sandboxes the copy.
+    if !is_a?(Dmg) && Sandbox.isolate_operation?
+      move = is_a?(Directory) && move?
+      Sandbox.operation(
+        "extract",
+        JSON.generate(strategy: self.class.name, path: path.to_s, to: unpack_dir.to_s, basename: basename.to_s,
+                      verbose:, ref_type: @ref_type, ref: @ref, merge_xattrs:, move:),
+        read_paths: [path], write_paths: [unpack_dir, *(path if move)], temporary_directory:,
+      )
+      return
+    end
+
     extract_to_dir(unpack_dir, basename: Pathname(basename), verbose:)
   end
 
@@ -164,18 +209,20 @@ module UnpackStrategy
     ).void
   }
   def extract_nestedly(to: nil, basename: nil, verbose: false, prioritize_extension: false)
-    Mktemp.new("homebrew-unpack").run(chdir: false) do |unpack_dir|
-      tmp_unpack_dir = T.must(unpack_dir.tmpdir)
+    Mktemp.new("homebrew-unpack", parent: temporary_directory).run(chdir: false) do |unpack_dir|
+      tmp_unpack_dir = unpack_dir.tmpdir
+      raise "Failed to create a temporary directory to unpack #{path}" if tmp_unpack_dir.nil?
 
       extract(to: tmp_unpack_dir, basename:, verbose:)
+      raise "Extraction directory is a symlink: #{tmp_unpack_dir}" if tmp_unpack_dir.symlink?
 
       children = tmp_unpack_dir.children
 
-      if children.size == 1 && !children.fetch(0).directory?
+      if children.size == 1 && !children.fetch(0).directory? && !children.fetch(0).symlink?
         first_child = children.first
         next if first_child.nil?
 
-        s = UnpackStrategy.detect(first_child, prioritize_extension:)
+        s = UnpackStrategy.detect(first_child, prioritize_extension:, temporary_directory:)
 
         s.extract_nestedly(to:, verbose:, prioritize_extension:)
 
@@ -207,7 +254,7 @@ module UnpackStrategy
   }
   def each_directory(pathname, &_block)
     pathname.find do |path|
-      yield path if path.directory?
+      yield path if !path.symlink? && path.directory?
     end
   end
 end

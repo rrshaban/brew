@@ -1,10 +1,12 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 require "bundle"
 require "bundle/subcommand/exec"
+require "bundle/subcommand/check"
 require "bundle/brewfile"
 require "bundle/brew_services"
+require "cmd/bundle"
 require "sandbox"
 
 RSpec.describe Homebrew::Cmd::Bundle::ExecSubcommand do
@@ -49,6 +51,19 @@ RSpec.describe Homebrew::Cmd::Bundle::ExecSubcommand do
       it "does not raise an error when HOMEBREW_BUNDLE_EXEC_ALL_KEG_ONLY_DEPS is set" do
         ENV["HOMEBREW_BUNDLE_EXEC_ALL_KEG_ONLY_DEPS"] = "1"
         expect { described_class.run_external_command("bundle", "install") }.not_to raise_error
+      end
+
+      it "runs the check subcommand with a real `Bundle::Args` extended with `CheckSubcommand::Args`" do
+        allow(Homebrew::Bundle::Checker).to receive(:check)
+          .and_return(Homebrew::Bundle::Checker::CheckResult.new(work_to_be_done: false, errors: []))
+        allow(Homebrew::Cmd::Bundle::CheckSubcommand).to receive(:new).and_wrap_original do |original, args, **kwargs|
+          expect(args).to be_a(Homebrew::Cmd::Bundle::Args)
+          instance = original.call(args, **kwargs)
+          expect(instance.args).to be_a(Homebrew::Cmd::Bundle::CheckSubcommand.args_module)
+          instance
+        end
+
+        described_class.run_external_command("bundle", "install", check: true)
       end
 
       it "uses the formula version from the environment variable" do
@@ -183,49 +198,37 @@ RSpec.describe Homebrew::Cmd::Bundle::ExecSubcommand do
       let(:brewfile_contents) { "brew 'nginx'\nbrew 'redis'" }
 
       let(:nginx_formula) do
-        instance_double(
-          Formula,
-          name:                     "nginx",
+        nginx = formula("nginx") do
+          T.bind(self, T.class_of(Formula))
+          url "nginx-1.0"
+        end
+        allow(nginx).to receive_messages(
           any_version_installed?:   true,
           any_installed_prefix:     HOMEBREW_PREFIX/"opt/nginx",
-          plist_name:               "homebrew.mxcl.nginx",
+          plist_name:               "sh.brew.nginx",
           service_name:             "nginx",
           versioned_formulae_names: [],
           conflicts:                [instance_double(Formula::FormulaConflict, name: "httpd")],
           keg_only?:                false,
         )
+        nginx
       end
 
       let(:redis_formula) do
-        instance_double(
-          Formula,
-          name:                     "redis",
+        redis = formula("redis") do
+          T.bind(self, T.class_of(Formula))
+          url "redis-1.0"
+        end
+        allow(redis).to receive_messages(
           any_version_installed?:   true,
           any_installed_prefix:     HOMEBREW_PREFIX/"opt/redis",
-          plist_name:               "homebrew.mxcl.redis",
+          plist_name:               "sh.brew.redis",
           service_name:             "redis",
           versioned_formulae_names: ["redis@6.2"],
           conflicts:                [],
           keg_only?:                false,
         )
-      end
-
-      let(:services_info_pre) do
-        [
-          { "name" => "nginx", "running" => true, "loaded" => true },
-          { "name" => "httpd", "running" => true, "loaded" => true },
-          { "name" => "redis", "running" => false, "loaded" => false },
-          { "name" => "redis@6.2", "running" => true, "loaded" => true, "registered" => true },
-        ]
-      end
-
-      let(:services_info_post) do
-        [
-          { "name" => "nginx", "running" => true, "loaded" => true },
-          { "name" => "httpd", "running" => false, "loaded" => false },
-          { "name" => "redis", "running" => true, "loaded" => true },
-          { "name" => "redis@6.2", "running" => false, "loaded" => false, "registered" => true },
-        ]
+        redis
       end
 
       before do
@@ -245,9 +248,27 @@ RSpec.describe Homebrew::Cmd::Bundle::ExecSubcommand do
         allow(described_class).to receive(:exit!).and_return(nil)
       end
 
-      shared_examples "handles service lifecycle correctly" do
+      shared_examples "handles service lifecycle correctly" do |nginx_service_file:, redis_service_file:|
+        let(:services_info_pre) do
+          [
+            { "name" => "nginx", "running" => true, "loaded" => true },
+            { "name" => "httpd", "running" => true, "loaded" => true },
+            { "name" => "redis", "running" => false, "loaded" => false },
+            { "name" => "redis@6.2", "running" => true, "loaded" => true, "registered" => true },
+          ]
+        end
+
+        let(:services_info_post) do
+          [
+            { "name" => "nginx", "running" => true, "loaded" => true },
+            { "name" => "httpd", "running" => false, "loaded" => false },
+            { "name" => "redis", "running" => true, "loaded" => true },
+            { "name" => "redis@6.2", "running" => false, "loaded" => false, "registered" => true },
+          ]
+        end
+
         it "handles service lifecycle correctly" do
-          # The order of operations is important. This unweildly looking test is so it tests that.
+          # The order of operations is important. This unwieldy looking test is so it tests that.
 
           # Return original service state
           expect(Utils).to receive(:safe_popen_read)
@@ -302,10 +323,9 @@ RSpec.describe Homebrew::Cmd::Bundle::ExecSubcommand do
           allow(Homebrew::Services::System).to receive(:launchctl?).and_return(true)
         end
 
-        let(:nginx_service_file) { nginx_formula.any_installed_prefix/"#{nginx_formula.plist_name}.plist" }
-        let(:redis_service_file) { redis_formula.any_installed_prefix/"#{redis_formula.plist_name}.plist" }
-
-        include_examples "handles service lifecycle correctly"
+        include_examples "handles service lifecycle correctly",
+                         nginx_service_file: HOMEBREW_PREFIX/"opt/nginx/sh.brew.nginx.plist",
+                         redis_service_file: HOMEBREW_PREFIX/"opt/redis/sh.brew.redis.plist"
       end
 
       context "with systemd" do
@@ -313,10 +333,9 @@ RSpec.describe Homebrew::Cmd::Bundle::ExecSubcommand do
           allow(Homebrew::Services::System).to receive(:launchctl?).and_return(false)
         end
 
-        let(:nginx_service_file) { nginx_formula.any_installed_prefix/"#{nginx_formula.service_name}.service" }
-        let(:redis_service_file) { redis_formula.any_installed_prefix/"#{redis_formula.service_name}.service" }
-
-        include_examples "handles service lifecycle correctly"
+        include_examples "handles service lifecycle correctly",
+                         nginx_service_file: HOMEBREW_PREFIX/"opt/nginx/nginx.service",
+                         redis_service_file: HOMEBREW_PREFIX/"opt/redis/redis.service"
       end
     end
   end

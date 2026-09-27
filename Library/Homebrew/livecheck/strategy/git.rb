@@ -1,9 +1,10 @@
 # typed: strict
 # frozen_string_literal: true
 
-require "addressable"
 require "livecheck/strategic"
 require "system_command"
+require "timeout"
+require "uri"
 
 module Homebrew
   module Livecheck
@@ -32,9 +33,17 @@ module Homebrew
         # Used to cache processed URLs, to avoid duplicating effort.
         @processed_urls = T.let({}, T::Hash[String, String])
 
+        class << self
+          sig { params(processed_urls: T::Hash[String, String]).void }
+          attr_writer :processed_urls
+        end
+
         # The priority of the strategy on an informal scale of 1 to 10 (from
         # lowest to highest).
         PRIORITY = 8
+
+        # Maximum time in seconds to wait for `git ls-remote` to finish.
+        TIMEOUT = 20
 
         # The regex used to extract tags from `git ls-remote --tags` output.
         TAG_REGEX = %r{^\h+\s+refs/tags/(.+?)(?:\^{})?$}
@@ -63,8 +72,8 @@ module Homebrew
           return processed_url if processed_url
 
           begin
-            uri = Addressable::URI.parse(url)
-          rescue Addressable::URI::InvalidURIError
+            uri = URI.parse(url)
+          rescue URI::InvalidURIError
             return url
           end
 
@@ -116,7 +125,7 @@ module Homebrew
         end
 
         # Runs `git ls-remote --tags` with the provided URL and returns a hash
-        # containing the `stdout` content or any errors from `stderr`.
+        # containing the `stdout` content, errors from `stderr` or a timeout error.
         #
         # @param url [String] the URL of the Git repository to check
         # @return [Hash]
@@ -124,12 +133,13 @@ module Homebrew
         def self.ls_remote_tags(url)
           stdout, stderr, _status = system_command(
             "git",
-            args:         ["ls-remote", "--tags", url],
+            args:         ["ls-remote", "--tags", "--end-of-options", url],
             env:          { "GIT_TERMINAL_PROMPT" => "0" },
             print_stdout: false,
             print_stderr: false,
             debug:        false,
             verbose:      false,
+            timeout:      TIMEOUT,
           ).to_a
 
           data = {}
@@ -137,6 +147,8 @@ module Homebrew
           data[:messages] = stderr.split("\n") if stderr.present?
 
           data
+        rescue Timeout::Error
+          { messages: ["git ls-remote timed out after #{TIMEOUT} seconds."] }
         end
 
         # Parse tags from `git ls-remote --tags` output.
@@ -211,9 +223,9 @@ module Homebrew
           return match_data if content.blank?
 
           versions_from_content(content, regex, &block).each do |match_text|
+            next unless match_text.is_a?(String)
+
             match_data[:matches][match_text] = Version.new(match_text)
-          rescue TypeError
-            next
           end
 
           match_data

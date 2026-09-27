@@ -8,22 +8,15 @@ require "cmd/which-formula"
 
 RSpec.describe Homebrew::Cmd::WhichFormula do
   it_behaves_like "parseable arguments"
+  it_behaves_like "a documented command", "which-formula", shell: true
 
   describe "which_formula" do
-    let(:shell_cellar) do
-      if (HOMEBREW_LIBRARY_PATH.parent.parent/"Cellar").directory?
-        HOMEBREW_LIBRARY_PATH.parent.parent/"Cellar"
-      else
-        HOMEBREW_CELLAR
-      end
-    end
+    let(:shell_cellar) { HOMEBREW_CELLAR }
 
     before do
-      # Override DATABASE_FILE to use test environment's HOMEBREW_CACHE
-      test_db_file = HOMEBREW_CACHE/"api"/Homebrew::Cmd::WhichFormula::ENDPOINT
-      stub_const("#{described_class}::DATABASE_FILE", test_db_file)
-
-      db = Homebrew::Cmd::WhichFormula::DATABASE_FILE
+      # Write the database where `brew which-formula` (a Bash command) reads it:
+      # the same path `Homebrew::API.write_executables_file!` writes to.
+      db = Homebrew::API::HOMEBREW_CACHE_API/"internal/executables.txt"
       db.dirname.mkpath
       db.write(<<~EOS)
         foo(1.0.0):foo2 foo3

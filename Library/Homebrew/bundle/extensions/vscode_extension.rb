@@ -44,16 +44,27 @@ module Homebrew
             which("code-insiders", ORIGINAL_PATHS)
         end
 
+        sig { override.params(_name: String, _options: Homebrew::Bundle::EntryOptions).returns(T::Boolean) }
+        def batch_installable?(_name, _options = {})
+          true
+        end
+
+        sig { override.params(entries: T::Array[Dsl::Entry], verbose: T::Boolean).returns(T::Boolean) }
+        def install_batch!(entries, verbose: false)
+          args = entries.flat_map { |entry| ["--install-extension", entry.name] }
+
+          Bundle.system(package_manager_executable!, *args, verbose:)
+        end
+
         sig { returns(T::Array[String]) }
         def extensions
           extensions = @extensions
           return extensions if extensions
 
           @extensions = if (vscode = package_manager_executable)
-            Bundle.exchange_uid_if_needed! do
-              ENV["WSL_DISTRO_NAME"] = ENV.fetch("HOMEBREW_WSL_DISTRO_NAME", nil)
-              `"#{vscode}" --list-extensions 2>/dev/null`
-            end.split("\n").map(&:strip).grep(EXTENSION_ID_REGEX).map(&:downcase)
+            ENV["WSL_DISTRO_NAME"] = ENV.fetch("HOMEBREW_WSL_DISTRO_NAME", nil)
+            Utils.popen_read_text(vscode, "--list-extensions", err: File::NULL)
+                 .split("\n").map(&:strip).grep(EXTENSION_ID_REGEX).map(&:downcase)
           end
           return [] if @extensions.nil?
 
@@ -125,11 +136,7 @@ module Homebrew
         def install_package!(name, with: nil, verbose: false)
           _ = with
 
-          vscode = package_manager_executable!
-
-          Bundle.exchange_uid_if_needed! do
-            Bundle.system(vscode, "--install-extension", name, verbose:)
-          end
+          Bundle.system(package_manager_executable!, "--install-extension", name, verbose:)
         end
 
         sig {
@@ -182,10 +189,8 @@ module Homebrew
           vscode = package_manager_executable
           return if vscode.nil?
 
-          Bundle.exchange_uid_if_needed! do
-            extensions.each do |extension|
-              Kernel.system(vscode.to_s, "--uninstall-extension", extension)
-            end
+          extensions.each do |extension|
+            Kernel.system(vscode.to_s, "--uninstall-extension", extension)
           end
         end
       end

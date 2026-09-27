@@ -8,9 +8,9 @@ module RuboCop
         include CaskHelp
 
         # These stanzas can be overridden by `on_*` blocks, so take them into account.
-        # TODO: Update this list if new stanzas are added to `Cask::DSL` that call `set_unique_stanza`.
+        # TODO: Update this list when stanzas in `Cask::DSL` start or stop calling `set_unique_stanza`.
         OVERRIDABLE_METHODS = [
-          :appcast, :arch, :auto_updates, :conflicts_with, :container,
+          :appcast, :arch, :auto_updates, :container,
           :desc, :homepage, :os, :sha256, :url, :version
         ].freeze
 
@@ -48,10 +48,13 @@ module RuboCop
           method_nodes.select(&:block_type?).each do |node|
             node.child_nodes.each do |child|
               child.each_node(:send) do |send_node|
-                next if send_node.method_name != :depends_on
+                next if send_node.receiver || send_node.method_name != :depends_on
 
-                macos_pair = send_node.arguments.first.pairs.find { |a| a.key.value == :macos }
-                macos_versions << macos_pair.value.source if macos_pair
+                if (macos_pair = macos_dependency_pair(send_node))
+                  macos_versions << macos_pair.value.source
+                elsif (argument = send_node.first_argument)&.sym_type? && argument.value == :macos
+                  macos_versions << ":any"
+                end
               end
             end
           end
@@ -70,8 +73,9 @@ module RuboCop
                 end
                 next if RuboCop::Cask::Constants::ON_SYSTEM_METHODS.include?(send_node.method_name)
 
-                if send_node.method_name == :depends_on &&
-                   send_node.arguments.first.pairs.any? { |a| a.key.value == :macos } &&
+                macos_pair = macos_dependency_pair(send_node)
+                # `depends_on macos: :any` declares no minimum version to hoist.
+                if macos_pair && !(macos_pair.value.sym_type? && macos_pair.value.value == :any) &&
                    OnSystemConditionalsHelper::ON_SYSTEM_OPTIONS.map do |m|
                      :"on_#{m}"
                    end.include?(T.cast(node, RuboCop::AST::BlockNode).method_name) &&
@@ -85,6 +89,14 @@ module RuboCop
             end
           end
           names
+        end
+
+        sig { params(send_node: RuboCop::AST::SendNode).returns(T.nilable(RuboCop::AST::PairNode)) }
+        def macos_dependency_pair(send_node)
+          return if send_node.method_name != :depends_on
+          return unless (hash = send_node.first_argument)&.hash_type?
+
+          hash.pairs.find { |pair| pair.key.sym_type? && pair.key.value == :macos }
         end
 
         sig { params(node: RuboCop::AST::Node).returns(T::Boolean) }

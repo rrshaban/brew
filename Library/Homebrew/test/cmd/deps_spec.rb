@@ -36,14 +36,19 @@ RSpec.describe Homebrew::Cmd::Deps, :integration_test, :no_api do
 
   it_behaves_like "parseable arguments"
 
-  it "outputs all of a Formula's dependencies and their dependencies on separate lines" do
+  it "outputs Formula and Cask dependencies on separate lines", :cask do
     setup_test_formula "installed"
+    setup_test_formula "unar"
     expect do
-      brew "deps", "baz", "--include-test", "--missing", "--skip-recommended", "HOMEBREW_REQUIRE_TAP_TRUST" => "1"
+      brew "deps", "baz", "--include-test", "--missing", "--skip-recommended"
     end
       .to be_a_success
       .and output("bar\nfoo\ntest\n").to_stdout
       .and output(/not the actual runtime dependencies/).to_stderr
+    expect { brew "deps", "--cask", "--direct", cask_path("with-depends-on-everything") }
+      .to output("unar\n").to_stdout
+      .and output(/not the actual runtime dependencies/).to_stderr
+      .and be_a_success
   end
 
   context "with --tree" do
@@ -83,6 +88,29 @@ RSpec.describe Homebrew::Cmd::Deps, :integration_test, :no_api do
 
       EOS
       expect { brew "deps", "baz", "--tree", "--prune" }
+        .to be_a_success
+        .and output(stdout).to_stdout
+    end
+
+    it "reads inputs from a Brewfile alongside named arguments" do
+      setup_test_formula "installed"
+      brewfile = HOMEBREW_TEMP/"deps.Brewfile"
+      brewfile.write <<~BREWFILE
+        brew "baz"
+        tap "ignored/tap"
+      BREWFILE
+      stdout = <<~EOS
+        bar
+        └── foo
+
+        baz
+        ├── bar
+        │   └── foo
+        ├── recommended_test
+        └── installed
+
+      EOS
+      expect { brew "deps", "--tree", "bar", "--brewfile=#{brewfile}" }
         .to be_a_success
         .and output(stdout).to_stdout
     end
